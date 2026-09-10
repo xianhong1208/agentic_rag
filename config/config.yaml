@@ -1,0 +1,252 @@
+database:
+  url: "postgresql://postgres:CHANGE_ME@localhost/agentic_rag"
+  port: 5444
+  echo: false
+  pool_size: 5
+  max_overflow: 10
+  pool_timeout: 30
+  pool_recycle: 3600
+
+# Server Configuration
+server:
+  host: "0.0.0.0"
+  port: 5038
+  transport: "http"
+
+# Authentication
+auth:
+  enabled: true
+  token_server_url: "http://0.0.0.0:5017"
+  cache_ttl: 60
+  request_timeout: 5.0
+  retry_count: 2
+  dynamic_tools:
+    enabled: true # per-folder 工具動態註冊
+
+# Logging
+logging:
+  level: "DEBUG"
+  format: "colorized"
+  file: "logs/app.log"
+  max_size: "10MB"
+  backup_count: 3
+
+# Application
+app:
+  name: "Agentic RAG"
+  title: "Agentic RAG MCP Server"
+  description: "Agentic RAG — Hierarchical chunking + AutoMerging retrieval for LLM agents"
+  tool_prefix: "Agentic"
+
+# ===========================================================================
+# RAG — 三大區塊:① 模型服務 ② 文件處理 ③ 查詢行為
+# ===========================================================================
+rag:
+
+  # ╔═════════════════════════════════════════════════════════════════════╗
+  # ║ ① 模型服務 — 三個本地端 vLLM endpoint(基礎設施層)                ║
+  # ╚═════════════════════════════════════════════════════════════════════╝
+
+  # Embedding — 文件/查詢 轉向量
+  # ⚠️ 換模型必須全量 reindex(向量空間不相容)
+  # 回退 bge-m3:model 改 "BAAI/bge-m3"、base_url 改 :5043、兩前綴刪掉
+  embedding:
+    provider: "vllm"                            # openai / azure / vllm / ollama / huggingface
+    model: "intfloat/multilingual-e5-large"
+    dimension: 1024
+    base_url: "http://localhost:7075/v1"
+    api_key: "changeme"
+    # e5 必加前綴;bge 系刪掉
+    query_prefix: "query: "
+    passage_prefix: "passage: "
+
+  # LLM — 索引時為 chunk 生成上下文前綴(Contextual Retrieval 用)
+  llm:
+    provider: "vllm"
+    model: "openai/gpt-oss-120b"
+    base_url: "http://localhost:5052/v1"
+    api_key: "changeme"
+
+  # Reranker — cross-encoder 重排檢索結果
+  # ⚠️ model 名須與 vllm serve 一致,否則 /v1/score 404 → 靜默 fallback 原始排序
+  # 回退 bge-reranker-v2-m3:model 改回,並刪掉兩個 template 欄位
+  rerank:
+    enabled: true
+    model: "mixedbread-ai/mxbai-rerank-base-v2"
+    base_url: "http://localhost:8787"
+    api_key: "changeme"
+    top_n: null                                 # null = 由 top_k 決定
+    score_threshold: 0.25                       # rerank 分數下限:結果常被砍光 → 調低;雜訊多 → 調高
+    # mxbai 官方模板({text} 佔位符);不套模板分數全擠高分區,threshold 失效
+    query_template: "query: {text}"
+    document_template: "document: {text}\nYou are a search relevance expert who evaluates how well documents match search queries. For each query-document pair, carefully analyze the semantic relationship between them, then provide your binary relevance judgment (0 for not relevant, 1 for relevant).\nRelevance:"
+
+  # ╔═════════════════════════════════════════════════════════════════════╗
+  # ║ ② 文件處理 — 索引時的行為(Docling 解析 + 分塊 + Context 補強)    ║
+  # ╚═════════════════════════════════════════════════════════════════════╝
+
+  # Docling — PDF/DOCX 結構化解析
+  docling:
+    device: "cuda"                            # cpu / cuda / cuda:0 / cuda:4
+    ocr_enabled: true
+    ocr_model_scale: "medium"                 # PP-OCRv6 tiny/small/medium;medium 準確率最高(torch backend,權重在 assets/.../RapidOcr/torch/)
+    hf_offline: true                            # 離線部署:強制使用 assets/ 內模型
+    compile_models: false
+
+  # 音檔轉錄(ASR)來源 — BL-06。最小欄位集:裁切/幻覺過濾程式內恆開;
+  # FireRedASR 專用欄位待 BL-08 實作時再加
+  asr:
+    enabled: true                               # false = 不轉錄音檔(即使模型在)
+    provider: "fireredasr"                      # docling-whisper | openai-compatible | fireredasr
+    # 雲端(openai-compatible)專用 — OpenAI / Groq / 自架 vLLM whisper 皆相容:
+    base_url: null                              # 如 http://localhost:8000/v1
+    api_key: null
+    model: null                                 # 雲端模型名,如 whisper-1
+
+  # Indexing 背景任務行為(auto-index 上傳檔案會走這邊)
+  indexing:
+    # 同時 job 上限(100 ≈ 無限制);GPU OOM/OCR thrash 才調低(典型 4-8)
+    # env RAG_INDEXING_CONCURRENCY 可即時 override
+    max_concurrent_jobs: 100
+    # 單檔 / job 索引上限預設 10 天(見 src/config/model.py IndexingConfig)—
+    # 慢機台大檔 OCR 用。要改就改 model.py 的 default;這裡不覆寫。
+    # 臨時調整用 env:RAG_PER_FILE_TIMEOUT_SECONDS / RAG_JOB_TIMEOUT_SECONDS
+
+  # Hierarchical Chunking — leaves 由 Docling 切,parents 後合成
+  chunking:
+    # [parent_target_tokens, leaf_chunk_size]:parent 大→context 完整但回傳成本升;leaf 小→精準但零碎
+    # ⚠️ 改 leaf size 需 reindex 才生效
+    hierarchy_sizes: [2048, 256]
+    chunk_overlap: 50                           # 相鄰 leaf 重疊:答案常被切斷在段界 → 調大(勿超過 leaf 的 1/4)
+    max_chunk_size: 2000
+
+  # Contextual Retrieval — 為 leaf 加 LLM 生成的上下文前綴(用 ① 的 LLM)
+  # 關掉(enabled: false)索引大幅加速,但 needle-in-haystack 檢索品質下降
+  contextual_retrieval:
+    enabled: true
+    apply_to: "leaf"                            # leaf / parent / all
+    max_context_length: 150                     # 前綴長度上限(字):太長稀釋 chunk 本文的向量
+    max_concurrent: 20                          # 併發 LLM 請求:vLLM 端過載/429 → 調低
+    # 全文餵 LLM 上限(字元):文件+模板+chunk 須塞進 LLM context,換模型時重算
+    # (60000 字 ≈ 72K tokens,對 gpt-oss @100K context 安全)
+    max_doc_chars: 60000
+    # ⚠️ reasoning 模型 thinking 計入 completion 預算:太小 content 會空 → 前綴 fallback
+    max_tokens: 2048
+    reasoning_effort: "low"                     # gpt-oss 支援 low/medium/high;前綴生成用 low 即可
+
+  # ╔═════════════════════════════════════════════════════════════════════╗
+  # ║ ③ 查詢行為 — 檢索策略(Hybrid + Auto-Merging + Context Expansion) ║
+  # ╚═════════════════════════════════════════════════════════════════════╝
+
+  # Vector Store — PGVector 表配置
+  vector_store:
+    type: "pgvector"
+    table_prefix: "vector_store"
+
+  # Hybrid retrieval + auto-merging + context expansion
+  # 以下皆為預設值,查詢 request 可逐次覆寫
+  retrieval:
+    # Hybrid search
+    default_top_k: 10                           # 回傳 chunk 數:答不全 → 調大;雜訊多 → 調小
+    default_similarity_cutoff: 0.25             # 向量相似度下限:調高過濾弱相關,太高會查無結果
+    default_sparse_top_k: 12                    # BM25 側候選數:專有名詞/編號查不到 → 調大
+    default_hybrid_alpha: 0.75                  # 0=純 BM25, 1=純向量:術語/代號型查詢多 → 調低
+    hybrid_search: true
+    text_search_config: "jiebacfg"              # Postgres 全文檢索字典(中文斷詞 jieba)
+
+    # Auto-Merging — 命中多 leaf 同 parent 自動升級
+    auto_merging:
+      enabled: true
+      merge_threshold: 0.4                      # parent 內 leaf 命中比例門檻:調低易升級(context 豐富);調高保守(精準)
+
+    # Context Expansion — 沒被 merge 的 leaf 自動展開鄰居
+    expand_context_default: true
+    expand_context_neighbors: 5                 # 左右各展開 N 個鄰居:答案常跨段落 → 調大;回傳太雜 → 調小
+
+    # 同時執行的查詢上限(REST+MCP 共用;超過排隊不丟棄)
+    # 依據 DB pool:sync 5+10 / async 5+10 / 每 folder PGVector 5+10,8 併發各池有餘裕
+    # 查詢常排隊 → 調大(同時把 database.pool_size 一起加);DB 連線吃緊 → 調小
+    max_concurrent_queries: 8
+
+    return_resource_files: true                 # 查詢結果是否附帶原始文件下載連結
+
+# Modules — rag 拆三模組:rag_indexing(索引 API)/ rag_query(查詢 REST)/ rag(MCP tools)
+modules:
+  enabled:
+    - folder
+    - file
+    - rag_indexing
+    - rag_query
+    - rag
+    - media
+    - admin
+
+  folder:
+    api_router:
+      module: "src.api.router.folder_api"
+      router_name: "router"
+      prefix: "/api"
+    mcp_tools:
+      module: ""
+      function_name: ""
+    description: "Folder CRUD REST API"
+
+  file:
+    api_router:
+      module: "src.api.router.file_api"
+      router_name: "router"
+      prefix: "/api"
+    mcp_tools:
+      module: ""
+      function_name: ""
+    description: "File upload/download/management REST API"
+
+  rag_indexing:
+    api_router:
+      module: "src.api.router.rag_indexing"
+      router_name: "router"
+      prefix: "/api/rag"
+    mcp_tools:
+      module: ""
+      function_name: ""
+    description: "RAG indexing: index / reindex / delete-index / job status"
+
+  rag_query:
+    api_router:
+      module: "src.api.router.rag_query"
+      router_name: "router"
+      prefix: "/api/rag"
+    mcp_tools:
+      module: ""
+      function_name: ""
+    description: "RAG query: hybrid retrieval REST endpoint"
+
+  rag:
+    api_router:
+      module: ""
+      router_name: ""
+      prefix: ""
+    mcp_tools:
+      module: "src.fastmcp_tools.agentic_tools"
+      function_name: "register_agentic_tools"
+    description: "Agentic RAG MCP tools (per-folder Agentic_{name} with auto-merging)"
+
+  admin:
+    api_router:
+      module: "src.api.router.admin_settings"
+      router_name: "router"
+      prefix: ""    # router 內自帶 /api/admin 與 /admin 路徑
+    mcp_tools:
+      module: ""
+      function_name: ""
+    description: "Runtime settings console (hot-editable model/retrieval config + /admin UI)"
+
+  media:
+    api_router:
+      module: "src.api.router.media"
+      router_name: "router"
+      prefix: ""    # router 內部已 prefix=/v1
+    mcp_tools:
+      module: ""
+      function_name: ""
+    description: "OpenAI-style STT/OCR REST API (shares Docling's pre-loaded Whisper turbo + RapidOCR)"

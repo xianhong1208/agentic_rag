@@ -1,0 +1,23 @@
+# RAG 檢索評測 QA 集(BL-01)— 格式範例
+#
+# 每條:question(查詢)+ expected_files(top-k 內應命中的檔名,與
+# evals/rag/documents/ 內的實際檔名一致)。建議 30-50 條,覆蓋:
+#   - 事實型(答案在單一 chunk)
+#   - 跨段型(需 auto-merge parent)
+#   - 表格型(xlsx / PDF 表格)
+#   - 掃描件(OCR 路徑)
+#   - 音檔內容(ASR 路徑)
+#   - 干擾型(多檔相似主題,考排序)
+#
+# 填好素材後跑:uv run --no-sync python scripts/run_rag_eval.py
+#
+# ---- 範例(請替換成真實條目;底下條目不會被跑 — 對應檔案不存在時腳本會計 0 分,
+#      所以正式使用前請整份換掉)----
+
+# - id: qa-001
+#   question: "2026 年第一季的預算總額是多少?"
+#   expected_files: ["2026Q1預算表.xlsx"]
+#
+# - id: qa-002
+#   question: "會議中決議的採購流程變更是什麼?"
+#   expected_files: ["0521會議錄音.mp3"]
