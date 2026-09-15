@@ -1,13 +1,15 @@
 
-"""PrefixedEmbedding — 為 e5 系模型自動加 query/passage 前綴的包裝層。
+"""PrefixedEmbedding — wrapper that auto-prepends query/passage prefixes for e5-family models.
 
-e5(multilingual-e5-*)的訓練契約:查詢文字前綴 ``query: ``、文件文字前綴
-``passage: ``,不加前綴檢索品質顯著劣化。bge 系不需要前綴。
+The e5 models (multilingual-e5-*) are trained with a prefix contract: query text
+gets ``query: `` and document text gets ``passage: ``. Omitting the prefix noticeably
+degrades retrieval quality. The bge family needs no prefix.
 
-llama_index 的 BaseEmbedding 本來就把「查詢」與「文件」分成不同方法
-(_get_query_embedding vs _get_text_embedding),所以這裡各自攔截加前綴即可,
-上游(indexer / query engine)完全不用改。前綴皆空字串時 rag_context 不會套用
-本包裝,bge 路徑零額外開銷。
+llama_index's BaseEmbedding already separates "query" from "document" into distinct
+methods (_get_query_embedding vs _get_text_embedding), so we just intercept each side
+and prepend the prefix; upstream (indexer / query engine) needs no changes. When both
+prefixes are empty strings, rag_context skips this wrapper, so the bge path has zero
+extra overhead.
 """
 
 from typing import Any, List
@@ -17,7 +19,7 @@ from llama_index.core.bridge.pydantic import PrivateAttr
 
 
 class PrefixedEmbedding(BaseEmbedding):
-    """包住任意 BaseEmbedding,查詢/文件各加固定前綴。"""
+    """Wrap any BaseEmbedding, prepending a fixed prefix to queries and documents."""
 
     _inner: Any = PrivateAttr()
     _query_prefix: str = PrivateAttr()
@@ -33,14 +35,12 @@ class PrefixedEmbedding(BaseEmbedding):
         self._query_prefix = query_prefix
         self._passage_prefix = passage_prefix
 
-    # ── 查詢側 ──────────────────────────────────────────────
     def _get_query_embedding(self, query: str) -> List[float]:
         return self._inner._get_query_embedding(self._query_prefix + query)
 
     async def _aget_query_embedding(self, query: str) -> List[float]:
         return await self._inner._aget_query_embedding(self._query_prefix + query)
 
-    # ── 文件側 ──────────────────────────────────────────────
     def _get_text_embedding(self, text: str) -> List[float]:
         return self._inner._get_text_embedding(self._passage_prefix + text)
 

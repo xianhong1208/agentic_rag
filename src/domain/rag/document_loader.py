@@ -1,16 +1,17 @@
 
-"""Document Loader — 檔案 → llama_index Document 的三路載入(M14 自 HierarchicalIndexer 拆出)。
+"""Document Loader — three-way loading of a file into a llama_index Document.
 
-三條路徑(與拆出前完全一致,逐字搬移):
-1. 純文字家族(.txt/.json/.csv/...):read_text_robust 編碼容錯直讀,不經 docling
-2. docling 支援格式:docling_convert_once(音檔先裁靜音、後過 Whisper 幻覺過濾)
-3. fallback:SimpleDirectoryReader
+Three paths:
+1. Plain-text family (.txt/.json/.csv/...): read directly via read_text_robust with encoding
+   tolerance, bypassing docling.
+2. docling-supported formats: docling_convert_once (audio is first silence-trimmed, then passed
+   through Whisper hallucination filtering).
+3. Fallback: SimpleDirectoryReader.
 
-⚠️ import 時序(M12):本模組頂部 import audio_defense — whisper 反幻覺 patch
-在 import 時套用,必須先於 docling get_converter()。原鏈 adapter →
-hierarchical_indexer → audio_defense;拆分後 hierarchical_indexer 頂部 import
-本模組,鏈變 … → hierarchical_indexer → document_loader → audio_defense,
-時序保證不變。
+Import ordering: this module imports audio_defense at the top — the whisper anti-hallucination
+patch is applied at import time and must run before docling's get_converter(). Since
+hierarchical_indexer imports this module at its top, the chain becomes
+… → hierarchical_indexer → document_loader → audio_defense, preserving the required ordering.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ logger = get_api_logger()
 
 
 def clean_text(text: str) -> str:
-    """清掉 NUL 與控制字元(PostgreSQL 不接受;PDF 字型表 / ICC profile 常見來源)。"""
+    """Strip NUL and control characters (rejected by PostgreSQL; commonly sourced from PDF font tables / ICC profiles)."""
     if not text:
         return text
     cleaned = text.replace('\x00', '')
@@ -51,7 +52,7 @@ def clean_text(text: str) -> str:
 
 
 class DocumentLoader:
-    """檔案載入器(HierarchicalIndexer 組合使用;邏輯自其 load_document_from_file 逐字搬入)。"""
+    """File loader (composed into HierarchicalIndexer; logic factored out of its load_document_from_file)."""
 
     def __init__(
         self,
@@ -63,10 +64,10 @@ class DocumentLoader:
     ):
         self._leaf_chunk_size = leaf_chunk_size
         self._embedding_model_name = embedding_model_name
-        # 只影響 docling_max_tokens 公式(contextual prefix 佔 token 預算)
+        # Only affects the docling_max_tokens formula (the contextual prefix consumes token budget)
         self._has_context_generator = has_context_generator
-        # BL-07: 音檔轉錄走注入的 provider(H6 同模式);未注入 → default
-        # docling-whisper(available() 沿用舊 auto-discover 語義,零行為變化)
+        # Audio transcription uses the injected provider; when not injected, defaults to
+        # docling-whisper (available() follows the existing auto-discover semantics)
         self._asr_provider = asr_provider or create_asr_provider(None)
         self._asr_enabled = asr_enabled
 
@@ -78,26 +79,26 @@ class DocumentLoader:
         metadata: Optional[Dict[str, Any]] = None,
         progress_cb: Optional[Callable[[str, Optional[int], Optional[int]], None]] = None,
     ) -> Document:
-        """跟前一版 flat RAG 的 load_document_from_file 行為一致 — 沿用既定流程
+        """Load a file into a Document, matching the behavior of the flat-RAG load_document_from_file.
 
-        progress_cb: 頁級解析進度 ``("loading", done, total)``(PDF/OCR 用,
-        可選)— 大掃描檔終於能顯示「解析文件 12/161」而不是乾等。
+        progress_cb: optional page-level parse progress ``("loading", done, total)`` (for PDF/OCR),
+        letting large scanned files show "parsing document 12/161" instead of appearing to hang.
         """
-        # 純文字家族:直讀(read_text_robust 容錯編碼),不經 docling
+        # Plain-text family: read directly (read_text_robust for encoding tolerance), bypassing docling
         text_extensions = {
             '.txt', '.text', '.json', '.csv',
             '.yaml', '.yml', '.xml', '.conf', '.log',
         }
         file_extension = Path(file_name).suffix.lower()
 
-        # DB 存的是 `storage/...` 相對字串。直接 open() 會吃 cwd,跟 save_file
-        # 的 _PROJECT_ROOT-anchored 寫入對不上 → ENOENT。一律走 FileStorage 解析。
+        # The DB stores a relative `storage/...` string. A bare open() would resolve against cwd,
+        # mismatching save_file's _PROJECT_ROOT-anchored writes → ENOENT. Always resolve via FileStorage.
         resolved_path = str(FileStorage.resolve_path(file_path))
 
         base_metadata: Dict[str, Any] = {
             "file_id": str(file_id),
             "file_name": file_name,
-            "file_path": file_path,  # 保留 DB 相對字串,給 metadata 消費者
+            "file_path": file_path,  # keep the DB relative string for metadata consumers
         }
         if metadata:
             base_metadata.update({k: v for k, v in metadata.items() if v is not None})
@@ -105,18 +106,19 @@ class DocumentLoader:
         doc_id = f"file_{file_id}"
 
         if file_extension in text_extensions:
-            # 編碼容錯:UTF-16(Windows 記事本「Unicode」)/ Big5 的 txt·csv
-            # 實務常見,寫死 utf-8 會 UnicodeDecodeError 直接索引失敗。
-            # 無法辨識時 read_text_robust 會 raise 帶處置指引的 ValueError
-            # (進 FileIndex.error_message),不靜默索引亂碼。
+            # Encoding tolerance: UTF-16 (Windows Notepad "Unicode") / Big5 txt·csv are common in
+            # practice, and hardcoding utf-8 would fail indexing outright with UnicodeDecodeError.
+            # When it can't identify the encoding, read_text_robust raises a ValueError with
+            # remediation guidance (surfaced in FileIndex.error_message) rather than silently
+            # indexing garbled text.
             from src.utils.text_io import read_text_robust
             content = clean_text(read_text_robust(resolved_path, file_name))
             return Document(text=content, metadata=base_metadata, doc_id=doc_id)
 
-        # BL-07: 音檔走注入的 AsrProvider(trim → transcribe → 幻覺過濾)。
-        # config 選定的 provider 就是**唯一**語音來源:不可服務(權重/端點
-        # 未就緒)→ 明確報錯讓檔案標 failed(帶可行動訊息),絕不靜默改走
-        # 別的模型或不轉錄。只有 rag.asr.enabled=false 才是「明確不轉錄」。
+        # Audio uses the injected AsrProvider (trim → transcribe → hallucination filter).
+        # The config-selected provider is the ONLY speech source: if it can't serve, raise
+        # an explicit error (file marked failed) rather than silently switching models or
+        # skipping. Only rag.asr.enabled=false means "explicitly do not transcribe".
         if file_extension in _AUDIO_TRIM_EXTENSIONS and self._asr_enabled:
             if not self._asr_provider.available():
                 raise RuntimeError(
@@ -175,16 +177,16 @@ class DocumentLoader:
         base_metadata: Dict[str, Any], doc_id: str,
         progress_cb: Optional[Callable[[str, Optional[int], Optional[int]], None]] = None,
     ) -> Document:
-        """音檔:前導靜音裁切 → AsrProvider 轉錄 → Whisper 幻覺過濾 → Document。
+        """Audio: leading-silence trim → AsrProvider transcription → Whisper hallucination filter → Document.
 
-        裁切/過濾是模型無關的前後處理(audio_defense),刻意留在 provider 外層 —
-        換任何 provider 都保留這兩道防禦。語義與拆出前逐點一致(BL-07 零行為)。
+        Trimming/filtering are model-agnostic pre/post-processing (audio_defense), deliberately kept
+        outside the provider so both defenses survive swapping in any provider.
         """
         docling_max_tokens = min(
             self._leaf_chunk_size, 380 if self._has_context_generator else 450
         )
 
-        # 1. Trim leading silence(失敗 fallback 原檔,不擋轉錄)
+        # 1. Trim leading silence (on failure, fall back to the original file; don't block transcription)
         effective_path = resolved_path
         trimmed_temp: Optional[str] = None
         try:
@@ -196,7 +198,7 @@ class DocumentLoader:
             trimmed_temp = None
 
         try:
-            # 2. Transcribe(provider 失敗原樣 raise → 既有失敗路徑寫 failed tag)
+            # 2. Transcribe (provider failures re-raise as-is → the existing failure path writes a failed tag)
             result = self._asr_provider.transcribe(
                 audio_path=effective_path,
                 file_name=file_name,
@@ -229,7 +231,7 @@ class DocumentLoader:
 
             doc = Document(text=content, metadata=base_metadata, doc_id=doc_id)
             if chunk_texts is not None:
-                # docling provider 有預切 chunks;雲端 None → leaf_splitter 純文字路徑
+                # the docling provider pre-splits chunks; cloud returns None → leaf_splitter plain-text path
                 doc.metadata["_docling_chunks"] = chunk_texts
             return doc
         finally:

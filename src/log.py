@@ -1,24 +1,9 @@
 #!/usr/bin/env python3
 
-"""
-Log Configuration Module - 獨立的日誌配置模組
+"""Standalone logging configuration (loguru).
 
-功能：
-- 控制台日誌輸出（彩色）
-- 分模組檔案日誌記錄（adapter、api、auth、db、mcptools、server）
-- Request ID 自動注入（透過 contextvars，串聯整條請求鏈路）
-- Structured Log Helpers（統一格式，方便 grep）
-- HTTP 請求日誌記錄
-
-查問題用法：
-    # 串聯一個請求的完整鏈路
-    grep "rid=abc12345" logs/*/info_*.log
-
-    # 找某個 folder 的所有錯誤
-    grep "fid=42" logs/adapter/error_*.log
-
-    # 找某個 token 的操作
-    grep "tok=abcd1234" logs/*/info_*.log
+Provides colored console output, per-module file logging, automatic request_id
+injection via contextvars, and structured grep-friendly log helpers.
 """
 
 import os
@@ -32,48 +17,33 @@ from fastmcp.server.dependencies import get_http_request
 from starlette.requests import Request
 
 
-# ============================================================================
-# Request ID（每個 HTTP 請求自動產生，透過 contextvars 在所有層自動帶上）
-# ============================================================================
-
+# Request ID: auto-generated per HTTP request, carried across layers via contextvars.
 _request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
 
 def get_request_id() -> str:
-    """取得當前請求的 request_id（在所有層都可呼叫）"""
+    """Return the current request's request_id (callable from any layer)."""
     return _request_id_var.get()
 
 def set_request_id(rid: str) -> None:
-    """設定當前請求的 request_id（由 middleware 呼叫）"""
+    """Set the current request's request_id (called by middleware)."""
     _request_id_var.set(rid)
 
 def generate_request_id() -> str:
-    """產生短 request_id（取 UUID 前 8 碼，足夠在單日內唯一）"""
+    """Generate a short request_id (first 8 hex chars of a UUID)."""
     return uuid.uuid4().hex[:8]
 
-
-# ============================================================================
-# 模組定義
-# ============================================================================
 
 LogModule = Literal["adapter", "api", "auth", "db", "mcptools", "server"]
 LOG_MODULES: list[LogModule] = ["adapter", "api", "auth", "db", "mcptools", "server"]
 
 
-# ============================================================================
-# Logger Setup
-# ============================================================================
-
 def _format_file_log(record) -> str:
-    """檔案 log 格式 ─ 自動附 request_id(contextvar 優先,fallback extra["rid"])。
+    """File log format, appending the request_id.
 
-    順序重要:get_logger 通常 module 頂層呼叫,那時 contextvar 是 "-",bind 進 extra 後
-    就凍住了;所以 format 時必須先讀 contextvar 才能拿到當下 request 的真值。
-
-    Args:
-        record: loguru 的 record dict。
-
-    Returns:
-        format string (帶 placeholder,loguru 自己會代入)。
+    Reads the contextvar first, falling back to extra["rid"]. Order matters:
+    get_logger usually runs at module import when the contextvar is still "-",
+    and once bound into extra it is frozen; so at format time the contextvar
+    must be read first to get the current request's real value.
     """
     rid = _request_id_var.get()
     if rid == "-":
@@ -85,11 +55,11 @@ def _format_file_log(record) -> str:
     )
 
 def _format_console_log(record) -> str:
-    """控制台 log 格式:彩色 + request_id(參見 _format_file_log 的順序說明)。
+    """Console log format: colored + request_id (see _format_file_log for the ordering note).
 
-    時間欄位用完整 YYYY-MM-DD HH:mm:ss.SSS。 隔夜長跑(indexing job /
-    Whisper transcription / 跨日 SSE stream)時純看時分秒會把不同天
-    混在一起,日期是必要 context — 跟檔案 log 對齊也更好 grep。
+    The full date is kept because overnight long runs (indexing, transcription,
+    cross-day SSE streams) would otherwise blur different days together, and it
+    aligns with the file logs for easier grep.
     """
     rid = _request_id_var.get()
     if rid == "-":
@@ -108,23 +78,10 @@ def setup_logger(
     rotation: str = "5 MB",
     encoding: str = "utf-8"
 ) -> None:
-    """設定 loguru 日誌系統
+    """Configure the loguru logging system.
 
-    為每個模組建立獨立的日誌資料夾，分 info/error 兩個檔案。
-    所有 log 自動帶上 request_id，方便串聯請求鏈路。
-
-    目錄結構：
-        logs/adapter/info_2026-03-20.log   <- DEBUG/INFO/WARNING
-        logs/adapter/error_2026-03-20.log  <- ERROR/CRITICAL
-        logs/api/info_2026-03-20.log
-        ...
-
-    Args:
-        console_level: 控制台日誌等級
-        file_level: 檔案日誌等級
-        log_base_dir: 日誌檔案基礎目錄
-        rotation: 日誌輪替大小
-        encoding: 檔案編碼
+    Creates a separate log directory per module, split into info/error files.
+    Every log automatically carries a request_id for correlating request chains.
     """
     logger.remove()
 
@@ -149,7 +106,7 @@ def setup_logger(
                 )
             )
 
-    # 控制台日誌 (彩色輸出到 stderr，避免和 uvicorn stdout 混在一起)
+    # Console: colored output to stderr, kept separate from uvicorn's stdout.
     logger.add(
         sys.stderr,
         level=console_level,
@@ -159,20 +116,11 @@ def setup_logger(
     )
 
 
-# ============================================================================
-# Logger Getters
-# ============================================================================
-
 def get_logger(module: LogModule):
-    """取得指定模組的 loguru logger(只 bind module,不 bind rid)。
+    """Get the loguru logger for a module (binds module only, not rid).
 
-    bind rid 會在 import 時凍住 "-",改由 format function 每次即時讀 contextvar。
-
-    Args:
-        module: "adapter" / "api" / "auth" / "db" / "mcptools" / "server" 其一。
-
-    Returns:
-        loguru.Logger 已綁定 module。
+    Binding rid would freeze it to "-" at import time; instead the format
+    function reads the contextvar live on each call.
     """
     return logger.bind(module=module)
 
@@ -196,19 +144,15 @@ def get_server_logger():
     return get_logger("server")
 
 
-# ============================================================================
-# Structured Log Helpers（統一格式，方便 grep）
-# ============================================================================
-
 def mask_token(token: Optional[str]) -> str:
-    """遮罩 token，只顯示前 8 碼"""
+    """Mask a token, showing only the first 8 characters."""
     if not token:
         return "-"
     return f"{token[:8]}..." if len(token) > 8 else token
 
 
 def _build_context(**kwargs) -> str:
-    """把 key=value 組成 log context 字串，跳過 None"""
+    """Join key=value pairs into a log context string, skipping None values."""
     parts = []
     for key, value in kwargs.items():
         if value is not None:
@@ -217,18 +161,9 @@ def _build_context(**kwargs) -> str:
 
 
 def log_op(log, op: str, *, folder_id=None, file_id=None, token=None, msg: str = "", **extra):
-    """記錄 INFO 級別的操作事件(統一格式,方便 grep)。
+    """Log an INFO-level operation event in a uniform, grep-friendly format.
 
-    輸出:``[OP] fid=N file=UUID tok=abcdefgh... | msg``
-
-    Args:
-        log: loguru logger(從 get_xxx_logger 拿)。
-        op: 操作識別字(e.g. "INDEX_START")。
-        folder_id: 可選 folder id。
-        file_id: 可選 file id。
-        token: 可選 token(會自動 mask)。
-        msg: 可選額外訊息接在 ``|`` 後面。
-        **extra: 其他要塞進 context 的 key=value。
+    Output: ``[OP] fid=N file=UUID tok=abcdefgh... | msg``
     """
     ctx = _build_context(
         fid=folder_id,
@@ -240,7 +175,7 @@ def log_op(log, op: str, *, folder_id=None, file_id=None, token=None, msg: str =
 
 
 def log_op_debug(log, op: str, *, folder_id=None, file_id=None, token=None, msg: str = "", **extra):
-    """同 log_op 但走 DEBUG 級別 — 用於細節操作事件,日常不需要看,排查時開 DEBUG"""
+    """Like log_op but at DEBUG level, for detailed events not needed day-to-day."""
     ctx = _build_context(
         fid=folder_id,
         file=str(file_id) if file_id else None,
@@ -251,18 +186,9 @@ def log_op_debug(log, op: str, *, folder_id=None, file_id=None, token=None, msg:
 
 
 def log_err(log, op: str, error, *, folder_id=None, file_id=None, token=None, **extra):
-    """記錄 ERROR 級別事件(同 log_op 但附 exception 類別 + 訊息)。
+    """Log an ERROR-level event (like log_op, plus the exception class + message).
 
-    輸出:``[OP] fid=N file=UUID tok=abcdefgh... | ExceptionName: message``
-
-    Args:
-        log: loguru logger。
-        op: 操作識別字。
-        error: 抓到的 exception 物件。
-        folder_id: 可選 folder id。
-        file_id: 可選 file id。
-        token: 可選 token(自動 mask)。
-        **extra: 其他 context k=v。
+    Output: ``[OP] fid=N file=UUID tok=abcdefgh... | ExceptionName: message``
     """
     ctx = _build_context(
         fid=folder_id,
@@ -274,7 +200,7 @@ def log_err(log, op: str, error, *, folder_id=None, file_id=None, token=None, **
 
 
 def log_warn(log, op: str, *, folder_id=None, file_id=None, token=None, msg: str = "", **extra):
-    """記錄警告（WARNING 級別）"""
+    """Log a warning (WARNING level)."""
     ctx = _build_context(
         fid=folder_id,
         file=str(file_id) if file_id else None,
@@ -284,28 +210,15 @@ def log_warn(log, op: str, *, folder_id=None, file_id=None, token=None, msg: str
     log.warning(f"[{op}] {ctx} | {msg}" if msg else f"[{op}] {ctx}")
 
 
-# ============================================================================
-# HTTP Request Info Logger（支援 FastAPI 和 FastMCP）
-# ============================================================================
-
 async def log_request_info(
     tool_name: str = "",
     module: LogModule = "mcptools",
     request: Request = None
 ) -> Dict[str, Any]:
-    """記錄並返回當前 HTTP 請求信息
+    """Log and return the current HTTP request info.
 
-    支援兩種呼叫方式：
-    - FastAPI: 傳入 request 參數
-    - FastMCP: 自動從 context 取得 request
-
-    Args:
-        tool_name: 調用此函數的工具名稱
-        module: 要記錄到的模組名稱（預設為 "mcptools"）
-        request: FastAPI Request（可選，FastMCP 會自動獲取）
-
-    Returns:
-        包含請求信息的字典
+    Supports two calling styles: FastAPI (pass ``request``) and FastMCP (request
+    is obtained automatically from the context).
     """
     module_logger = get_logger(module)
 

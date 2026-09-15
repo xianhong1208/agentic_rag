@@ -1,55 +1,25 @@
-# ============================================================================
 # agentic-rag — Agentic RAG MCP Server
-#
-# ⚠️ AMD 硬體部署說明:
-# AMD 現用 multi-arch wheel(torch[device-all]):一顆 wheel 內含所有 GPU 架構
-# (gfx1151 RDNA3.5 APU / gfx90a CDNA2 / gfx1201 RDNA4)的 HSACO kernel,三種
-# 機台裝的東西完全相同 —— 應用套件全在 [project].dependencies,GPU 層只差
-# torch/torchvision/torchaudio,multi-arch 下連這個都同一顆 wheel。
-# 所以「機台」不再各自開 group,只依 ROCm 版本分兩個。
-#
-# 透過 PEP 735 dependency groups 切換,build 時用 `--group <name>` 指定目標。
-#
-# 部署目標對照表:
-#   rocm-r713  全 AMD(gfx1151/90a/1201)  ROCm 7.1.3  AMD multi-arch index
-#   rocm-r714  全 AMD(gfx1151/90a/1201)  ROCm 7.1.4  AMD multi-arch index
-#   cuda       NVIDIA(build 機本地測試)  CUDA 12.6   PyTorch 官方
-#   cpu        CI / 無 GPU 環境           —           PyTorch 官方
-#
-# 常用指令:
-#   uv lock                       # 重 resolve 全部 group(改 pyproject 後跑)
-#   uv sync --group rocm-r714     # 任何 AMD 機台,ROCm 7.1.4(torch 2.12)
-#   uv sync --group rocm-r713     # 任何 AMD 機台,ROCm 7.1.3(torch 2.11)
-#   uv sync --group cuda          # 本地 NVIDIA 開發機
-#   uv sync --group cpu           # CI / 純 CPU
-#
-# ⚠️ 新增/升 ROCm 版本要更新五處:
-#   (1) 上面對照表 + 常用指令
-#   (2) [dependency-groups] 新增 rocm-r<ver>(版本見 whl-multi-arch index)
-#   (3) [tool.uv] 底下的 conflicts 清單加進互斥項(注意:是 [tool.uv] 表的 key,
-#       不是獨立的 [tool.uv.conflicts] 表)
-#   (4) [tool.uv.sources] torch/torchvision/torchaudio 各加一行指到 pytorch-rocm-multiarch
-#   (5) 檔外文件:docs/testing/ENVIRONMENTS.md、ROADMAP.md、README.md 若列出 group 名也要同步
-# ============================================================================
+# GPU builds select PyTorch via PEP 735 dependency groups: `uv sync --group {rocm-r713|rocm-r714|cuda|cpu}`.
+# Only torch/torchvision/torchaudio differ per group; see docs/testing/ENVIRONMENTS.md for the matrix.
 
 [project]
 name = "agentic-rag"
-version = "1.1.9"
+version = "1.0.0"
 description = "Agentic RAG MCP Server — Hierarchical chunking + AutoMerging retrieval, designed for gpt-oss-120b"
-# Python 3.12 是所有 PyTorch wheel(rocm/cuda/cpu)都有 cp312 build 的最低版本
+# 3.12 is the lowest Python with cp312 wheels for every PyTorch build (rocm/cuda/cpu).
 requires-python = ">=3.12,<3.13"
 
 dependencies = [
-    # MCP / Web framework
+    # MCP / web framework
     "fastmcp>=3.2.0",
     "mcp[cli]>=1.24.0",
     "uvicorn==0.38.0",
     "fastapi==0.121.1",
-    # Logging / Config / Validation
+    # Logging / config / validation
     "loguru==0.7.3",
     "psutil==7.1.3",
     "pydantic==2.12.4",
-    # Database (跟前一版 flat RAG 共用)
+    # Database
     "sqlalchemy==2.0.44",
     "psycopg2==2.9.11",
     "alembic==1.17.1",
@@ -61,51 +31,34 @@ dependencies = [
     "llama-index-embeddings-azure-openai==0.6.0",
     "llama-index-embeddings-huggingface==0.6.1",
     "llama-index-embeddings-openai-like==0.4.0",
-    # 0.14.24 meta 不再內含 readers-file(舊 0.14.7 有);SimpleDirectoryReader
-    # 的非純文字 fallback(document_loader._load_via_simple_reader)需要它,顯式保留
+    # Required by SimpleDirectoryReader's non-text fallback (not bundled in the 0.14.24 meta).
     "llama-index-readers-file==0.7.0",
     "pgvector==0.4.1",
     "openai==1.109.1",
     "tiktoken==0.12.0",
     "numpy==2.3.4",
-    # Document parsing (沿用前一版 flat RAG)
-    # ⚠️ 下限 2.124:2.119→2.124 經查 CHANGELOG 無 ASR/audio API 變更、breaking
-    # 僅 CLI 層;紅利 = threaded docling-parse 預設化(2.123)、pipeline options
-    # cache key 修復、Apple Pages 支援(2.121)。歷史前提不變:ASR 的
-    # word_timestamps 選項化(2.111+)是繞開 whisper Triton 依賴的基礎
-    # (PatchedAsrPipeline 已隨 2.119 移除)
+    # Document parsing (Docling, with ASR extra)
     "docling[asr]>=2.124.0",
-    # OpenDocument(odt/ods/odp)解析依賴 — 格式 v3 實測抓到缺這個(版本對齊
-    # docling-slim 的 format-opendocument extra 約束)
+    # OpenDocument (odt/ods/odp) parsing
     "odfdo>=3.22.0,<4.0.0",
     "pymupdf==1.26.7",
     "pillow==12.2.0",
     "openpyxl>=3.1.5",
     "python-docx>=1.2.0",
-    # ----- FireRedASR(BL-08)-----
-    # vendored 官方推論碼(見 [tool.uv.sources] path dep;vendor/fireredasr_src)
+    # FireRedASR — vendored official inference code (see [tool.uv.sources]; vendor/fireredasr_src)
     "fireredasr",
-    # AED 推論依賴 —
-    # 全為 arch 無關輕依賴(kaldi-native-fbank/sentencepiece 有 manylinux wheel);
-    # peft 僅 LLM 變體用且為 lazy import,不裝。VAD 切段走系統 ffmpeg
-    # silencedetect(silero-vad 會把 torchaudio 拖進 base resolution,與
-    # GPU group 切換衝突,棄用)。opencc = 簡→繁(s2twp,含台灣用語)。
+    # FireRedASR AED inference deps (arch-independent); opencc handles Simplified->Traditional.
     "kaldiio>=2.18.0",
     "kaldi-native-fbank>=1.15",
     "sentencepiece>=0.2.0",
     "opencc>=1.1.9",
-    # OCR:docling 2.10x 起改用新版 `rapidocr` 3.x(docling 的 transitive dep,
-    # 不用明列);舊的 rapidocr-onnxruntime 1.x 已無人 import,2026-07 移除
-    # OCR 推論走 rapidocr torch backend(與 docling 共用 torch,CUDA/ROCm 通吃),
-    # 不再依賴 onnxruntime — 各 GPU 的 onnxruntime 變體維護已移除
+    # OCR runs via docling's transitive rapidocr (torch backend); no onnxruntime needed.
     # Test
     "pytest==9.0.3",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
     "pytest-mock>=3.15.0",
-    # ----- Security pins (沿用前一版 flat RAG 的 CVE 修補) -----
-    # torch / torchvision / torchaudio 由 [dependency-groups] 提供
-    # (rocm-r713 / rocm-r714 / cuda / cpu 擇一),不寫在這
+    # Security pins. torch/torchvision/torchaudio come from [dependency-groups], not here.
     "nltk>=3.9.4",
     "authlib>=1.6.9",
     "aiohttp>=3.13.4",
@@ -118,31 +71,26 @@ dependencies = [
     "pyjwt>=2.12.0",
     "marshmallow>=3.26.2",
     "requests>=2.33.0",
-    # transformers 保守鎖 4.x:4.46+ 已涵蓋 2024-2025 末的 CVE patches。
-    # torch 2.8(cuda 組)技術上可跑 transformers 5.x,但升 5.x 需另行驗證
-    # sentence-transformers / llama-index-embeddings-huggingface 相容性,獨立處理
+    # Pinned to 4.x; 5.x needs separate sentence-transformers / llama-index compatibility checks.
     "transformers>=4.46.0,<5.0.0",
+    # CKIP word segmentation for Chinese BM25/FTS (Academia Sinica). Segments in Python, then
+    # Postgres tokenizes with `simple`; replaces the old pg_jieba/jiebacfg path.
+    "ckip-transformers>=0.3.4",
     "pygments>=2.20.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-# 讓 `uv run pytest` 直接找得到 src.*(專案未以 package 安裝,靠 rootdir 上 path)
 pythonpath = ["."]
 
-# ============================================================================
-# Coverage — 單元測試覆蓋率(docs/testing/TEST_PLAN.md 第 5 節)
-# 範圍 = 可純邏輯測試的模組(單元測試範疇)。
-# omit 清單 = 需要 DB / vLLM / GPU / 網路才能執行的模組,屬整合/系統測試範疇
-# (見 docs/testing/TEST_STRATEGY.md 2.3-2.4),用部署環境與 scripts/ 驗證,
-# 不納入單元覆蓋率統計——不灌水也不拖低門檻。
-# ============================================================================
+# Unit-test coverage. `omit` lists modules that need DB/vLLM/GPU/network and are covered by
+# integration tests instead (see docs/testing/TEST_STRATEGY.md).
 [tool.coverage.run]
 source = ["src"]
 omit = [
     "tests/*",
-    # -- adapter 業務串接層(DB + llama_index;僅 model.py 為純 DTO 保留) --
+    # adapter layer (DB + llama_index)
     "src/adapter/file.py",
     "src/adapter/folder.py",
     "src/adapter/rag.py",
@@ -150,7 +98,7 @@ omit = [
     "src/adapter/rag_indexing.py",
     "src/adapter/rag_query.py",
     "src/adapter/rag_maintenance.py",
-    # -- API 路由與 Depends(FastAPI + DB;僅 response.py schema 保留) --
+    # API routers and Depends (FastAPI + DB)
     "src/api/router/health.py",
     "src/api/router/index.py",
     "src/api/router/media.py",
@@ -159,10 +107,8 @@ omit = [
     "src/api/router/rag_indexing.py",
     "src/api/router/rag_query.py",
     "src/api/dependencies/*",
-    # -- RAG pipeline 重外部依賴(pgvector / vLLM / GPU / docling) --
+    # RAG pipeline with heavy external deps (pgvector / vLLM / GPU / docling)
     "src/domain/rag/hierarchical_indexer.py",
-    # M14/M6 搬移模組:原即屬 omit 範圍(hierarchical_indexer / fastmcp_tools/*),
-    # 搬進 domain 後性質不變 — 由 tests/integration 的 pipeline/三模式網覆蓋
     "src/domain/rag/document_loader.py",
     "src/domain/rag/leaf_splitter.py",
     "src/domain/rag/agentic_handlers.py",
@@ -175,20 +121,19 @@ omit = [
     "src/domain/rag/reranker.py",
     "src/domain/rag/auto_merging.py",
     "src/domain/rag/embedding/*",
-    # -- MCP 工具註冊 / 遠端認證 wiring(FastMCP + DB + httpx) --
+    # MCP tool registration / auth wiring (FastMCP + DB + httpx)
     "src/fastmcp_tools/*",
     "src/auth/dependencies.py",
     "src/auth/init_auth.py",
     "src/middleware/auth_middleware.py",
-    # -- 其他 wiring --
+    # other wiring
     "src/log.py",
     "src/utils/db_bootstrap.py",
 ]
 
 [tool.coverage.report]
-# 覆蓋率門檻:低於 95% 時 `pytest --cov` 以非零退出(CI gate)
-# 2026-08-20 升 85→95(實測 95.2%);另有逐檔下限 50%,由
-# scripts/check_coverage_floor.py 把關(coverage 無內建 per-file 門檻)
+# CI gate: `pytest --cov` exits non-zero below 95%. A per-file 50% floor is enforced by
+# scripts/check_coverage_floor.py (coverage has no built-in per-file threshold).
 fail_under = 95
 show_missing = true
 exclude_lines = [
@@ -196,66 +141,37 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
-    # 抽象方法的 pass 體不可能執行 — 豁免而非寫假測試
     "@(abc\\.)?abstractmethod",
 ]
 
 
-# ============================================================================
-# Dependency Groups — PyTorch 安裝分流(PEP 735)
-# ============================================================================
+# PyTorch install split (PEP 735). Groups are mutually exclusive — see [tool.uv] conflicts.
 [dependency-groups]
 
-# ---- NVIDIA CUDA 12.6 -------------------------------------------------------
-# 本地 build 機 GPU 測試用。torch 2.8+ 是 docling 2.108+ asr(whisper-s2t-reborn,
-# CTranslate2 後端)的硬需求。
-# 本機 driver 535.230 / CUDA 12.2:cu126 靠 CUDA 12.x minor-version compatibility
-# (需 driver >= 525)可跑;cu128 在此機實測不行,不要升回去
+# NVIDIA CUDA 12.6 (local build-box GPU testing). torch 2.8+ is required by docling ASR.
 cuda = [
     "torch>=2.8.0,<2.9",
     "torchvision>=0.23.0,<0.24",
     "torchaudio>=2.8.0,<2.9",
-    # triton 明列在此是為了讓 [tool.uv.sources] 的 index pin 生效
-    # (torch 的 transitive dep;不 pin 會被 AMD index 的 +rocm local version 蓋掉)
+    # triton is listed so its [tool.uv.sources] index pin applies (it is a torch transitive dep).
     "triton>=3.4.0,<3.5",
 ]
 
-# ---- 純 CPU(CI / 無 GPU 環境) -----------------------------------------------
-# 下限對齊 cuda 組:torch 2.8+ 是 docling asr(whisper-s2t-reborn / CTranslate2)硬需求。
-# 別退回 2.6/2.7 —— 那個組合 asr 會壞,而 asr 模組不在單元覆蓋率範圍,CI 抓不到。
+# Pure CPU (CI / no GPU). Keep torch >= 2.8 — earlier versions break docling ASR.
 cpu = [
     "torch>=2.8.0",
     "torchvision>=0.23.0",
     "torchaudio>=2.8.0",
 ]
 
-# ============================================================================
-# ROCm 7.1.x multi-arch wheels(2026-08 新增,v1.1.9)
-# ============================================================================
-# AMD 改用單一 multi-arch index:torch[device-all] 一顆 wheel 內含所有 AMD 架構
-# 的 kernel(gfx1151 / gfx90a / gfx1201 通吃),不再需要 per-gfx 分 index、
-# 也不需要 rocm[libraries] meta(multi-arch wheel 自帶 ROCm runtime libs)。
-# 官方安裝法:
-#   pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
-#     torch[device-all]==2.12.0+rocm7.14.0 torchvision[device-all]==0.27.0+rocm7.14.0 \
-#     torchaudio==2.11.0+rocm7.14.0
-# ⚠️ 版本為 whl-multi-arch index 實際存在的最高 cp312 linux_x86_64(2026-08 查證):
-#     7.13.0 → torch 2.11.0 / tv 0.26.0 / ta 2.11.0
-#     7.14.0 → torch 2.12.0 / tv 0.27.0 / ta 2.11.0(torchaudio 官方就是停在 2.11)
-# ⚠️ [device-all] extra 只加在 torch / torchvision;torchaudio 不加(對齊官方指令)
-#
-# 只有兩個 group:應用層套件全在 [project].dependencies,三台 AMD 機器完全相同;
-# 唯一差異是 ROCm 版本(7.1.3 / 7.1.4)。multi-arch 下同版本三機型解到同一顆
-# wheel,所以不再分機型 group —— 直接依 ROCm 版本選 rocm-r713 / rocm-r714。
-# (舊的 per-gfx groups 與 `rocm` 別名已於 v1.1.9 一併移除)
-
-# ROCm 7.1.3
+# AMD ROCm 7.1.x multi-arch wheels: one torch[device-all] wheel covers all AMD archs
+# (gfx1151 / gfx90a / gfx1201). Groups differ only by ROCm version. [device-all] applies
+# to torch/torchvision only, not torchaudio (matches AMD's official command).
 rocm-r713 = [
     "torch[device-all]==2.11.0+rocm7.13.0",
     "torchvision[device-all]==0.26.0+rocm7.13.0",
     "torchaudio==2.11.0+rocm7.13.0",
 ]
-# ROCm 7.1.4
 rocm-r714 = [
     "torch[device-all]==2.12.0+rocm7.14.0",
     "torchvision[device-all]==0.27.0+rocm7.14.0",
@@ -263,32 +179,22 @@ rocm-r714 = [
 ]
 
 
-# ============================================================================
-# uv 設定
-# ============================================================================
 [tool.uv]
-# 下載併發降到 8(uv 預設 50)。CI/build 機首次 bootstrap 要抓 ~3.5GB
-# (torch 783M + cudnn 674M + cublas 375M...),50 條並行會把小檔(pyyaml 等)
-# 餓死在 30s 預設 timeout 內 → "Failed to download ... network timeout"。
-# 降併發讓小檔不被大檔擠掉;build 系統若可設 env,建議再加 UV_HTTP_TIMEOUT=300 保險
+# Lower concurrency so first-time bootstrap (~3.5GB of torch/cuda wheels) doesn't starve
+# small downloads into the default 30s timeout. Consider UV_HTTP_TIMEOUT=300 in CI.
 concurrent-downloads = 8
 
-# 部署目標一律 Linux x86_64。沒有這行,unsafe-best-match 可能從別的 index
-# 挑到只有 aarch64/win wheel 的版本(實例:nvidia-cublas-cu12 從 rocm6.4 index
-# 解到 12.8.4.1,Linux x86_64 無 wheel → sync 爆炸)
+# Deploy target is always Linux x86_64; without this, unsafe-best-match may pick a version
+# that only ships aarch64/win wheels.
 required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
-# unsafe-best-match: 允許 uv 跨 index 找最佳套件
-# 必要原因:AMD multi-arch index 只放 ROCm 套件,對 PyPI 一般套件會回錯,
-# 嚴格 first-match resolver 會卡死。
-# ⚠️ AMD index 與 PyPI 確有同名套件(已知 triton),且 AMD 的 local version
-# (+rocm...)排序較高會蓋過裸版本 —— 靠下方 [tool.uv.sources] 逐一 pin 隔離
-# (triton 見第 320 行附近)。所以「不撞名」的說法不成立,不要據此刪掉那些 pin。
+# Needed because the AMD index only serves ROCm packages; a strict first-match resolver stalls
+# on ordinary PyPI packages. The per-package [tool.uv.sources] pins isolate the few names that
+# collide (e.g. triton, whose +rocm local version would otherwise win).
 index-strategy = "unsafe-best-match"
 
-# GPU/CPU group 互斥(同時只能啟用一個)—— 四個 group 都 install 同一個 torch
-# package,只是 index / 版本不同,同時啟用會互相覆蓋。這份清單就是唯一的守門:
-# 新增任何 group(含新 ROCm 版本)都要手動加進來,漏加 uv 不會警告。
+# GPU/CPU groups are mutually exclusive (all install the same torch package from different
+# indexes). This list is the only guard — add every new group (including new ROCm versions).
 conflicts = [
     [
         { group = "rocm-r713" },
@@ -299,36 +205,24 @@ conflicts = [
 ]
 
 
-# ============================================================================
-# Wheel Index 來源
-# ============================================================================
-
-# ---- AMD ROCm 7.1.x multi-arch wheel(v1.1.9;torch[device-all] 通吃所有架構)--
-# 唯一的 AMD wheel 來源(舊 per-gfx index 已隨 legacy groups 一併移除)。
+# Wheel index sources.
 [[tool.uv.index]]
 name = "pytorch-rocm-multiarch"
 url = "https://repo.amd.com/rocm/whl-multi-arch/"
-# ⚠️ 不能 explicit = true:torch[device-all] 的 transitive deps(rocm runtime
-# libs 等)都在此 index,設 explicit 會解不到。此 index 只放 ROCm 套件,不撞 PyPI。
-# ---- NVIDIA CUDA 12.6 wheel -------------------------------------------------
+# Not explicit: torch[device-all]'s transitive ROCm runtime libs also live on this index.
 [[tool.uv.index]]
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
-explicit = true   # cuda group 只用 torch/torchvision/torchaudio,沒有特殊 transitive deps
-
-# ---- 純 CPU wheel -----------------------------------------------------------
+explicit = true
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 
-# ============================================================================
-# Source Mapping — 每個 group 對應到自己的 index
-# ============================================================================
+# Map torch/torchvision/torchaudio (and triton) to the right index per group.
 [tool.uv.sources]
-# vendored FireRedASR(官方碼無 PyPI 發佈)→ 本地 path dependency:
-# 裝進 site-packages 讓 Nuitka 當一般依賴編進 binary,部署不用外帶 vendor/
+# Vendored FireRedASR (no PyPI release) installed as a local path dependency.
 fireredasr = { path = "vendor/fireredasr_src" }
 torch = [
     { index = "pytorch-rocm-multiarch", group = "rocm-r713" },
@@ -348,20 +242,14 @@ torchaudio = [
     { index = "pytorch-cu126",          group = "cuda"      },
     { index = "pytorch-cpu",            group = "cpu"       },
 ]
-# triton 必須跟著各 group 的 index 走。沒有這條,unsafe-best-match 會讓
-# AMD index 的 `3.4.0+rocm7.12.0`(PEP 440:local version > 裸版本)蓋掉
-# cuda 要的裸 `3.4.0` → NVIDIA 機器裝到 ROCm triton,torch.compile 直接炸
+# Pin triton to the CUDA index; otherwise the AMD index's +rocm local version outranks the
+# bare 3.4.0 that CUDA needs, and torch.compile breaks on NVIDIA.
 triton = [
     { index = "pytorch-cu126",        group = "cuda" },
 ]
 
 
-# ============================================================================
-# Packaging — 讓專案以 package 安裝進 .venv,產生 dist-info metadata
-# ============================================================================
-# 版本讀取(src/version.py)走 importlib.metadata,與 coreagent 同模式:
-# Nuitka/EXTERNAL 打包時 metadata 隨 site-packages(libs/)一起帶出,
-# 部署產物不需要攜帶 pyproject.toml。
+# Install the project as a package so importlib.metadata can read the version (src/version.py).
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -1,8 +1,9 @@
 
-"""Admin 主控台唯讀彙總查詢(跨表 read-only;不做任何寫入)。
+"""Read-only aggregate queries for the admin console (cross-table reads; never writes).
 
-Control Center 的資料面:總覽 KPI、folder 索引狀況、file 級狀態、
-index job 清單。全部走 aggregate/join,一次查詢一個畫面,避免 N+1。
+Backs the Control Center data views: overview KPIs, per-folder index status,
+file-level status, and the index job list. Each view is a single aggregate/join
+query to avoid N+1.
 """
 from __future__ import annotations
 
@@ -15,18 +16,18 @@ from src.log import get_db_logger
 
 log = get_db_logger()
 
-# 終態以外都算「進行中」(與 IndexingJobManager 的狀態機一致)
+# Any non-terminal status counts as "in progress" (matches IndexingJobManager's state machine)
 _JOB_ACTIVE = ("pending", "running", "queued")
 
 
 def _ensure_bound() -> None:
-    """Session 綁定保險 — admin API 可能在任何 DB 呼叫前先被打。"""
+    """Ensure the Session is bound — the admin API may be hit before any other DB call."""
     from db.db import get_engine
     get_engine()
 
 
 def overview() -> Dict[str, Any]:
-    """總覽 KPI:folder/file/index/job 全域統計。"""
+    """Overview KPIs: global folder/file/index/job statistics."""
     _ensure_bound()
     with Session() as s:
         folders = s.query(func.count(Folder.id)).scalar() or 0
@@ -62,7 +63,7 @@ def overview() -> Dict[str, Any]:
 
 
 def folders_with_index_stats() -> List[Dict[str, Any]]:
-    """全部 folder + 各自的索引彙總(單一查詢 join,無 N+1)。"""
+    """All folders plus their index summaries (single join query, no N+1)."""
     _ensure_bound()
     with Session() as s:
         idx = s.query(
@@ -95,7 +96,7 @@ def folders_with_index_stats() -> List[Dict[str, Any]]:
 
 
 def files_with_index_status(folder_id: int) -> List[Dict[str, Any]]:
-    """單一 folder 的檔案清單 + 索引狀態(left join FileIndex)。"""
+    """File list for a single folder plus index status (left join FileIndex)."""
     _ensure_bound()
     with Session() as s:
         rows = s.query(File, FileIndex).outerjoin(
@@ -115,14 +116,14 @@ def files_with_index_status(folder_id: int) -> List[Dict[str, Any]]:
                 "chunks": (ix.num_chunks or 0) if ix else 0,
                 "embedding_model": ix.embedding_model if ix else None,
                 "indexed_at": _iso(ix.indexed_at) if ix else None,
-                # 錯誤訊息截前 300 字(完整訊息可再查 DB;列表面不塞爆)
+                # Truncate the error message to 300 chars (full message stays in the DB; keep the list view lean)
                 "error": (err[:300] + ("…" if len(err) > 300 else "")) or None,
             })
         return out
 
 
 def recent_jobs(limit: int = 20) -> List[Dict[str, Any]]:
-    """近期 index job(含 folder 名),依最後更新排序。"""
+    """Recent index jobs (including folder name), ordered by last update."""
     _ensure_bound()
     with Session() as s:
         rows = s.query(IndexJob, Folder.name).outerjoin(
@@ -132,7 +133,7 @@ def recent_jobs(limit: int = 20) -> List[Dict[str, Any]]:
 
 
 def indexing_trend(days: int = 7) -> List[Dict[str, Any]]:
-    """近 N 天每日索引完成的檔案數(sparkline 用;依 FileIndex.indexed_at)。"""
+    """Daily count of files indexed over the last N days (for the sparkline; by FileIndex.indexed_at)."""
     _ensure_bound()
     from sqlalchemy import func as _f
     from datetime import datetime, timedelta, timezone
@@ -151,11 +152,12 @@ def indexing_trend(days: int = 7) -> List[Dict[str, Any]]:
 
 
 def chunks_for_file(folder_id: int, file_id: str, limit: int = 500) -> Dict[str, Any]:
-    """列出某檔切好的 leaf chunks(按 chunk_index 排序;客戶檢視索引長相用)。
+    """List the leaf chunks of a file (ordered by chunk_index; lets users inspect what the index looks like).
 
-    直接讀該 folder 的 pgvector 物理表 — file_id 走 bind param 防注入,
-    表名由 folder_id + server 端 vector_table_uuid 組成(非用戶輸入)。
-    表不存在(未索引)→ 回空清單而非報錯。
+    Reads the folder's physical pgvector table directly. file_id is passed as a bind
+    param to prevent injection; the table name is composed from folder_id and the
+    server-side vector_table_uuid (not user input). A missing table (not indexed)
+    returns an empty list rather than raising.
     """
     _ensure_bound()
     from sqlalchemy import text
@@ -193,7 +195,7 @@ def chunks_for_file(folder_id: int, file_id: str, limit: int = 500) -> Dict[str,
 
 
 def system_resources() -> Dict[str, Any]:
-    """DB 大小 / 向量表總大小 / 磁碟用量(總覽資源卡)。全 best-effort。"""
+    """DB size / total vector-table size / disk usage (overview resource card). All best-effort."""
     _ensure_bound()
     from sqlalchemy import text
     from db.db import get_engine

@@ -1,13 +1,9 @@
 
-"""整合測試 — IndexJobDB / FileIndexDB 真庫往返(M14 前置測試網,第一塊)。
+"""Integration tests -- IndexJobDB / FileIndexDB real-DB round-trips.
 
-這兩層是 IndexingJobManager 的持久化面(write-through / restart 回收 /
-失敗 tag),全在 coverage omit、之前零測試。在真 PostgreSQL 上鎖住:
-- IndexJobDB.upsert 往返 + update 語義 + JSONB 欄位 + load_active 過濾
-- FileIndexDB.upsert_indexed 的 reindex idempotency(同 file 二次不撞
-  UniqueViolation)+ content_hash 持久化 + mark_failed 三條路徑之二
-
-跑法:有 DB 時 `uv run --no-sync pytest tests/integration -v`;無 DB 自動 skip。
+Covers IndexJobDB.upsert round-trip, update semantics, JSONB fields, and
+load_active filtering; and FileIndexDB.upsert_indexed reindex idempotency,
+content_hash persistence, and the mark_failed paths.
 """
 
 import uuid
@@ -15,7 +11,7 @@ import uuid
 from db.fileindexdb import FileIndexDB
 from db.indexjobdb import IndexJobDB
 
-# folder / file_row fixture 在 conftest.py(與 test_index_pipeline 共用)
+# The folder / file_row fixtures live in conftest.py (shared with test_index_pipeline)
 
 
 def _job_state(folder_id: int, **over):
@@ -33,7 +29,7 @@ def _job_state(folder_id: int, **over):
         "last_updated_at": "2026-08-19T00:01:00+00:00",
         "scope_file_ids": ["f-1", "f-2"],
         "file_timings": [{"file_id": "f-1", "total_ms": 1200}],
-        # 不在 _PERSISTED_FIELDS 的 key 必須被安全 drop(forward-compat)
+        # Keys not in _PERSISTED_FIELDS must be safely dropped (forward-compat)
         "current_file_eta_seconds": 42,
         "eta_seconds": 99,
     }
@@ -50,7 +46,7 @@ class TestIndexJobDB:
         assert row is not None, "upsert 靜默失敗(它吞例外只 log — roundtrip 才驗得出)"
         assert row["status"] == "running"
         assert row["total_files"] == 3
-        # JSONB 欄位原樣往返
+        # JSONB fields round-trip verbatim
         assert row["scope_file_ids"] == ["f-1", "f-2"]
         assert row["file_timings"] == [{"file_id": "f-1", "total_ms": 1200}]
 
@@ -97,7 +93,7 @@ class TestFileIndexDB:
         assert rec.content_hash == "a" * 64
 
     def test_upsert_indexed_reindex_is_idempotent(self, itest_db, folder, file_row):
-        """同 file 二次 upsert:不撞 UniqueViolation、值就地更新(reindex 場景)。"""
+        """Second upsert of the same file: no UniqueViolation, values updated in place (reindex scenario)."""
         for num_chunks, chash in ((7, "a" * 64), (9, "b" * 64)):
             FileIndexDB.upsert_indexed(
                 file_id=file_row.id, folder_id=folder.id,
@@ -123,7 +119,7 @@ class TestFileIndexDB:
         assert "boom" in (rec.error_message or "")
 
     def test_mark_failed_creates_row_when_absent(self, itest_db, folder, file_row):
-        """沒有先前記錄 + 給 folder_id → 建 failed row(60c3943 timeout tag 的關鍵路徑)。"""
+        """No prior record + folder_id given -> create a failed row (the key path for timeout tagging)."""
         FileIndexDB.mark_failed(
             file_row.id, "timeout", folder_id=folder.id,
             embedding_model="e5-large", chunk_size=256, chunk_overlap=50,

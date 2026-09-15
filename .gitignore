@@ -84,3 +84,9 @@ evals/asr/audio/*
 evals/asr/golden_transcripts/*
 evals/asr/drafts/*
 !evals/**/.gitkeep
+
+# Local environment overrides (DATABASE_URL etc.) — never commit real secrets
+.env
+
+# Node / frontend build deps
+node_modules/

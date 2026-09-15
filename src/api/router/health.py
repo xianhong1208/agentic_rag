@@ -25,44 +25,28 @@ logger = get_api_logger()
 router = APIRouter(tags=["Health"], prefix="/health")
 
 
-# Response = {status, timestamp};給 K8s / Docker liveness probe 用,無依賴
+# Liveness probe (K8s / Docker): no dependencies.
 @router.get(
     "",
     response_model=HealthStatusResponse,
 )
 async def health_check():
-    """Basic health check.
-
-    Returns:
-        Status + ISO timestamp 表示 server 還在跑。
-    """
+    """Basic liveness check: returns status + ISO timestamp."""
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-# Response = nested dict {status, components{db,pgvector,cache,pool}, overall_healthy}
 @router.get("/detailed")
 async def detailed_health_check():
-    """Comprehensive health check with component status
-
-    Checks:
-    - Database connectivity
-    - PGVector extension availability
-    - Cache service status
-    - Overall system health
-
-    Returns:
-        Detailed health information for all system components
+    """Comprehensive health check reporting per-component status (DB, PGVector, cache, pool).
 
     Use this for readiness probes or detailed monitoring.
     """
     checks: Dict[str, Any] = {}
     overall_healthy = True
 
-    # 1. Check Database Connectivity
     try:
         engine = get_engine()
         with Session(bind=engine) as session:
-            # Try a simple query
             session.execute(text("SELECT 1"))
             checks["database"] = {
                 "status": "healthy",
@@ -77,11 +61,9 @@ async def detailed_health_check():
         overall_healthy = False
         logger.error(f"Database health check failed: {e}")
 
-    # 2. Check PGVector Extension
     try:
         engine = get_engine()
         with Session(bind=engine) as session:
-            # Check if pgvector extension is installed
             result = session.execute(text(
                 "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')"
             ))
@@ -108,7 +90,6 @@ async def detailed_health_check():
         overall_healthy = False
         logger.error(f"PGVector health check failed: {e}")
 
-    # 3. Check Cache Service
     try:
         cache = CacheService.get_instance()
         cache_stats = cache.get_stats()
@@ -127,7 +108,6 @@ async def detailed_health_check():
         overall_healthy = False
         logger.error(f"Cache health check failed: {e}")
 
-    # 4. Check Database Connection Pool
     try:
         engine = get_engine()
         pool = engine.pool
@@ -150,15 +130,15 @@ async def detailed_health_check():
         # Not critical for overall health
         logger.warning(f"Connection pool stats unavailable: {e}")
 
-    # 5. Capability degradation — router/module 啟動載入失敗(M15)
-    #    原本這類失敗只記 log、server 照常啟動,/health 卻 healthy、端點靜默 404。
+    # Capability degradation: a router/module can fail to load at startup yet the server still
+    # starts, so /health would report healthy while those endpoints silently 404. Surface it here.
     from src.api.startup_state import get_load_failures
     load_failures = get_load_failures()
     if load_failures:
         checks["capabilities"] = {
             "status": "degraded",
             "failed": load_failures,
-            "message": "部分 router/module 啟動載入失敗,對應端點不可用(詳見啟動 log)",
+            "message": "Some routers/modules failed to load at startup; their endpoints are unavailable (see startup log)",
         }
         overall_healthy = False
     else:
@@ -171,21 +151,12 @@ async def detailed_health_check():
     }
 
 
-# Response = nested cache stats dict {status, stats{size, hit_rate, ...}, message}
 @router.get(
     "/cache/stats",
     responses={500: {"model": ErrorDetailResponse}},
 )
 async def cache_stats():
-    """Get cache performance statistics
-
-    Returns cache metrics including:
-    - Hit/miss counts and rates
-    - Current size and capacity
-    - Set/delete operation counts
-
-    Useful for monitoring cache effectiveness.
-    """
+    """Cache performance statistics (hit/miss rates, size, operation counts)."""
     try:
         cache = CacheService.get_instance()
         stats = cache.get_stats()
@@ -208,9 +179,9 @@ async def cache_stats():
         )
 
 
-# Response = {status, message, items_removed, timestamp}
-# ⚠️ 唯一掛認證的 health 端點:這是寫操作(清全租戶快取,可重複打 = DoS)。
-# 其餘 GET(liveness / stats)依內網部署哲學保持開放,監控系統不需配 token。
+# The only authenticated health endpoint: it is a write operation (clears the all-tenant cache;
+# repeatable calls = DoS). The other GETs (liveness / stats) stay open per the internal-network
+# deployment philosophy, so monitoring systems need no token.
 @router.post(
     "/cache/clear",
     response_model=CacheClearResponse,
@@ -218,13 +189,9 @@ async def cache_stats():
     dependencies=[Depends(authenticate_request)],
 )
 async def clear_cache():
-    """Clear all cached data
+    """Clear all cached data.
 
-    WARNING: This will force all subsequent requests to hit the database
-    until the cache is repopulated. Use sparingly.
-
-    Returns:
-        Confirmation message with stats before clearing
+    Forces subsequent requests to hit the database until the cache repopulates; use sparingly.
     """
     try:
         cache = CacheService.get_instance()
@@ -252,28 +219,17 @@ async def clear_cache():
         )
 
 
-# Response = {status, database_stats{table_counts, database_size, active_connections}, timestamp}
 @router.get(
     "/database/stats",
     responses={500: {"model": ErrorDetailResponse}},
 )
 async def database_stats():
-    """Get database statistics
-
-    Returns:
-    - Table row counts
-    - Database size
-    - Index usage
-    - Connection information
-
-    Useful for monitoring database growth and performance.
-    """
+    """Database statistics: table row counts, database size, and connection info."""
     try:
         engine = get_engine()
         stats = {}
 
         with Session(bind=engine) as session:
-            # Get table row counts
             tables = ['Folders', 'Files', 'FileIndices']
             table_counts = {}
 
@@ -283,13 +239,11 @@ async def database_stats():
 
             stats['table_counts'] = table_counts
 
-            # Get database size
             result = session.execute(text(
                 "SELECT pg_size_pretty(pg_database_size(current_database()))"
             ))
             stats['database_size'] = result.scalar()
 
-            # Get connection count
             result = session.execute(text(
                 "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()"
             ))
@@ -313,17 +267,9 @@ async def database_stats():
 
 
 def _get_cache_recommendations(stats: Dict[str, Any]) -> list[str]:
-    """Generate cache performance recommendations based on stats
-
-    Args:
-        stats: Cache statistics dictionary
-
-    Returns:
-        List of recommendation strings
-    """
+    """Generate cache performance recommendations from the stats dict."""
     recommendations = []
 
-    # Check hit rate
     hit_rate = stats.get('hit_rate', 0)
     if hit_rate < 50:
         recommendations.append(
@@ -334,7 +280,6 @@ def _get_cache_recommendations(stats: Dict[str, Any]) -> list[str]:
             f"Excellent cache hit rate ({hit_rate}%)! Cache is performing well."
         )
 
-    # Check cache utilization
     size = stats.get('size', 0)
     max_size = stats.get('max_size', 1000)
     utilization = (size / max_size * 100) if max_size > 0 else 0
@@ -348,7 +293,6 @@ def _get_cache_recommendations(stats: Dict[str, Any]) -> list[str]:
             f"Cache utilization is low ({utilization:.1f}%). Current max_size may be too large."
         )
 
-    # Check if cache is being used
     total_operations = stats.get('hits', 0) + stats.get('misses', 0)
     if total_operations == 0:
         recommendations.append("Cache has no activity. Ensure caching is enabled in application code.")

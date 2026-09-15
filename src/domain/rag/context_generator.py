@@ -1,10 +1,11 @@
 
 """Contextual Retrieval — Context Generator
 
-為每個 chunk 生成上下文前綴，解決 chunk 脫離原文後語義模糊的問題。
-參考：Anthropic "Introducing Contextual Retrieval" (2024-09)
+Generates a context prefix for each chunk, resolving the semantic ambiguity a chunk has once
+detached from its source document.
+Reference: Anthropic "Introducing Contextual Retrieval" (2024-09)
 
-用法：
+Usage:
     generator = ContextGenerator.from_config(rag_config)
     contextualized_texts = await generator.generate_batch(
         chunks=["前項所述之情形，不適用本條規定。", ...],
@@ -12,10 +13,10 @@
         file_name="員工差旅管理辦法.docx",
     )
 
-效能：
-    使用 sync OpenAI client + asyncio.to_thread 並行呼叫 LLM，
-    搭配 asyncio.Semaphore 限流，最大化 vLLM continuous batching 效率。
-    使用 sync client 可避免 PyInstaller 打包環境下 AsyncOpenAI 的 event loop 問題。
+Performance:
+    Uses a sync OpenAI client + asyncio.to_thread to call the LLM concurrently, throttled by an
+    asyncio.Semaphore, maximizing vLLM continuous-batching efficiency. The sync client avoids the
+    AsyncOpenAI event-loop issues seen under PyInstaller-packaged environments.
 """
 
 from __future__ import annotations
@@ -28,14 +29,11 @@ from src.log import get_api_logger
 
 logger = get_api_logger()
 
-# Prompt — written in English for i18n maintainability.
-# CRITICAL DESIGN: the LLM is instructed to output in the SAME language as the source
-# document (not English). This keeps the generated context prefix embedding-aligned
-# with the chunk it precedes — hard-coding English output would break cross-language
-# retrieval (e.g. Chinese chunk with English prefix drifts in bge-m3 vector space).
-#
-# Strengthened with few-shot examples + harder language rule because gemma-3-27b
-# tends to slip into English for Chinese transcripts otherwise.
+# The LLM must output in the SAME language as the source document, keeping the
+# context prefix embedding-aligned with the chunk it precedes; a hard-coded English
+# prefix would drift in bge-m3 vector space and break cross-language retrieval.
+# Few-shot examples and a hard language rule are needed because gemma-3-27b otherwise
+# slips into English on Chinese transcripts.
 _CONTEXT_PROMPT = """\
 You are a document analysis assistant. Generate a short context line (1-2 sentences) \
 describing where the given chunk sits in the document, so a downstream retriever can \
@@ -84,21 +82,14 @@ Output the context line directly (remember: SAME LANGUAGE AS CHUNK):"""
 
 
 def _detect_scripts(text: str) -> set:
-    """偵測 text 中存在的主要 Unicode 字符 scripts 集合
-
-    通用設計 — 不寫死任何特定語言,直接由 Unicode block 判定。
-    支援 Latin / CJK / Hiragana / Katakana / Hangul / Cyrillic /
-    Arabic / Devanagari / Hebrew / Thai 等所有主流 script。
-
-    Returns:
-        set of script names, e.g., {"Latin", "CJK"}, {"Hiragana", "CJK"} 等
+    """Detect the set of major Unicode scripts present in text, deciding directly
+    from the Unicode block (no hardcoded language). Returns e.g. {"Latin", "CJK"}.
     """
     scripts: set = set()
     for ch in text:
         if not ch.isalpha():
             continue
         cp = ord(ch)
-        # 排前面的常見 block(可隨需擴充,新增 script 不影響既有判斷)
         if cp < 0x0080:                              scripts.add("Latin")
         elif 0x00C0 <= cp < 0x0250:                  scripts.add("Latin")    # Latin Extended
         elif 0x0400 <= cp < 0x0500:                  scripts.add("Cyrillic")
@@ -114,50 +105,34 @@ def _detect_scripts(text: str) -> set:
 
 
 def _is_script_mismatch(chunk_text: str, candidate_prefix: str) -> bool:
-    """判斷 LLM 產的 prefix 跟 chunk 主腳本是否不一致(避免向量飄移)。
+    """Return True if the prefix's main script mismatches the chunk's (avoids vector drift).
 
-    chunk 含非拉丁主腳本(CJK / Hangul / Arabic / Cyrillic …) 但 prefix 全 Latin → mismatch。
-    Latin 容差容許各語文本內雜英數標點。
-
-    Args:
-        chunk_text: 原始 chunk。
-        candidate_prefix: LLM 生的 prefix。
-
-    Returns:
-        True = mismatch(應 fallback);False = 一致或不確定。
+    A non-Latin chunk (CJK / Hangul / Arabic / Cyrillic …) with an all-Latin prefix is
+    a mismatch; the Latin tolerance allows incidental alphanumerics in any language.
     """
     chunk_scripts = _detect_scripts(chunk_text)
     prefix_scripts = _detect_scripts(candidate_prefix)
 
-    # chunk 主腳本(排除 Latin)— 若 chunk 是純 Latin,prefix 是 Latin 沒問題
+    # Exclude Latin: a pure-Latin chunk is fine with a Latin prefix
     chunk_main = chunk_scripts - {"Latin"}
     prefix_main = prefix_scripts - {"Latin"}
 
-    # chunk 有非拉丁主腳本但 prefix 完全沒有 → mismatch
     return bool(chunk_main) and not prefix_main
 
 
 def _safe_fallback_prefix(chunk_text: str, file_name: str) -> str:
-    """LLM 失敗時的 fallback prefix(用 file_name 當 prefix,語言中性)。
-
-    不加任何自然語言 wrapper(如 "[From file: X]"),讓 prefix 跟 chunk 語言一致。
-    檔名跨語時 bge-m3 對命名類噪音較不敏感。
-
-    Args:
-        chunk_text: 原始 chunk(目前僅 logging 用)。
-        file_name: 檔名,直接用為 prefix。
-
-    Returns:
-        "{file_name}\n\n{chunk_text}" 格式的 fallback string。
+    """Fallback prefix when the LLM fails: use file_name directly, adding no natural-
+    language wrapper, so the prefix stays language-neutral (bge-m3 is fairly
+    insensitive to naming-like noise). Returns "{file_name}\n\n{chunk_text}".
     """
     return f"{file_name}\n\n{chunk_text}"
 
 
 class ContextGenerator:
-    """使用 LLM 為 chunk 生成上下文前綴
+    """Uses an LLM to generate a context prefix for each chunk.
 
-    使用 sync OpenAI client + asyncio.to_thread() 並行呼叫，
-    避免 PyInstaller 打包環境下 AsyncOpenAI 的 event loop 相容問題。
+    Uses a sync OpenAI client + asyncio.to_thread() for concurrent calls, avoiding AsyncOpenAI
+    event-loop compatibility issues under PyInstaller-packaged environments.
     """
 
     def __init__(
@@ -185,7 +160,7 @@ class ContextGenerator:
 
     @classmethod
     def from_config(cls, rag_config) -> Optional["ContextGenerator"]:
-        """從 RAG config 建立 ContextGenerator
+        """Build a ContextGenerator from the RAG config.
 
         Returns:
             ContextGenerator instance, or None if not configured/enabled
@@ -218,7 +193,7 @@ class ContextGenerator:
 
     @staticmethod
     def _create_sync_client(llm_config):
-        """建立 sync OpenAI client（支援 Azure / OpenAI / vLLM / Ollama）"""
+        """Build a sync OpenAI client (supports Azure / OpenAI / vLLM / Ollama)."""
         from openai import OpenAI
 
         provider = llm_config.provider.lower()
@@ -261,7 +236,7 @@ class ContextGenerator:
             )
 
     def _call_llm_sync(self, prompt: str, client) -> str:
-        """同步呼叫 LLM（由 asyncio.to_thread 在 thread pool 中執行）"""
+        """Call the LLM synchronously (run in a thread pool via asyncio.to_thread)."""
         kwargs = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
@@ -273,7 +248,7 @@ class ContextGenerator:
 
         response = client.chat.completions.create(**kwargs)
         msg = response.choices[0].message
-        # 先讀 content，若為空則 fallback 到 reasoning_content（reasoning model）
+        # Read content first; if empty, fall back to reasoning_content (reasoning models)
         raw_content = msg.content
         if not raw_content:
             raw_content = getattr(msg, 'reasoning_content', None)
@@ -288,11 +263,11 @@ class ContextGenerator:
         semaphore: asyncio.Semaphore,
         should_abort: Optional[Callable[[], bool]] = None,
     ) -> str:
-        """為單個 chunk 生成帶有上下文前綴的文字
+        """Generate the context-prefixed text for a single chunk.
 
-        should_abort 成立時直接回傳原 chunk_text 跳過 LLM — abort 後整批結果
-        會被 indexer 丟棄(raise IndexingAbortedError),這裡只求快速讓
-        gather 收尾,不浪費 LLM 呼叫。
+        When should_abort holds, return the original chunk_text and skip the LLM — after an abort
+        the whole batch's results are discarded by the indexer (raises IndexingAbortedError), so
+        the goal here is only to let gather finish quickly without wasting LLM calls.
         """
         try:
             if should_abort and should_abort():
@@ -310,7 +285,7 @@ class ContextGenerator:
             )
 
             async with semaphore:
-                # 排在 semaphore 後面的 chunk 可能等了很久,取得執行權後再確認一次
+                # A chunk queued behind the semaphore may have waited a while; re-check once it acquires the slot
                 if should_abort and should_abort():
                     return chunk_text
                 raw_content = await asyncio.to_thread(self._call_llm_sync, prompt, client)
@@ -324,9 +299,8 @@ class ContextGenerator:
 
             context = raw_content.strip()
 
-            # 通用 script 不一致偵測 — 不寫死任何特定語言
-            # bge-m3 embed 時 prefix+chunk 主腳本錯位會讓向量飄移,該 chunk 在
-            # 對應語言 query 下命中率劇降。寧可用 fallback,不要錯位 prefix。
+            # A script-mismatched prefix+chunk drifts in bge-m3 space and tanks the
+            # chunk's hit rate on same-language queries; prefer the fallback instead.
             if _is_script_mismatch(chunk_text, context):
                 logger.warning(
                     f"LLM produced script-mismatched prefix for chunk in '{file_name}',"
@@ -351,32 +325,34 @@ class ContextGenerator:
         on_progress: Optional[Callable[[int, int], None]] = None,
         should_abort: Optional[Callable[[], bool]] = None,
     ) -> List[str]:
-        """批量為 chunks 生成 contextual prefix(並行 LLM 呼叫)。
+        """Generate contextual prefixes for a batch of chunks (concurrent LLM calls).
 
-        sync OpenAI client + asyncio.to_thread 並行;asyncio.Semaphore 限流。
+        Sync OpenAI client + asyncio.to_thread for concurrency; asyncio.Semaphore for throttling.
 
         Args:
-            chunks: 要產 prefix 的 chunk text list。
-            full_document: 完整文件內容(LLM 需要這個推理 chunk 上下文)。
-            file_name: 檔名 tag(logging + fallback 用)。
-            on_progress: ``(done, total)`` 進度回呼;每完成 10 個 chunk 或最後
-                一個呼叫一次(節流,讓 job 狀態能顯示「切到多少 ?/?」)。None 靜默。
-            should_abort: 回傳 True 時剩餘 chunk 跳過 LLM 快速收尾(檔案途中
-                被刪的 cooperative cancellation)。caller 保證此 callable 不 raise;
-                中止判定與丟棄結果由 indexer 負責,本方法照常回傳。
+            chunks: List of chunk texts to prefix.
+            full_document: Full document content (the LLM needs it to reason about chunk context).
+            file_name: File-name tag (for logging + fallback).
+            on_progress: ``(done, total)`` progress callback; invoked every 10 completed chunks or
+                on the last one (throttled, so job status can show progress). None = silent.
+            should_abort: When it returns True, remaining chunks skip the LLM to finish quickly
+                (cooperative cancellation for a file deleted mid-run). The caller guarantees this
+                callable won't raise; abort adjudication and result discarding are the indexer's
+                job, and this method returns normally.
 
         Returns:
-            跟 chunks 等長的 list;每個元素是 `prefix\n\nchunk_text` 已合成字串。
+            A list the same length as chunks; each element is the assembled `prefix\n\nchunk_text` string.
         """
         total = len(chunks)
 
-        # 建立 sync client（thread-safe，可跨 thread 共用）。每檔一個 client,
-        # 用完必關 — long-running server 不關的話 socket/fd 隨檔案數線性洩漏
+        # One sync client per file; must be closed when done or a long-running server
+        # leaks sockets/fds linearly with file count.
         client = self._create_sync_client(self._llm_config)
         semaphore = asyncio.Semaphore(self._max_concurrent)
 
-        # gather 完成順序 ≠ 提交順序,進度要用完成計數,不能用 chunk index。
-        # counter 只在 event loop 內遞增(await 之後),單執行緒安全免鎖。
+        # Progress uses a completion count, not the chunk index, since gather's
+        # completion order differs from submission order. Incremented only after await
+        # (single-threaded within the event loop), so it needs no lock.
         done_count = 0
 
         def _on_one_done() -> None:
@@ -390,11 +366,10 @@ class ContextGenerator:
                     except Exception as e:
                         logger.debug(f"context-gen progress callback failed (ignored): {e}")
 
-        # abort 監看:檔案被刪時不只停「後續」呼叫(_generate_one 的檢查點),
-        # 還立刻 close client 把「飛行中」的請求連線切斷 — vLLM 偵測到 client
-        # disconnect 會中止該請求的生成,GPU 不再為註定被丟棄的結果燒。
-        # (單檔 job 走 task.cancel() 本來就會斷;這裡補的是多檔 job 用
-        # per-file abort flag 的路徑,原本飛行中 ≤max_concurrent 個請求會跑完。)
+        # Abort watcher: on file deletion, also close the client immediately so vLLM
+        # aborts the in-flight generations (client disconnect) rather than only
+        # skipping subsequent calls. Covers the multi-file-job path (per-file abort
+        # flag); a single-file job already breaks via task.cancel().
         _abort_stop = asyncio.Event()
 
         async def _abort_watcher():
@@ -450,7 +425,7 @@ class ContextGenerator:
         on_done: Callable[[], None],
         should_abort: Optional[Callable[[], bool]] = None,
     ) -> str:
-        """生成一個 chunk 的 context 並回報完成"""
+        """Generate one chunk's context and report completion."""
         result = await self._generate_one(
             chunk_text, full_document, file_name, client, semaphore, should_abort
         )

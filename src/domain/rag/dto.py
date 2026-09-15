@@ -1,12 +1,13 @@
 
-"""Domain 層共享 DTO — 修 H5(層次反向依賴)。
+"""Shared domain-layer DTOs.
 
-這些是純資料型別(pydantic),被 domain / adapter / api 三層共用。原本
-散在 adapter.model 與 api.router.response,導致 domain(query_engine /
-index_service)反過來 import 外層 → 層次倒置、潛在 import 循環。
+These are pure data types (pydantic) shared across the domain / adapter / api layers. They
+previously lived in adapter.model and api.router.response, which forced the domain (query_engine /
+index_service) to import outward -> inverted layering and potential import cycles.
 
-改由最內層 domain 定義,外層(adapter.model / api.router.response)re-export
-以維持既有 import 路徑不變(向下相容)。方向從此一律向內。
+They are now defined in the innermost domain layer, and the outer layers (adapter.model /
+api.router.response) re-export them to keep existing import paths unchanged (backward compatible).
+Dependencies now always point inward.
 """
 
 from typing import List, Optional
@@ -16,7 +17,7 @@ from pydantic import BaseModel
 
 
 class FileRequest(BaseModel):
-    """待索引檔案的 DTO(由 IndexingService 從 File ORM 轉出,供索引流程消費)。"""
+    """DTO for a file to be indexed (produced by IndexingService from the File ORM, consumed by the indexing pipeline)."""
     id: UUID
     folder_id: int
     file_name: str
@@ -31,18 +32,18 @@ class FileRequest(BaseModel):
 
 
 class RAGChunkMetadata(BaseModel):
-    """RAG 檢索結果中單個塊的元數據。"""
+    """Metadata for a single chunk in a RAG retrieval result."""
     node_id: UUID
     mcp_file_id: str
     file_name: str
     folder_name: Optional[str] = None
-    # BL-05 引用溯源(docling 路徑索引的資料才有;舊索引/純文字為 None)
+    # Citation provenance (only present for data indexed via the docling path; None for old indexes/plain text)
     page: Optional[int] = None
     headings: Optional[List[str]] = None
 
 
 class RAGSearchResult(BaseModel):
-    """RAG 檢索單個結果。"""
+    """A single RAG retrieval result."""
     text: str
     score: float
     metadata: RAGChunkMetadata

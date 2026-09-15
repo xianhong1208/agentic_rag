@@ -1,8 +1,9 @@
 
-"""Control Center 資料面 API 契約(admin_overview)。
+"""Control Center data-plane API contract (admin_overview).
 
-彙總查詢本體(db/admin_stats)由整合測試驗真庫;這裡釘 HTTP 面:
-路由、回應形狀、models 摘要組裝、limit 驗證。
+The aggregate queries themselves (db/admin_stats) are verified against a real
+DB by the integration tests; here we pin the HTTP face: routing, response
+shape, models-summary assembly, and limit validation.
 """
 
 from types import SimpleNamespace
@@ -244,7 +245,7 @@ class TestHealth:
         assert d["overall"] == "ok"
         names = {c["name"]: c for c in d["checks"]}
         assert names["Database"]["status"] == "ok" and names["Database"]["latency_ms"] == 3
-        # endpoint 只回 base_url,不回 api_key(不外洩金鑰)
+        # The endpoint returns only base_url, never api_key (does not leak keys)
         assert "SECRETKEY123" not in str(d)
         assert names["Speech-to-Text"]["status"] == "ok"
 
@@ -280,10 +281,10 @@ class TestHealth:
     @pytest.mark.asyncio
     async def test_probe_endpoint_health_unset_and_ok(self):
         from src.api.router.admin_overview import _probe_endpoint_health
-        # 空 base_url → unset,不打網路
+        # Empty base_url -> unset, no network call
         status, detail, ms = await _probe_endpoint_health("", None)
         assert status == "unset" and ms is None
-        # 可達端點 → ok(mock httpx client)
+        # Reachable endpoint -> ok (mock httpx client)
         from unittest.mock import AsyncMock
         resp = SimpleNamespace(status_code=200)
         client_cm = MagicMock()

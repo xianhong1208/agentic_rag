@@ -1,34 +1,6 @@
+"""In-memory caching service for query results and frequently accessed data.
 
-"""In-memory caching service for query results and frequently accessed data
-
-This module provides a simple in-memory cache implementation using cachetools.
-It helps reduce database load by caching:
-- Folder lookups by name/token
-- File listings
-- RAG query results
-- Auth token validations
-
-Performance Benefits:
-- Typical cache hit reduces response time from 50-200ms to < 1ms
-- Reduces database load by 60-80% for read-heavy workloads
-- Automatic TTL-based expiration prevents stale data
-
-Usage:
-    from src.infrastructure.cache.cache_service import CacheService
-
-    cache = CacheService.get_instance()
-
-    # Set value
-    cache.set("folder:token123:my_folder", folder_data, ttl=300)
-
-    # Get value
-    folder = cache.get("folder:token123:my_folder")
-
-    # Delete value
-    cache.delete("folder:token123:my_folder")
-
-    # Clear by pattern
-    cache.clear_pattern("folder:*")
+Simple TTL-based in-memory cache with LRU eviction and hit/miss statistics.
 """
 
 from abc import ABC, abstractmethod
@@ -39,74 +11,59 @@ from threading import Lock
 
 
 class ICacheService(ABC):
-    """Interface for cache implementations"""
+    """Interface for cache implementations."""
 
     @abstractmethod
     def get(self, key: str) -> Optional[Any]:
-        """Get value from cache"""
+        """Get value from cache."""
         pass
 
     @abstractmethod
     def set(self, key: str, value: Any, ttl: int = 300):
-        """Set value in cache with TTL in seconds"""
+        """Set value in cache with TTL in seconds."""
         pass
 
     @abstractmethod
     def delete(self, key: str):
-        """Delete key from cache"""
+        """Delete key from cache."""
         pass
 
     @abstractmethod
     def clear_pattern(self, pattern: str):
-        """Delete all keys matching pattern (supports * wildcards)"""
+        """Delete all keys matching pattern (supports * wildcards)."""
         pass
 
     @abstractmethod
     def clear_all(self):
-        """Clear entire cache"""
+        """Clear entire cache."""
         pass
 
     @abstractmethod
     def get_stats(self) -> dict:
-        """Get cache statistics"""
+        """Get cache statistics."""
         pass
 
 
 class InMemoryCache(ICacheService):
-    """Simple in-memory cache with TTL support
+    """Simple in-memory cache with TTL support.
 
-    This implementation uses a dictionary with manual TTL checking.
-    For production with larger datasets, consider using cachetools.TTLCache
-    or integrating with Redis for distributed caching.
+    Uses a dict with manual TTL checking. For larger or distributed workloads,
+    consider cachetools.TTLCache or Redis.
     """
 
     def __init__(self, max_size: int = 1000, default_ttl: int = 300):
-        """Initialize cache
-
-        Args:
-            max_size: Maximum number of items in cache (LRU eviction)
-            default_ttl: Default TTL in seconds (300 = 5 minutes)
-        """
         self._cache: dict[str, tuple[Any, float, float]] = {}  # key -> (value, expiry_time, last_access_time)
         self._max_size = max_size
         self._default_ttl = default_ttl
         self._lock = Lock()
 
-        # Statistics
         self._hits = 0
         self._misses = 0
         self._sets = 0
         self._deletes = 0
 
     def get(self, key: str) -> Optional[Any]:
-        """從 cache 取值。
-
-        Args:
-            key: cache key。
-
-        Returns:
-            原 set 進去的值;不存在 / 已過期回 None。
-        """
+        """Return the cached value, or None if missing or expired."""
         with self._lock:
             if key not in self._cache:
                 self._misses += 1
@@ -114,7 +71,6 @@ class InMemoryCache(ICacheService):
 
             value, expiry_time, _ = self._cache[key]
 
-            # Check if expired
             if time.time() > expiry_time:
                 del self._cache[key]
                 self._misses += 1
@@ -126,20 +82,13 @@ class InMemoryCache(ICacheService):
             return value
 
     def set(self, key: str, value: Any, ttl: Optional[int] = None):
-        """Set value in cache with TTL
-
-        Args:
-            key: Cache key
-            value: Value to cache (any serializable object)
-            ttl: Time to live in seconds (None = use default)
-        """
+        """Set value in cache with TTL in seconds (None uses the default)."""
         if ttl is None:
             ttl = self._default_ttl
 
         expiry_time = time.time() + ttl
 
         with self._lock:
-            # Evict oldest item if cache is full
             if len(self._cache) >= self._max_size and key not in self._cache:
                 self._evict_oldest()
 
@@ -147,20 +96,14 @@ class InMemoryCache(ICacheService):
             self._sets += 1
 
     def delete(self, key: str):
-        """Delete key from cache"""
+        """Delete key from cache."""
         with self._lock:
             if key in self._cache:
                 del self._cache[key]
                 self._deletes += 1
 
     def clear_pattern(self, pattern: str):
-        """刪除所有匹配 pattern 的 key(fnmatch wildcards)。
-
-        Wildcard:`*` 任意字串、`?` 單字、`[seq]` 集合、`[!seq]` 反集合。
-
-        Args:
-            pattern: fnmatch pattern,例如 ``"folder:*"`` 清掉所有 folder cache。
-        """
+        """Delete all keys matching the fnmatch pattern (e.g. ``"folder:*"``)."""
         with self._lock:
             keys_to_delete = [
                 key for key in self._cache.keys()
@@ -172,24 +115,23 @@ class InMemoryCache(ICacheService):
                 self._deletes += 1
 
     def clear_all(self):
-        """Clear entire cache"""
+        """Clear entire cache."""
         with self._lock:
             self._cache.clear()
 
     def _evict_oldest(self):
-        """Evict the least recently used item (true LRU)"""
+        """Evict the least recently used item (true LRU)."""
         if not self._cache:
             return
 
-        # Find key with earliest last_access_time (index 2)
+        # Key with the earliest last_access_time (tuple index 2)
         oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k][2])
         del self._cache[oldest_key]
 
     def cleanup_expired(self):
-        """Manually cleanup expired entries
+        """Manually remove expired entries to free memory.
 
-        This is called periodically to free memory.
-        Note: Expired entries are also cleaned up automatically during get().
+        Expired entries are also removed lazily during get().
         """
         current_time = time.time()
 
@@ -203,20 +145,7 @@ class InMemoryCache(ICacheService):
                 del self._cache[key]
 
     def get_stats(self) -> dict:
-        """Get cache statistics
-
-        Returns:
-            Dictionary with cache metrics:
-            {
-                'size': int,  # Current number of items
-                'max_size': int,
-                'hits': int,
-                'misses': int,
-                'sets': int,
-                'deletes': int,
-                'hit_rate': float  # Percentage (0-100)
-            }
-        """
+        """Return cache metrics (size, hits, misses, sets, deletes, hit_rate)."""
         with self._lock:
             total_requests = self._hits + self._misses
             hit_rate = (self._hits / total_requests * 100) if total_requests > 0 else 0.0
@@ -232,25 +161,16 @@ class InMemoryCache(ICacheService):
             }
 
 
-# Singleton instance
 _cache_instance: Optional[InMemoryCache] = None
 _instance_lock = Lock()
 
 
 class CacheService:
-    """Factory for accessing the global cache instance"""
+    """Factory for accessing the global cache instance."""
 
     @classmethod
     def get_instance(cls, max_size: int = 1000, default_ttl: int = 300) -> InMemoryCache:
-        """Get or create the global cache instance
-
-        Args:
-            max_size: Maximum cache size (only used on first call)
-            default_ttl: Default TTL in seconds (only used on first call)
-
-        Returns:
-            The global InMemoryCache instance
-        """
+        """Get or create the global cache instance (max_size/default_ttl apply on first call only)."""
         global _cache_instance
 
         if _cache_instance is None:
@@ -262,15 +182,14 @@ class CacheService:
 
     @classmethod
     def reset_instance(cls):
-        """Reset the global cache instance (useful for testing)"""
+        """Reset the global cache instance (useful for testing)."""
         global _cache_instance
         with _instance_lock:
             _cache_instance = None
 
 
-# Cache key generators for consistency
 class CacheKeys:
-    """Standard cache key formats for different entity types"""
+    """Standard cache key formats for different entity types."""
 
     @staticmethod
     def folder_by_name(user_token: str, folder_name: str) -> str:
@@ -301,12 +220,11 @@ class CacheKeys:
         return f"index:file:{file_id}"
 
 
-# Recommended TTL values for different entity types
 class CacheTTL:
-    """Recommended TTL values in seconds"""
-    FOLDER = 300  # 5 minutes
-    FILE_LIST = 180  # 3 minutes
-    FILE_DETAIL = 300  # 5 minutes
-    QUERY_RESULT = 300  # 5 minutes
-    AUTH_TOKEN = 3600  # 1 hour
-    INDEX_STATUS = 600  # 10 minutes
+    """Recommended TTL values in seconds."""
+    FOLDER = 300
+    FILE_LIST = 180
+    FILE_DETAIL = 300
+    QUERY_RESULT = 300
+    AUTH_TOKEN = 3600
+    INDEX_STATUS = 600

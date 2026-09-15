@@ -1,19 +1,19 @@
 
 """RAG Indexing REST API
 
-只負責 indexing 相關操作:
-- POST   /api/rag/files/{folder_id}/index                       索引整個資料夾(背景非同步)
-- POST   /api/rag/file/{file_id}/index                          索引單一檔案
-- POST   /api/rag/files/{folder_id}/reindex                     重新索引整個資料夾
-- GET    /api/rag/indexed-files                                 查詢已索引的檔案清單
-- GET    /api/rag/files/{folder_id}/index/jobs/{job_id}         查詢背景任務狀態
-- GET    /api/rag/files/{folder_id}/index/jobs/{job_id}/events  SSE realtime progress stream (D1)
-- DELETE /api/rag/files/{folder_id}/index/jobs/{job_id}         取消背景索引任務 (A1)
-- GET    /api/rag/file/{file_id}/index/status                   查詢單檔索引狀態 (Part 3)
-- DELETE /api/rag/files/{folder_id}/index                       刪除整個資料夾索引
-- DELETE /api/rag/file/{file_id}/index                          刪除單檔索引
+Handles indexing-related operations only:
+- POST   /api/rag/files/{folder_id}/index                       index an entire folder (background, async)
+- POST   /api/rag/file/{file_id}/index                          index a single file
+- POST   /api/rag/files/{folder_id}/reindex                     reindex an entire folder
+- GET    /api/rag/indexed-files                                 list indexed files
+- GET    /api/rag/files/{folder_id}/index/jobs/{job_id}         query background job status
+- GET    /api/rag/files/{folder_id}/index/jobs/{job_id}/events  SSE realtime progress stream
+- DELETE /api/rag/files/{folder_id}/index/jobs/{job_id}         cancel a background indexing job
+- GET    /api/rag/file/{file_id}/index/status                   query single-file index status
+- DELETE /api/rag/files/{folder_id}/index                       delete an entire folder's index
+- DELETE /api/rag/file/{file_id}/index                          delete a single file's index
 
-查詢 endpoint 已移到 rag_query.py。
+Query endpoints have moved to rag_query.py.
 """
 
 import asyncio
@@ -54,10 +54,10 @@ from src.log import get_api_logger, log_err, log_op, log_warn
 
 logger = get_api_logger()
 
-# router-level tag 留空;每個 endpoint 自己 declare 分群(Indexing/Jobs/Status/Cleanup)
+# Router-level tag left empty; each endpoint declares its own group (Indexing/Jobs/Status/Cleanup)
 router = APIRouter(dependencies=[Depends(authenticate_request)])
 
-# Tag constants — keep in sync with openapi_tags in app.py (順序也在那裡定義)
+# Tag constants — keep in sync with openapi_tags in app.py (the order is defined there too)
 _TAG_INDEXING = "RAG: Indexing"
 _TAG_JOBS = "RAG: Jobs"
 _TAG_STATUS = "RAG: Status"
@@ -66,37 +66,35 @@ _TAG_CLEANUP = "RAG: Cleanup"
 job_manager = IndexingJobManager.get_instance()
 
 
-# ============================================================================
 # Index operations
-# ============================================================================
 
 _INDEX_REQUEST_EXAMPLES = {
     "use_config_defaults": {
-        "summary": "用 config 預設(最常見)",
-        "description": "送空 body → indexing 從 `config.rag.chunking` 讀預設值。",
+        "summary": "Use config defaults (most common)",
+        "description": "Send an empty body; indexing reads defaults from `config.rag.chunking`.",
         "value": {},
     },
     "explicit_match_config": {
-        "summary": "顯式對齊 config 當前值",
-        "description": "把 config 預設複製到 request,方便只調其中一個。",
+        "summary": "Explicitly match current config values",
+        "description": "Copy the config defaults into the request to tune just one of them.",
         "value": {"chunk_size": 256, "chunk_overlap": 50},
     },
     "smaller_chunks": {
-        "summary": "更小的 chunk(高精準度)",
-        "description": "leaf 切小,提升 retrieval 精度但會產生更多 chunk。",
+        "summary": "Smaller chunks (higher precision)",
+        "description": "Smaller leaf chunks improve retrieval precision but produce more chunks.",
         "value": {"chunk_size": 128, "chunk_overlap": 30},
     },
 }
 
 
-# Resource = IndexJob;Response = {data: IndexJobStatusResponse, message}(背景 job,立刻回 job_id)
+# Resource = IndexJob; Response = {data: IndexJobStatusResponse, message} (background job; returns job_id immediately)
 @router.post(
     "/files/{folder_id}/index",
     tags=[_TAG_INDEXING],
     response_model=IndexJobEnvelope,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder 不存在"},
-        409: {"model": ErrorDetailResponse, "description": "該 folder 已有 in-flight indexing job (#28 folder lock)"},
+        404: {"model": ErrorDetailResponse, "description": "folder does not exist"},
+        409: {"model": ErrorDetailResponse, "description": "This folder already has an in-flight indexing job (folder lock)"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -107,7 +105,7 @@ async def index_folder_endpoint(
     token: str = Depends(extract_token),
     folder: Folder = Depends(get_folder_by_id),
 ):
-    """背景索引整個資料夾的所有檔案"""
+    """Index all files in an entire folder in the background."""
     try:
         log_op(logger, "API_INDEX_FOLDER", folder_id=folder_id, token=token,
                msg=f"skip_existing={skip_existing}")
@@ -141,14 +139,14 @@ async def index_folder_endpoint(
         raise HTTPException(status_code=500, detail=f"Failed to start indexing: {str(e)}")
 
 
-# Resource = FileIndex;Response = {data: IndexDocumentResponse, message}(同步,等真正索引完才返回)
+# Resource = FileIndex; Response = {data: IndexDocumentResponse, message} (synchronous; returns only after indexing actually completes)
 @router.post(
     "/file/{file_id}/index",
     tags=[_TAG_INDEXING],
     response_model=IndexDocumentEnvelope,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "file 不存在或無權限"},
-        500: {"model": ErrorDetailResponse, "description": "索引失敗(Docling / embedding 等)"},
+        404: {"model": ErrorDetailResponse, "description": "file does not exist or no permission"},
+        500: {"model": ErrorDetailResponse, "description": "indexing failed (Docling / embedding, etc.)"},
     },
 )
 async def index_single_file_endpoint(
@@ -158,10 +156,11 @@ async def index_single_file_endpoint(
     token: str = Depends(extract_token),
     file: File = Depends(get_file_by_id),
 ):
-    """同步索引單一檔案。
+    """Synchronously index a single file.
 
-    force=true 跳過 content_hash 冪等短路,強制重跑整條管線(設定變更後
-    的單檔重建;寫入前會先清該檔舊向量,不會殘留重複)。
+    force=true skips the content_hash idempotency short-circuit and forces the whole pipeline to
+    rerun (single-file rebuild after a config change; the file's old vectors are cleared before
+    writing, so no duplicates remain).
     """
     try:
         log_op(logger, "API_INDEX_FILE", file_id=file_id, token=token,
@@ -196,14 +195,14 @@ async def index_single_file_endpoint(
         raise HTTPException(status_code=500, detail=f"Failed to index file: {str(e)}")
 
 
-# Resource = IndexJob;Response = {data: IndexJobStatusResponse, message}(先刪 folder 索引再啟動新 job)
+# Resource = IndexJob; Response = {data: IndexJobStatusResponse, message} (deletes the folder index first, then starts a new job)
 @router.post(
     "/files/{folder_id}/reindex",
     tags=[_TAG_INDEXING],
     response_model=IndexJobEnvelope,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder 不存在"},
-        409: {"model": ErrorDetailResponse, "description": "該 folder 已有 in-flight job"},
+        404: {"model": ErrorDetailResponse, "description": "folder does not exist"},
+        409: {"model": ErrorDetailResponse, "description": "This folder already has an in-flight job"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -214,15 +213,16 @@ async def reindex_folder_endpoint(
     token: str = Depends(extract_token),
     folder: Folder = Depends(get_folder_by_id),
 ):
-    """先刪除舊索引,再背景重新索引整個資料夾"""
+    """Delete the old index first, then reindex the entire folder in the background."""
     try:
         logger.info(
             f"API: Reindexing folder_id={folder_id} chunk_size={reindex_request.chunk_size} "
             f"chunk_overlap={reindex_request.chunk_overlap}"
         )
 
-        # C1 修:刪舊索引失敗**必須中止** — 舊行為(warn 後照跑)會讓 reindex
-        # 在索引未清的情況下啟動,content_hash 短路使其成為靜默 no-op。
+        # Failing to delete the old index must abort: proceeding after only a warning would start
+        # the reindex with the index uncleared, and the content_hash short-circuit would make it a
+        # silent no-op.
         try:
             delete_result = await get_rag_adapter().delete_folder_index(
                 folder_id=folder_id, token=token
@@ -236,9 +236,10 @@ async def reindex_folder_endpoint(
                        "Nothing was rebuilt — retry when the cause is resolved.",
             )
 
-        # H5 緩解:刪除→啟動之間的 folder lock 空窗可能被 auto-index 搶走
-        # (start_indexing 是拒絕語義)。此刻索引已清,409 放棄會留下空索引 —
-        # 重試幾次拿鎖,拿不到才回 409(訊息明確指示重按)。
+        # The folder-lock gap between delete and start could be grabbed by auto-index
+        # (start_indexing has reject semantics). The index is now cleared, so giving up with a 409
+        # would leave an empty index — retry acquiring the lock a few times, returning 409 only if
+        # it can't be obtained (with a message clearly telling the user to retry).
         job_state = None
         for attempt in range(3):
             try:
@@ -273,17 +274,15 @@ async def reindex_folder_endpoint(
         raise HTTPException(status_code=500, detail=f"Failed to reindex folder: {str(e)}")
 
 
-# ============================================================================
 # Read-only status
-# ============================================================================
 
-# Resource = List[FileIndex];Response = {data: [IndexedFileEntry...], message}
+# Resource = List[FileIndex]; Response = {data: [IndexedFileEntry...], message}
 @router.get(
     "/indexed-files",
     tags=[_TAG_STATUS],
     response_model=IndexedFilesResponse,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder 不存在"},
+        404: {"model": ErrorDetailResponse, "description": "folder does not exist"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -292,7 +291,7 @@ async def get_indexed_files(
     token: str = Depends(extract_token),
     folder: Folder = Depends(get_folder_by_id),
 ):
-    """列出指定資料夾內已索引的所有檔案"""
+    """List all indexed files in a specified folder."""
     try:
         logger.info(f"API: Getting indexed files for folder_id={folder_id}")
         result = await get_rag_adapter().get_indexed_files(folder_id=folder_id)
@@ -310,7 +309,7 @@ async def get_indexed_files(
     tags=[_TAG_JOBS],
     response_model=IndexJobEnvelope,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "job_id 不存在或不屬於該 folder"},
+        404: {"model": ErrorDetailResponse, "description": "job_id does not exist or does not belong to this folder"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -320,7 +319,7 @@ async def get_index_job_status(
     token: str = Depends(extract_token),
     folder: Folder = Depends(get_folder_by_id),
 ):
-    """查詢背景索引任務狀態"""
+    """Query the status of a background indexing job."""
     try:
         status = await job_manager.get_status(job_id)
 
@@ -343,7 +342,7 @@ async def get_index_job_status(
     tags=[_TAG_JOBS],
     response_model=IndexJobListResponse,
     responses={
-        400: {"model": ErrorDetailResponse, "description": "status query param 不是合法值"},
+        400: {"model": ErrorDetailResponse, "description": "status query param is not a valid value"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -352,12 +351,12 @@ async def list_index_jobs(
     folder_id: Optional[int] = None,
     token: str = Depends(extract_token),
 ):
-    """列出 indexing jobs + 各狀態 count(只回 token 擁有的 folders 的 jobs)。
+    """List indexing jobs + per-status counts (returns only jobs for folders owned by the token).
 
     Query params:
       - status: pending / running / succeeded / partial_success / failed / cancelled
-                (可選,只回該狀態)
-      - folder_id: 只回該 folder 的 jobs(可選;不屬於此 token 時 404)
+                (optional; returns only that status)
+      - folder_id: return only that folder's jobs (optional; 404 if it doesn't belong to this token)
 
     Returns:
       {
@@ -378,16 +377,17 @@ async def list_index_jobs(
                            f"{[s.value for s in JobStatus]}",
                 )
 
-        # 所有權過濾 — 不濾的話任何合法 token 都看得到全站 jobs(檔名/錯誤/耗時)
+        # Ownership filter — without it, any valid token could see site-wide jobs (filenames/errors/timings)
         if folder_id is not None:
             folder = CachedFolderDB.get_by_id(folder_id)
             if not folder or folder.user_token != token:
                 raise HTTPException(status_code=404, detail=f"Folder not found: {folder_id}")
             scoped = job_manager.list_jobs(folder_id=folder_id)
         else:
-            # use_cache=False:folder 建立走 FolderDB.create,不會失效
-            # folders:user:{token} 快取(TTL 180s)— 吃快取的話,新建 folder
-            # 的 jobs 會被這裡隱形最多 3 分鐘。直查 DB(有 user_token index,便宜)
+            # use_cache=False: folder creation goes through FolderDB.create, which doesn't
+            # invalidate the folders:user:{token} cache (TTL 180s) — using the cache would hide a
+            # newly created folder's jobs here for up to 3 minutes. Query the DB directly (there's a
+            # user_token index, so it's cheap).
             allowed_ids = {
                 f.id for f in CachedFolderDB.get_by_user_token(token, use_cache=False)
             }
@@ -396,7 +396,7 @@ async def list_index_jobs(
                 if j.get("folder_id") in allowed_ids
             ]
 
-        # counts 也要限縮到本人的 jobs(維持原語義:不受 status filter 影響)
+        # Counts must also be scoped to the caller's own jobs (preserving original semantics: unaffected by the status filter)
         counts = {s.value: 0 for s in JobStatus}
         for j in scoped:
             counts[j["status"]] = counts.get(j["status"], 0) + 1
@@ -420,7 +420,7 @@ _TERMINAL_JOB_STATUSES = {
 }
 
 
-# Stream;非 JSON ─ 每個 event 是一個 IndexJobStatusResponse 序列化。Content-Type: text/event-stream
+# Stream; non-JSON — each event is a serialized IndexJobStatusResponse. Content-Type: text/event-stream
 @router.get(
     "/files/{folder_id}/index/jobs/{job_id}/events",
     tags=[_TAG_JOBS],
@@ -428,9 +428,9 @@ _TERMINAL_JOB_STATUSES = {
     responses={
         200: {
             "content": {"text/event-stream": {}},
-            "description": "Server-Sent Events stream; each `data: {...}` 是完整 IndexJobStatusResponse JSON,到 terminal status 自動斷",
+            "description": "Server-Sent Events stream; each `data: {...}` is a complete IndexJobStatusResponse JSON, closing automatically at terminal status",
         },
-        404: {"model": ErrorDetailResponse, "description": "job_id 不存在"},
+        404: {"model": ErrorDetailResponse, "description": "job_id does not exist"},
     },
 )
 async def stream_index_job_events(
@@ -440,24 +440,27 @@ async def stream_index_job_events(
     token: str = Depends(extract_token),
     folder: Folder = Depends(get_folder_by_id),
 ):
-    """SSE stream:推送 job 狀態變化(取代 polling)。
+    """SSE stream: push job status changes (replacing polling).
 
-    每次 status / progress / 每檔完成 / timing 寫入都會推一個 `data: {full state JSON}` event。
-    Job 達 terminal status 後 stream 自動關。閒置 15s 推 `:ping` 防 proxy 斷線。
+    Every status / progress / per-file completion / timing write pushes a `data: {full state JSON}`
+    event. The stream closes automatically once the job reaches a terminal status. A `:ping` is sent
+    after 15s idle to prevent proxy disconnects.
 
     Args:
-        folder_id: job 所屬 folder。
-        job_id: 要訂閱的 job id。
-        request: FastAPI Request(用來偵測 client 斷線)。
-        token: 使用者 token(權限驗證)。
-        folder: get_folder_by_id Depend 注入。
+        folder_id: The folder the job belongs to.
+        job_id: The job id to subscribe to.
+        request: FastAPI Request (used to detect client disconnect).
+        token: User token (permission check).
+        folder: Injected by the get_folder_by_id dependency.
 
     Returns:
-        StreamingResponse, Content-Type: text/event-stream。
+        StreamingResponse, Content-Type: text/event-stream.
     """
-    # M9: 先 subscribe 再讀快照。反過來(舊寫法)會有空窗:讀完快照、還沒 subscribe
-    # 之前 job 若轉終態,terminal 事件發給「還沒存在的訂閱者」而遺失 → 快照顯示非終態、
-    # stream 之後只每 15s 送 ping,對一個已結束的 job 永遠掛著。先 subscribe 就不漏。
+    # Subscribe before reading the snapshot. The reverse order leaves a gap: if the job goes
+    # terminal after the snapshot is read but before subscribing, the terminal event is delivered to
+    # a not-yet-existing subscriber and lost -> the snapshot shows a non-terminal status and the
+    # stream afterward only pings every 15s, hanging forever on an already-finished job. Subscribing
+    # first misses nothing.
     queue = job_manager.subscribe(job_id)
     initial = await job_manager.get_status(job_id)
     if not initial or initial.get("folder_id") != folder_id:
@@ -466,14 +469,14 @@ async def stream_index_job_events(
 
     async def event_stream():
         try:
-            # 1. 先送當前快照,client 一連上就渲染正確狀態,不必先 polling
+            # 1. Send the current snapshot first, so the client renders the correct state on connect without polling
             yield f"data: {json.dumps(initial)}\n\n"
             if initial.get("status") in _TERMINAL_JOB_STATUSES:
                 return
 
-            # 2. 消費 subscribe(早於快照)之後的所有更新;terminal 不會漏
+            # 2. Consume all updates after subscribe (which preceded the snapshot); terminal isn't missed
             while True:
-                # client 斷線就停;不然會對死掉的 socket emit 到天荒地老
+                # Stop if the client disconnects; otherwise we'd emit to a dead socket indefinitely
                 if await request.is_disconnected():
                     return
                 try:
@@ -504,7 +507,7 @@ async def stream_index_job_events(
     tags=[_TAG_JOBS],
     response_model=IndexJobCancelResponse,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "job_id 不存在或不屬於該 folder"},
+        404: {"model": ErrorDetailResponse, "description": "job_id does not exist or does not belong to this folder"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -514,7 +517,7 @@ async def cancel_index_job(
     token: str = Depends(extract_token),
     folder: Folder = Depends(get_folder_by_id),
 ):
-    """取消執行中的背景索引任務 (A1)"""
+    """Cancel a running background indexing job."""
     try:
         status = await job_manager.get_status(job_id)
         if not status or status.get("folder_id") != folder_id:
@@ -536,13 +539,13 @@ async def cancel_index_job(
         raise HTTPException(status_code=500, detail=f"Failed to cancel job: {str(e)}")
 
 
-# Response = {data: FileIndexStatusResponse, message} ─ status ∈ indexed / indexing / queued / failed / not_indexed
+# Response = {data: FileIndexStatusResponse, message} — status ∈ indexed / indexing / queued / failed / not_indexed
 @router.get(
     "/file/{file_id}/index/status",
     tags=[_TAG_STATUS],
     response_model=FileIndexStatusEnvelope,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "file 不存在或無權限"},
+        404: {"model": ErrorDetailResponse, "description": "file does not exist or no permission"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -551,16 +554,16 @@ async def get_file_index_status(
     token: str = Depends(extract_token),
     file: File = Depends(get_file_by_id),
 ):
-    """查單一檔案的索引狀態。
+    """Query a single file's index status.
 
     Args:
-        file_id: 檔案 UUID。
-        token: 使用者 token(權限驗證)。
-        file: get_file_by_id Depend 注入。
+        file_id: File UUID.
+        token: User token (permission check).
+        file: Injected by the get_file_by_id dependency.
 
     Returns:
         envelope: ``{data: FileIndexStatusResponse, message}``;
-        status ∈ ``indexed`` / ``indexing`` / ``queued`` / ``failed`` / ``not_indexed``。
+        status ∈ ``indexed`` / ``indexing`` / ``queued`` / ``failed`` / ``not_indexed``.
     """
     try:
         from db.fileindexdb import FileIndexDB
@@ -650,16 +653,14 @@ async def get_file_index_status(
         raise HTTPException(status_code=500, detail=f"Failed to get file status: {str(e)}")
 
 
-# ============================================================================
 # Deletion
-# ============================================================================
 
-# Resource = folder 全部 FileIndex + vector store table;Response = DeleteFolderIndexResponse
+# Resource = all of the folder's FileIndex + vector store table; Response = DeleteFolderIndexResponse
 @router.delete(
     "/files/{folder_id}/index",
     tags=[_TAG_CLEANUP],
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder 不存在"},
+        404: {"model": ErrorDetailResponse, "description": "folder does not exist"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -668,7 +669,7 @@ async def delete_folder_index_endpoint(
     token: str = Depends(extract_token),
     folder: Folder = Depends(get_folder_by_id),
 ):
-    """刪除整個資料夾的索引(保留 folder 與 files 本身)"""
+    """Delete an entire folder's index (keeping the folder and the files themselves)."""
     try:
         logger.info(f"API: Deleting folder index for folder_id={folder_id}")
         result = await get_rag_adapter().delete_folder_index(folder_id=folder_id, token=token)
@@ -690,7 +691,7 @@ async def delete_folder_index_endpoint(
     "/file/{file_id}/index",
     tags=[_TAG_CLEANUP],
     responses={
-        404: {"model": ErrorDetailResponse, "description": "file 不存在"},
+        404: {"model": ErrorDetailResponse, "description": "file does not exist"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -699,7 +700,7 @@ async def delete_single_file_index_endpoint(
     token: str = Depends(extract_token),
     file: File = Depends(get_file_by_id),
 ):
-    """刪除單檔的索引"""
+    """Delete a single file's index."""
     try:
         logger.info(f"API: Deleting index for single file_id={file_id}")
         success = await get_rag_adapter().delete_document_index(file_id=file_id, token=token)

@@ -1,5 +1,5 @@
 
-"""error_handler — 統一錯誤格式(domain / generic)與註冊函式。"""
+"""error_handler — unified error format (domain / generic) and the registration function."""
 
 import json
 from unittest.mock import MagicMock
@@ -22,7 +22,7 @@ def _req(path="/api/x"):
 
 
 async def test_domain_exception_maps_status_and_body():
-    """DomainException → 對應 HTTP status + 結構化 body(error_code/message)。"""
+    """DomainException maps to the corresponding HTTP status plus a structured body (error_code/message)."""
     exc = RAGFileNotFoundError(file_id="f-123")
     resp = await domain_exception_handler(_req(), exc)
     assert resp.status_code == 404
@@ -31,7 +31,7 @@ async def test_domain_exception_maps_status_and_body():
 
 
 async def test_generic_exception_returns_500_without_leaking():
-    """未預期例外 → 500 generic body,不外洩內部訊息。"""
+    """Unexpected exception returns a 500 generic body without leaking internal details."""
     resp = await generic_exception_handler(_req("/api/y"), RuntimeError("secret detail"))
     assert resp.status_code == 500
     body = json.loads(resp.body)
@@ -41,13 +41,13 @@ async def test_generic_exception_returns_500_without_leaking():
 
 
 async def test_generic_handler_reraises_http_exception():
-    """HTTPException 顯式 re-raise,讓 FastAPI 原生 handler 管 status(不吞成 500)。"""
+    """HTTPException is explicitly re-raised so FastAPI's native handler owns the status (not swallowed into a 500)."""
     with pytest.raises(HTTPException):
         await generic_exception_handler(_req(), HTTPException(status_code=418))
 
 
 def test_register_error_handlers_wires_both():
-    """register_error_handlers 把 domain + generic 兩個 handler 掛上 app。"""
+    """register_error_handlers wires both the domain and generic handlers onto the app."""
     app = FastAPI()
     register_error_handlers(app)
     assert app.exception_handlers.get(DomainException) is domain_exception_handler

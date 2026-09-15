@@ -1,26 +1,35 @@
-"""Agentic RAG MCP Server — CLI 啟動點
+"""Agentic RAG MCP Server CLI entry point.
 
-預設行為(`uv run python main.py`)依序做四件事:
-  1. DB bootstrap:確保 DB 存在 + pgvector / pg_jieba extension 啟用
-  2. Auto migration:Alembic 套用所有未套用的 migrations
-  3. Docling warmup:預載 ML 模型避免第一次查詢長等
-  4. 啟動 FastAPI + FastMCP server
+Default run (`uv run python main.py`) does DB bootstrap, auto migration, Docling
+warmup, then starts the FastAPI + FastMCP server. See main() for the CLI flags.
 
-旗標:
-  --no-migrate              跳過 1+2(本地除錯,假設 DB 已就緒)
-  --migrate-only [action]   只跑 migration 不啟動 server
-                            actions: auto / status / generate / upgrade /
-                                     rollback / downgrade / init / stamp /
-                                     current / history / heads
-
-注意:此檔刻意不用 `from __future__ import annotations`,因為打包工具(Nuitka)的
-libs loader injection 會把可執行碼塞到 main.py 開頭,違反「from __future__ 必須
-在所有可執行碼前」的規則。type hints 全部用 builtin types,不需要 PEP 563
-延遲求值。
+Note: this file deliberately does not use `from __future__ import annotations`.
+Nuitka's libs-loader injection prepends executable code to the top of main.py,
+which would violate the rule that `from __future__` must precede all executable
+code. All type hints use builtin types, so PEP 563 is not needed here.
 """
 
 import argparse
 import sys
+from pathlib import Path
+
+# Load the project's .env before anything reads os.environ. Config expands
+# ${DATABASE_URL:-...}, so DATABASE_URL must be present first. override=True lets
+# this project's .env win over a stale global export lingering in the shell.
+def _load_dotenv() -> None:
+    import os
+    env_file = Path(__file__).resolve().parent / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ[key.strip()] = value.strip().strip('"').strip("'")
+
+
+_load_dotenv()
 
 import uvicorn
 
@@ -32,18 +41,18 @@ from src.log import get_server_logger, setup_logger
 
 
 def run_migration_command(action: str, message: str = None, revision: str = "-1") -> bool:
-    """執行 Alembic migration 動作
+    """Execute an Alembic migration action.
 
     Actions:
-        auto / migrate     : 自動套用所有未套用的 migrations(預設啟動會跑這個)
-        upgrade            : 升級到指定 revision(--revision,預設 head)
-        downgrade          : 降級到指定 revision
-        rollback           : 回退一版(同 downgrade -1)
-        generate           : 產生新的 migration(需要 --message)
-        status / current   : 檢查目前狀態
-        history / heads    : 顯示歷史 / 所有 heads
-        init               : 建立資料庫(若不存在)+ 套 migrations
-        stamp              : 標記 revision 但不執行
+        auto / migrate     : Auto-apply all pending migrations (default at startup).
+        upgrade            : Upgrade to a given revision (--revision, default head).
+        downgrade          : Downgrade to a given revision.
+        rollback           : Roll back one revision (same as downgrade -1).
+        generate           : Generate a new migration (requires --message).
+        status / current   : Check the current status.
+        history / heads    : Show history / all heads.
+        init               : Create the database (if absent) and apply migrations.
+        stamp              : Stamp a revision without executing it.
     """
     logger = get_server_logger()
     try:
@@ -94,7 +103,6 @@ def main():
                        choices=["critical", "error", "warning", "info", "debug", "trace"])
     parser.add_argument("--transport", type=str, choices=["sse", "http"])
 
-    # Migration flags
     parser.add_argument("--no-migrate", action="store_true",
                        help="Skip auto-migration on startup (default: auto-migrate runs)")
     parser.add_argument("--migrate-only", nargs="?", const="auto", metavar="ACTION",
@@ -108,7 +116,6 @@ def main():
     args = parser.parse_args()
 
     try:
-        # ------ Load config ------
         Config.set_config(args.config)
         config_obj = Config.get_config_model()
         if not config_obj:
@@ -126,14 +133,14 @@ def main():
         setup_logger(console_level=log_level, file_level="DEBUG", log_base_dir=log_dir)
         logger = get_server_logger()
 
-        # ------ Migration-only mode (don't start server) ------
+        # Migration-only mode: run the action and exit without starting the server.
         if args.migrate_only:
             action = args.migrate_only
             logger.info(f"🔄 Running migration-only: {action}")
             success = run_migration_command(action, args.message, args.revision)
             sys.exit(0 if success else 1)
 
-        # ------ DB bootstrap:確保 DB 存在 + extensions 啟用(unless --no-migrate) ------
+        # DB bootstrap: ensure the DB exists and extensions are enabled (unless --no-migrate).
         if not args.no_migrate:
             db_conf = Config.get_database_config()
             if not db_conf:
@@ -146,7 +153,8 @@ def main():
                 logger.error("   Check Postgres is running and credentials in config.yaml are correct")
                 sys.exit(1)
 
-            # ------ 向量表維度 vs config 比對(換模/手誤填錯 dimension 提前抓) ------
+            # Compare the vector-table dimension against config to catch a model swap or
+            # a mistyped dimension early.
             try:
                 cfg_model = Config.get_config_model()
                 rag_conf = getattr(cfg_model, "rag", None)
@@ -156,7 +164,7 @@ def main():
             except Exception as e:
                 logger.warning(f"⚠️ Vector dim startup check failed (continuing): {e}")
 
-            # ------ Auto-migrate(schema 跟 head 對齊) ------
+            # Auto-migrate to align the schema with head.
             logger.info("🔄 Running auto migration...")
             success = run_migration_command("auto")
             if success:
@@ -168,8 +176,9 @@ def main():
         else:
             logger.warning("⚠️ Skipping bootstrap + migration (--no-migrate)")
 
-        # ------ 執行期設定覆寫(admin 面板熱改的持久層)疊上 ConfigModel ------
-        # 必須在任何 RAG 元件 lazy 建構之前;DB 不可用時安全略過(用 yaml 預設)
+        # Overlay runtime setting overrides (admin-panel hot changes) onto the ConfigModel.
+        # Must run before any RAG component is lazily constructed; skipped safely when the
+        # DB is unavailable, falling back to yaml defaults.
         try:
             from db.runtime_settings_db import RuntimeSettingsDB
             from src.adapter.runtime_settings_service import load_overrides_on_startup
@@ -182,7 +191,6 @@ def main():
         except Exception as e:
             logger.warning(f"⚠️ Runtime settings overlay skipped: {e}")
 
-        # ------ Server config ------
         server_conf = Config.get_server_config()
         if not server_conf:
             raise RuntimeError("Server config missing")
@@ -198,7 +206,7 @@ def main():
         logger.info(f"MCP Endpoint: http://{host}:{port}/{mcp_endpoint}")
         logger.info(f"Transport: {transport}")
 
-        # ------ DB connection check (schema 已由 migration 處理,不再 create_tables) ------
+        # DB connection check; schema is handled by migrations, so no create_tables.
         try:
             engine = db_module.init_db(create_tables=False)
             with engine.connect():
@@ -207,21 +215,20 @@ def main():
             logger.error(f"❌ DB connect failed: {e}")
             logger.warning("⚠️ Server starting anyway — RAG features will fail")
 
-        # ------ Pre-warm Docling (1-2 min on first start) ------
+        # Pre-warm Docling (1-2 min on first start).
         try:
             from src.domain.rag.docling_loader import warmup_docling
             warmup_docling()
         except Exception as e:
             logger.warning(f"Docling warmup skipped: {e}")
 
-        # ------ Start server ------
         app_instance = create_app(config_obj, transport=transport)
         uvicorn.run(
             app_instance,
             host=host,
             port=port,
             log_level=log_level.lower(),
-            access_log=False,  # 關閉 uvicorn 預設 access log;client 來源/狀態看 token validation log 即可
+            access_log=False,  # client origin/status is already logged during token validation
         )
 
     except FileNotFoundError as e:

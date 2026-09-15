@@ -1,13 +1,17 @@
 
-"""幽靈 folder 修復(2026-09-07 用戶回報「XSS 測試名稱的 folder 刪不掉」)。
+"""Ghost-folder fix.
 
-根因鏈:
-① create:DB row 先建、storage 名稱驗證後炸 → 422 回呼叫端但幽靈 row 留下
-② delete:storage 清理對非法名稱 raise ValueError → 一路炸出 → row 永生
+Root cause:
+(1) create: the DB row is created first, then storage name validation raises →
+    a 422 goes back to the caller but the ghost row remains.
+(2) delete: storage cleanup raises ValueError on an illegal name → propagates
+    out → the row lives forever.
 
-契約:
-- create 對非法名稱 fail-fast:ValueError 且 **FolderDB.create 不得被呼叫**
-- delete 的 storage 清理 best-effort:ValueError 不阻斷 FolderDB.delete
+Contract:
+- create fails fast on an illegal name: raises ValueError and **FolderDB.create
+  must not be called**.
+- delete's storage cleanup is best-effort: a ValueError does not block
+  FolderDB.delete.
 """
 
 from types import SimpleNamespace
@@ -51,7 +55,7 @@ class TestDeleteGhostRow:
             storage.delete_folder.side_effect = ValueError("illegal characters")
             ok = await FolderAdapter.delete_folder(99, user_token="tok-a")
         assert ok is True
-        db.delete.assert_called_once_with(id=99)  # row 一定要刪掉
+        db.delete.assert_called_once_with(id=99)  # the row must be deleted
 
     async def test_normal_delete_still_cleans_storage(self):
         folder = SimpleNamespace(id=7, name="good", user_token="tok-a",

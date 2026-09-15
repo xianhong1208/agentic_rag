@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
 
-"""
-Core Database Migration Utility using Alembic Python API
-Pure Python implementation - no CLI dependency
+"""Database migration utility built on the Alembic Python API (no CLI dependency).
 
-This module provides complete database migration functionality:
-- Auto migration (check and apply)
-- Apply pending migrations
-- Rollback migrations
-- Status checking
-- Database initialization
-
-Usage:
-    python -m db.migrate [command] [options]
-    
-Commands:
-    auto                        Auto-apply migrations (default)
-    migrate                     Apply pending migrations
-    rollback [revision]         Rollback to previous or specific revision
-    status                      Show detailed migration status
-    current                     Show current database revision
-    init                        Initialize database to current model state
+Run with `python -m db.migrate [command]`; see `main()` for available commands.
 """
 import sys
 import re
@@ -29,7 +11,6 @@ import traceback
 from pathlib import Path
 from typing import Tuple, Optional, List
 
-# Alembic Python API imports
 from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine, text
@@ -37,7 +18,6 @@ from sqlalchemy.engine import Engine
 from alembic.config import Config as AlembicConfig
 from alembic import command
 
-# Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -47,34 +27,26 @@ from src.utils.runtime_paths import resolve_external_dir
 
 logger = get_server_logger()
 
-# 跨實例的 migration 全域鎖 key(pg_advisory_lock)。任意固定 64-bit 值,
-# 所有 instance 一致即可;防多 worker / 滾動部署同時 auto_migrate 並發跑
-# 同一條 migration(DROP TABLE 類的並發跑會一邊成功一邊炸)。
+# Cross-instance global migration lock key (pg_advisory_lock). Any fixed
+# 64-bit value works as long as every instance uses the same one; prevents
+# multiple workers / rolling deployments from running auto_migrate on the same
+# migration concurrently (e.g. concurrent DROP TABLE would succeed on one and
+# fail on another).
 _PG_MIGRATE_LOCK_KEY = 74_112_358
 
 
 class MigrationChainError(RuntimeError):
-    """migration 檔案解析 / 鏈完整性失敗 — 一律大聲失敗,絕不靜默跳過。
-
-    背景:revision 用 regex 解析(只認 [a-f0-9]),不合規的 id 原本會被
-    靜默略過 → 該 migration「寫了等於沒寫」,schema 靜默漂移。多 head /
-    多 base / 斷鏈同理:原本只 warning,實際只套其中一條鏈。
+    """Migration parsing / chain-integrity failure — raised so the problem fails
+    loudly instead of silently leaving migrations unapplied and the schema drifting.
     """
 
 
 def get_external_base_dir() -> Path:
-    """Get the base directory for external files (config, versions, data, etc.)
+    """Return the base directory for external files (config, versions, data).
 
-    Uses `config/` as the marker directory — config and versions always live
-    as siblings under the same base in every deployment mode (dev / Nuitka
-    standalone / Nuitka onefile / Docker). So wherever config is, that's the base.
-
-    Delegates the actual path resolution (including the Nuitka onefile +
-    /proc/self/exe handling) to `src.utils.runtime_paths.resolve_external_dir`.
-
-    Returns:
-        The base path where external folders live, or `project_root` as a
-        last-resort fallback if nothing could be resolved.
+    Uses `config/` as the marker: config and versions always live as siblings
+    under the same base in every deployment mode, so wherever config is, that's
+    the base. Falls back to `project_root` if nothing can be resolved.
     """
     config_dir = resolve_external_dir("config", dev_root=project_root)
     if config_dir is not None:
@@ -88,10 +60,7 @@ def get_migrate_dir() -> Path:
 
 
 def get_versions_dir() -> Path:
-    """Get the versions directory path (contains migration files)
-    
-    External folder - not packaged with the application.
-    """
+    """Return the versions directory (migration files); external, not packaged."""
     external_base = get_external_base_dir()
     return external_base / "versions"
 
@@ -103,22 +72,17 @@ def get_config_dir() -> Path:
 
 
 class DatabaseMigrator:
-    """Database migration manager using Alembic Python API
-    
-    This class provides a pure Python implementation of all migration operations.
-    Uses Alembic Python API directly - works in both development and packaged mode.
-    
-    Structure:
-    - db/migrate/ - Alembic logic (packaged with app)
-    - versions/   - Migration files (external, not packaged)
+    """Database migration manager using the Alembic Python API.
+
+    Works in both development and packaged mode. Alembic logic lives in
+    db/migrate/ (packaged); migration files live in versions/ (external).
     """
-    
+
     def __init__(self):
         self.project_root = project_root
         self.external_base = get_external_base_dir()
         self.versions_dir = get_versions_dir()
 
-        # Get database URL from config
         self.db_conf = Config.get_database_config()
         self.db_url = getattr(self.db_conf, 'url')
         self._engine = create_engine(self.db_url)
@@ -126,7 +90,6 @@ class DatabaseMigrator:
         logger.debug(f"External base directory: {self.external_base}")
         logger.debug(f"Versions directory: {self.versions_dir}")
 
-        # Ensure versions directory exists
         if not self.versions_dir.exists():
             logger.warning(f"Versions directory not found, creating: {self.versions_dir}")
             self.versions_dir.mkdir(parents=True, exist_ok=True)
@@ -143,18 +106,11 @@ class DatabaseMigrator:
     
     @staticmethod
     def _discover_revisions(versions_dir: Path) -> List[Tuple[str, Optional[str], Path]]:
-        """解析 versions/*.py 並建立**經完整性校驗**的有序 migration 鏈。
+        """Parse versions/*.py into an integrity-checked chain ordered base -> head.
 
-        三重防護(違者 raise MigrationChainError,絕不靜默):
-        1. 每個非 `__` 開頭的 .py 都必須解析出 revision(regex 只認 [a-f0-9];
-           id 帶底線等字元的檔案原本會被靜默跳過 —— 寫了等於沒寫)
-        2. 恰好一個 base(down_revision=None)、恰好一個 head — 多 base /
-           分叉(多 head)一律報錯,不得只走其中一條鏈
-        3. 鏈必須涵蓋所有檔案 — down 指向不存在 rev 的孤兒即斷鏈
-
-        Returns:
-            [(revision, down_revision, file_path), ...] base → head 有序;
-            空目錄回空 list。
+        Raises MigrationChainError (never silently skips) on any of: an id the
+        regex cannot parse, multiple bases or heads (a fork), or an orphan whose
+        down_revision points nowhere. Returns [] for an empty directory.
         """
         version_files = [
             f for f in sorted(versions_dir.glob("*.py"))
@@ -167,9 +123,8 @@ class DatabaseMigrator:
         unparseable: List[str] = []
         for vf in version_files:
             content = vf.read_text(encoding='utf-8')
-            # Support both formats: revision = '...' and revision: str = '...'
-            # (?<!down_):revision 行不匹配時,search 會滑到 down_revision 行
-            # 誤把 down 值當 revision — 負向斷言擋掉這個誤匹配
+            # The (?<!down_) lookbehind stops the match sliding onto the
+            # down_revision line and reading the down value as the revision.
             rev_match = re.search(r"(?<!down_)revision(?:\s*:\s*str)?\s*=\s*['\"]([a-f0-9]+)['\"]", content)
             down_match = re.search(r"down_revision(?:\s*:[^=]+)?\s*=\s*(?:['\"]?([a-f0-9]+)['\"]?|None)", content)
             if not rev_match:
@@ -182,9 +137,9 @@ class DatabaseMigrator:
 
         if unparseable:
             raise MigrationChainError(
-                f"無法解析 revision 的 migration 檔案:{unparseable} — "
-                f"revision id 只能含 [a-f0-9](regex 解析限制),否則會被靜默跳過。"
-                f"請改用純 hex 樣式 id(如 20260819cafe01)。"
+                f"Cannot parse revision from migration file(s): {unparseable} — "
+                f"a revision id may only contain [a-f0-9] (regex limitation), "
+                f"otherwise it is silently skipped. Use a pure-hex id (e.g. 20260819cafe01)."
             )
 
         all_revs = set(revisions.keys())
@@ -193,14 +148,15 @@ class DatabaseMigrator:
         bases = [r for r, (d, _) in revisions.items() if d is None]
         if len(bases) != 1:
             raise MigrationChainError(
-                f"migration 鏈必須恰好一個 base(down_revision=None),實得 {len(bases)}:"
-                f"{sorted(bases)} — 多 base 表示鏈斷成多段。"
+                f"The migration chain must have exactly one base (down_revision=None), "
+                f"got {len(bases)}: {sorted(bases)} — multiple bases mean a broken chain."
             )
         heads = sorted(all_revs - down_revs)
         if len(heads) != 1:
             raise MigrationChainError(
-                f"偵測到多個 head:{heads} — migration 歷史分叉,只會套用其中一條鏈、"
-                f"其餘靜默丟失。請把分支 rebase 成線性(改其中一支的 down_revision)。"
+                f"Multiple heads detected: {heads} — the migration history has forked; "
+                f"only one chain would be applied and the rest silently dropped. "
+                f"Rebase the branches into a linear history (adjust one branch's down_revision)."
             )
 
         chain: List[Tuple[str, Optional[str], Path]] = []
@@ -218,24 +174,18 @@ class DatabaseMigrator:
                 for r in all_revs - in_chain
             )
             raise MigrationChainError(
-                f"斷鏈:{len(revisions) - len(chain)} 個 migration 是 orphan"
-                f"(down_revision 指向不存在的 rev):{orphans}"
+                f"Broken chain: {len(revisions) - len(chain)} migration(s) are orphans "
+                f"(down_revision points to a nonexistent rev): {orphans}"
             )
         return chain
 
     def _get_head_revision(self) -> Optional[str]:
-        """Get head revision from migration files(鏈校驗失敗直接 raise)"""
+        """Get head revision from migration files (raises on chain-validation failure)"""
         chain = self._discover_revisions(self.versions_dir)
         return chain[-1][0] if chain else None
     
     def _get_migration_chain(self) -> List[Tuple[str, Optional[str], Path]]:
-        """Get ordered list of migrations from base to head
-        
-        Returns:
-            List of (revision, down_revision, file_path) tuples in order
-        """
-        # 解析 + 完整性校驗統一走 _discover_revisions;鏈壞掉直接 raise
-        # (舊版這裡自帶第二份 regex 且吞例外回空 list — 靜默漂移的另一個來源)
+        """Return migrations ordered base -> head as (revision, down_revision, file_path)."""
         return self._discover_revisions(self.versions_dir)
 
     def upgrade(self, revision: str = "head") -> bool:
@@ -266,27 +216,26 @@ class DatabaseMigrator:
                 logger.info("✅ Database is already at target revision")
                 return True
 
-            # 多實例防護:pg_advisory_lock(session 級,鎖在這條連線上持有)。
-            # 多 worker / 滾動部署同時啟動時,只有一個 instance 真正跑 migration,
-            # 其餘在此等待;等到後 double-check current(對手可能已升完)。
+            # Multi-instance guard: a session-scoped pg_advisory_lock so that when
+            # multiple workers / rolling deployments start at once, only one runs
+            # the migration while the rest wait here.
             with self._engine.connect() as lock_conn:
                 lock_conn.execute(
                     text("SELECT pg_advisory_lock(:k)"), {"k": _PG_MIGRATE_LOCK_KEY}
                 )
                 try:
-                    # double-check:等鎖期間別的 instance 可能已把庫升到位
+                    # Re-check after acquiring the lock: a competitor may already
+                    # have upgraded to the target while we waited.
                     current_rev = self._get_current_revision()
                     if current_rev == target_rev:
                         logger.info("✅ Another instance already upgraded to target — skipping")
                         return True
 
-                    # Get migration chain
                     chain = self._get_migration_chain()
                     if not chain:
                         logger.warning("⚠️ No migration files found")
                         return True
 
-                    # Find migrations to apply
                     start_applying = current_rev is None
                     migrations_to_apply = []
 
@@ -337,35 +286,29 @@ class DatabaseMigrator:
                 return False
             
             module = importlib.util.module_from_spec(spec)
-            
-            # Make SQLAlchemy ops available
+
             from alembic import op
             module.op = op
             module.sa = sqlalchemy
-            
+
             spec.loader.exec_module(module)
-            
-            # Execute upgrade function within Alembic context
+
             with engine.begin() as conn:
-                # Ensure alembic_version table exists
                 conn.execute(text("""
                     CREATE TABLE IF NOT EXISTS alembic_version (
                         version_num VARCHAR(32) NOT NULL,
                         CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
                     )
                 """))
-                
-                # Configure migration context
+
                 context = MigrationContext.configure(conn)
-                
-                # Bind op to the connection
+
                 with Operations.context(context):
                     if hasattr(module, 'upgrade'):
                         module.upgrade()
                     else:
                         logger.warning(f"No upgrade function in {file_path}")
-                
-                # Update alembic_version table
+
                 conn.execute(text("DELETE FROM alembic_version"))
                 conn.execute(
                     text("INSERT INTO alembic_version (version_num) VALUES (:rev)"),
@@ -397,7 +340,7 @@ class DatabaseMigrator:
                 logger.info("✅ Database has no revision to downgrade from")
                 return True
             
-            # Handle relative revision (-1, -2, etc.)
+            # Resolve a relative revision (-1, -2, ...) to an absolute one
             if revision.startswith("-"):
                 steps = int(revision)
                 chain = self._get_migration_chain()
@@ -421,7 +364,6 @@ class DatabaseMigrator:
             logger.info(f"📍 Current: {current_rev}")
             logger.info(f"🎯 Target: {revision}")
 
-            # Get migrations to rollback (from current down to target)
             chain = self._get_migration_chain()
             migrations_to_downgrade = []
             found_current = False
@@ -432,8 +374,6 @@ class DatabaseMigrator:
 
                 if found_current:
                     migrations_to_downgrade.append((rev, down_rev, file_path))
-                    # Stop condition: this migration's down_revision is the target
-                    # (or target is "base" and down_revision is None)
                     if revision == "base" and down_rev is None:
                         break
                     if down_rev == revision:
@@ -487,8 +427,7 @@ class DatabaseMigrator:
                         module.downgrade()
                     else:
                         logger.warning(f"No downgrade function in {file_path}")
-                
-                # Update alembic_version table
+
                 conn.execute(text("DELETE FROM alembic_version"))
                 if down_revision:
                     conn.execute(
@@ -633,8 +572,8 @@ class DatabaseMigrator:
         print(head if head else "(no head revision)")
         return True
 
-    # ==================== Alias methods for main.py compatibility ====================
-    
+    # Alias methods for main.py compatibility
+
     def apply_migrations(self) -> bool:
         """Apply all pending migrations (alias for upgrade('head'))"""
         return self.upgrade("head")
@@ -650,15 +589,12 @@ class DatabaseMigrator:
         """
         try:
             logger.info("🔧 Initializing database...")
-            
-            # Import Base for table creation
+
             from db.db import Base
 
-            # Create all tables
             logger.info("Creating database tables...")
             Base.metadata.create_all(self._engine)
-            
-            # Stamp to head revision
+
             logger.info("Stamping database to head revision...")
             self.stamp("head")
             
@@ -670,21 +606,19 @@ class DatabaseMigrator:
             return False
     
     def create_migration(self, message: str) -> bool:
-        """產生新的 Alembic migration 檔(autogenerate)。
+        """Create a new Alembic migration file (autogenerate).
 
-        僅在 dev 環境可用(需要 Alembic CLI + migrate_dir 存在)。
-        Packaged 環境應在打包前就先產 migration。
+        Only available in dev environments (requires the Alembic CLI and an
+        existing migrate_dir). Packaged environments should generate migrations
+        before packaging.
 
         Args:
-            message: revision 訊息(會變成檔名一部分)。
+            message: Revision message (becomes part of the filename).
 
         Returns:
-            True 成功;False = migrate_dir 不存在 / Alembic 失敗。
+            True on success; False if migrate_dir is missing or Alembic fails.
         """
         try:
-            # Use Alembic programmatic API to create a revision (autogenerate)
-
-
             logger.info(f"📝 Creating migration: {message}")
 
             migrate_dir = get_migrate_dir()
@@ -692,22 +626,17 @@ class DatabaseMigrator:
                 logger.error("❌ Migrate directory not found. Cannot create migrations in packaged mode.")
                 return False
 
-            # Prepare Alembic Config
             alembic_ini_path = migrate_dir / "alembic.ini"
             if alembic_ini_path.exists():
                 alembic_cfg = AlembicConfig(str(alembic_ini_path))
-                # alembic.ini already contains script_location (usually %(here)s/alembic)
             else:
-                # Create a minimal config object if alembic.ini is missing
                 alembic_cfg = AlembicConfig()
-                # point script_location to packaged alembic folder
                 alembic_cfg.set_main_option("script_location", str(migrate_dir / "alembic"))
 
-            # Ensure Alembic uses the external versions dir and DB URL
+            # Alembic must use the external versions dir and the configured DB URL
             alembic_cfg.set_main_option("version_locations", str(self.versions_dir))
             alembic_cfg.set_main_option("sqlalchemy.url", str(self.db_url))
 
-            # Run alembic revision with autogenerate
             command.revision(alembic_cfg, message=message, autogenerate=True)
 
             logger.info("✅ Migration created successfully (via Alembic API)")

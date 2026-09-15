@@ -1,8 +1,9 @@
 
-"""2026-09-07 管線審查修復的回歸網(C1/C2/H1/H3/H4/M3/M4)。
+"""Regression net for the pipeline-review fixes.
 
-出處:全鏈審查(上傳→解析→CR→embed→存→reindex→delete)發現的真缺陷。
-每個測試名對應審查編號,倒退 = 舊缺陷復活。
+Covers real defects found in a full-chain review
+(upload → parse → CR → embed → store → reindex → delete). Each test name maps to
+a review item; a regression here means an old defect has come back.
 """
 
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ class TestM3EmbeddingBatchMismatch:
     async def test_short_batch_raises_not_silently_truncates(self):
         from src.domain.rag.embedding.batch_exec import _embed_batch_with_retry
         embed = MagicMock()
-        embed.get_text_embedding_batch.return_value = [[0.1]] * 2  # 少一筆
+        embed.get_text_embedding_batch.return_value = [[0.1]] * 2  # one short
         with pytest.raises(ValueError, match="mismatch"):
             await _embed_batch_with_retry(embed, ["a", "b", "c"], "f.pdf", 0, 3, 3)
 
@@ -48,11 +49,11 @@ class TestH1LeafFilterInRestQuery:
             n = MagicMock()
             n.node.metadata = {"node_role": role} if role else {}
             n.metadata = {"file_id": "f", "file_name": "x", "folder_name": None}
-            n.node.node_id = nid  # 各節點唯一 id(RRF 依 node_id 去重)
+            n.node.node_id = nid  # unique id per node (RRF dedupes by node_id)
             n.text = text; n.score = 0.9
             return n
 
-        # 每次呼叫 aretrieve 回一份新 hits(RRF 路徑會分別檢索 dense+sparse)
+        # Each aretrieve call returns a fresh set of hits (the RRF path retrieves dense+sparse separately)
         def _hits():
             return [node("leaf", "L1", "00000000-0000-0000-0000-000000000001"),
                     node("parent", "P-superset", "00000000-0000-0000-0000-000000000002"),
@@ -61,8 +62,8 @@ class TestH1LeafFilterInRestQuery:
             R.return_value.aretrieve = AsyncMock(side_effect=lambda *a, **k: _hits())
             results = await qe.aquery("q")
         texts = [r.text for r in results]
-        assert "P-superset" not in texts          # parent 濾掉
-        assert "L1" in texts and "legacy" in texts  # legacy 無 node_role 視為 leaf
+        assert "P-superset" not in texts          # parent filtered out
+        assert "L1" in texts and "legacy" in texts  # legacy has no node_role, treated as a leaf
 
 
 class TestH4ForceBypass:
@@ -77,7 +78,7 @@ class TestH4ForceBypass:
         app.dependency_overrides[ri.get_file_by_id] = lambda: SimpleNamespace(
             id="9e68c18e-3209-44d3-b7e9-2211b3660d66", file_name="a.pdf",
             file_path="p", folder_id=1, mime_type="x", file_size=1, content_hash="h")
-        # router 掛了 authenticate_request(router-level)→ 一併 override
+        # The router applies authenticate_request (router-level) → override it too
         from src.auth.dependencies import authenticate_request
         app.dependency_overrides[authenticate_request] = lambda: None
         adapter = MagicMock()
@@ -94,7 +95,7 @@ class TestH4ForceBypass:
 
 class TestC1ReindexIntegrity:
     async def test_delete_failure_aborts_reindex(self):
-        """刪索引失敗 → endpoint 必須 500 中止,不得啟動 job(舊行為:warn 後照跑)。"""
+        """Index-delete failure → the endpoint must abort with 500 and not start the job (old behavior: warn, then run anyway)."""
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
         from src.api.router import rag_indexing as ri
@@ -113,22 +114,24 @@ class TestC1ReindexIntegrity:
             r = TestClient(app).post("/files/7/reindex", json={})
         assert r.status_code == 500
         assert "aborted" in r.json()["detail"]
-        start.assert_not_awaited()  # 索引未清成功,絕不能起 job
+        start.assert_not_awaited()  # index not cleared successfully, must never start the job
 
     def test_maintenance_drop_failure_raises(self):
-        """DROP 失敗必 raise(舊行為只 log)— 防止舊向量表 + 無 FileIndex 疊寫。"""
+        """A DROP failure must raise (old behavior only logged) — prevents an old vector table plus missing FileIndex from overwriting."""
         import inspect
         from src.adapter import rag_maintenance
         src = inspect.getsource(rag_maintenance)
         assert "raise ValueError" in src and "Failed to drop vector table" in src
-        # 順序:刪 rows 在 DROP 之前(致命態防護)
+        # Order: delete rows before DROP (guards against the fatal state)
         assert src.index("delete_indices_for_folder") < src.index("drop_table(")
 
 
 class TestH4ForceRealPath:
-    """回歸(2026-09-07 用戶 log):force 只加在外層簽名、hash 檢查在
-    _index_document_locked → NameError 讓整夾檔案全標 failed。
-    此測試**真的執行**到 hash 檢查行,scope 斷裂會當場炸。"""
+    """Regression: force was added only to the outer signature while the hash
+    check lives in _index_document_locked → a NameError marked every file in the
+    folder as failed. This test **actually executes** the hash-check line, so a
+    broken scope crashes on the spot.
+    """
 
     def _svc(self):
         from src.adapter.rag_indexing import RAGIndexingService
@@ -168,9 +171,9 @@ class TestH4ForceRealPath:
                 return True
             if calls["n"] <= 3:
                 return existing
-            raise RuntimeError("proceeded-past-shortcircuit")  # 走過短路即達成目的
+            raise RuntimeError("proceeded-past-shortcircuit")  # getting past the short-circuit is the goal
         with patch("src.adapter.rag_indexing._run_db", side_effect=fake_run_db):
             with pytest.raises(Exception):
                 await svc._index_document_locked(
                     file_record=self._file(), token="t", force=True)
-        # force=True 不得回 already_indexed(上面若短路會 return 而非 raise)
+        # force=True must not return already_indexed (a short-circuit above would return rather than raise)

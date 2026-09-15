@@ -14,31 +14,84 @@ from src.config.config_manager import Config
 
 logger = get_api_logger()
 
+# Column llama-index's PGVectorStore uses for the FTS tsvector when
+# hybrid_search=True (llama-index 0.14 builds it as
+# to_tsvector(text_search_config, content)). Update if a future version renames it.
+_TSV_COLUMN = "text_search_tsv"
+
+# Batch size for the CKIP re-segmentation + UPDATE loop (bounds memory, commits
+# incrementally).
+_TSV_REBUILD_BATCH = 256
+
+
+def rebuild_text_search_tsv(engine, table_name: str, segmenter) -> int:
+    """Recompute a PGVector table's `text_search_tsv` from CKIP-segmented text.
+
+    llama-index's native `to_tsvector('simple', text)` cannot segment space-less
+    Chinese, so we overwrite the column with CKIP-segmented tokens. The displayed
+    `text` column is left untouched — only the search vector is CKIP-derived.
+
+    llama-index creates `text_search_tsv` as a STORED GENERATED column
+    (`GENERATED ALWAYS AS to_tsvector(config, text)`), which Postgres forbids
+    UPDATEing. CKIP runs in Python (Postgres cannot call it, unlike the old pg_jieba
+    text-search config), so we first detach the generated expression, turning it into
+    a plain tsvector column we own. `DROP EXPRESSION IF EXISTS` is idempotent and a
+    no-op once detached; existing values are kept until this UPDATE overwrites them.
+    (Rows llama-index inserts afterwards land with NULL tsv until the next rebuild,
+    which runs after every add — see hierarchical_indexer.)
+
+    Blocking (sync SQLAlchemy + CKIP inference); callers must run it off the event
+    loop. Returns the number of rows updated.
+    """
+    updated = 0
+    # table_name is server-generated (int + UUID), not user input — no injection surface.
+    detach_sql = text(
+        f'ALTER TABLE "{table_name}" '
+        f"ALTER COLUMN {_TSV_COLUMN} DROP EXPRESSION IF EXISTS"
+    )
+    select_sql = text(f'SELECT id, text FROM "{table_name}"')
+    update_sql = text(
+        f'UPDATE "{table_name}" '
+        f"SET {_TSV_COLUMN} = to_tsvector('simple', :seg) WHERE id = :id"
+    )
+    with engine.connect() as conn:
+        # Detach the generated expression once so the column becomes UPDATEable.
+        conn.execute(detach_sql)
+        conn.commit()
+        rows = conn.execute(select_sql).fetchall()
+        if not rows:
+            return 0
+        for start in range(0, len(rows), _TSV_REBUILD_BATCH):
+            batch = rows[start:start + _TSV_REBUILD_BATCH]
+            texts = [(r[1] or "") for r in batch]
+            segmented = segmenter.segment_batch(texts)
+            params = [
+                {"id": r[0], "seg": seg}
+                for r, seg in zip(batch, segmented)
+            ]
+            conn.execute(update_sql, params)
+            conn.commit()
+            updated += len(params)
+    logger.info(
+        f"Rebuilt {_TSV_COLUMN} from CKIP tokens for {updated} row(s) "
+        f"in {table_name}"
+    )
+    return updated
+
 
 class VectorStoreManager:
-    """Manages vector store lifecycle and caching
+    """Manages PGVector store lifecycle and caching.
 
-    Responsibilities:
-    - Create PGVector stores for folders using vector_table_uuid
-    - Cache vector stores to avoid redundant connections
-    - Ensure proper table naming format: data_{vector_table_uuid}
-    - Configure hybrid search (vector + BM25)
-
-    Benefits of separating this responsibility:
-    - Single Responsibility Principle (SRP)
-    - Easier to test vector store logic in isolation
-    - Can be reused by other components
-    - Clear interface for vector store management
+    Each folder gets its own store (table data_{folder_id}_{uuid}) configured for
+    hybrid (vector + BM25) search; created stores are cached per table name.
     """
 
-    def __init__(self, embed_dim: int, text_search_config: str = "jiebacfg", hybrid_search: bool = True):
-        """Initialize vector store manager
+    def __init__(self, embed_dim: int, text_search_config: str = "simple", hybrid_search: bool = True):
+        """Initialize vector store manager.
 
-        Args:
-            embed_dim: Embedding dimension (must match model output)
-            text_search_config: PostgreSQL text search config for BM25 tokenization
-                                (e.g., 'jiebacfg' for Chinese, 'english' for English)
-            hybrid_search: Enable BM25 + vector hybrid search (default True)
+        text_search_config is the Postgres config that tokenizes the space-joined
+        result of Python-side CKIP segmentation ('simple' default; 'english' for
+        English-only corpora).
         """
         self._embed_dim = embed_dim
         self._text_search_config = text_search_config
@@ -60,29 +113,13 @@ class VectorStoreManager:
         folder_id: int,
         vector_table_uuid: str
     ) -> PGVectorStore:
-        """Get existing vector store or create new one
-
-        Args:
-            folder_id: Folder ID
-            vector_table_uuid: UUID for vector table name (from Folder.vector_table_uuid)
-
-        Returns:
-            PGVectorStore instance
-
-        This method implements the cache-aside pattern:
-        1. Check if vector store exists in cache
-        2. If not, create new one and cache it
-        3. Return vector store
-        """
-        # Use vector_table_uuid as table name (format: data_{folder_id}_{uuid})
+        """Get existing vector store or create a new one (cache-aside)."""
         table_name = f"{folder_id}_{vector_table_uuid}"
 
-        # Check cache
         if table_name in self._vector_stores:
             logger.debug(f"Vector store cache HIT: {table_name}")
             return self._vector_stores[table_name]
 
-        # Cache miss - create new vector store
         logger.debug(f"Vector store cache MISS: {table_name}, creating new one")
 
         try:
@@ -101,28 +138,17 @@ class VectorStoreManager:
             raise
 
     def _create_vector_store(self, table_name: str) -> PGVectorStore:
-        """Create a new PGVector store with hybrid search enabled
-
-        Args:
-            table_name: PGVector table name
-
-        Returns:
-            Configured PGVectorStore instance
-
-        Private method - only called by get_or_create()
-        """
-        # Parse connection string
+        """Create a new PGVector store with hybrid search enabled."""
         url = make_url(self._db_url)
-
-        # Determine connection parameters with sensible fallbacks
         port = url.port or self._db_port or 5432
 
-        # HNSW index 不透過 LlamaIndex 建 — LlamaIndex 內部 SQL 沒處理 UUID hyphen 的
-        # identifier quoting,會炸:
+        # Do not build the HNSW index through LlamaIndex — its internal SQL does not
+        # quote identifiers containing UUID hyphens and breaks:
         #     CREATE INDEX IF NOT EXISTS data_2_b09d9acf-d049-...
         #                                              ^ syntax error
-        # 改由 src/utils/db_bootstrap.py:_ensure_hnsw_indexes() 在 server boot 時
-        # 統一掃所有 data_* 表補 HNSW(冪等),覆蓋既有表跟未來新增 folder 的表。
+        # Instead, src/utils/db_bootstrap.py:_ensure_hnsw_indexes() scans all data_*
+        # tables at server boot and adds HNSW indexes (idempotently), covering both
+        # existing tables and tables for folders added later.
         vector_store = PGVectorStore.from_params(
             database=url.database,
             host=url.host,
@@ -144,19 +170,17 @@ class VectorStoreManager:
         return vector_store
 
     def clear_cache(self):
-        """Clear all cached vector stores
-
-        Useful for testing or when memory needs to be freed.
-        """
+        """Clear all cached vector stores."""
         count = len(self._vector_stores)
         self._vector_stores.clear()
         logger.info(f"Vector store cache cleared ({count} entries removed)")
 
     def update_embed_dim(self, embed_dim: int) -> None:
-        """執行期換 embedding 維度(admin 熱改)— 換值 + 清 store cache。
+        """Change the embedding dimension at runtime (admin hot-change).
 
-        cache 內的 PGVectorStore 凍著舊維度,必須一起清;既有 folder 的
-        物理表維度不會跟著變(pgvector 建表後固定),要重建索引才對齊。
+        Cached PGVectorStore instances freeze the old dimension, so the cache is
+        cleared. Physical table dimensions are fixed at creation, so folders must be
+        reindexed to realign.
         """
         if embed_dim == self._embed_dim:
             return
@@ -166,39 +190,33 @@ class VectorStoreManager:
         logger.info(f"[RUNTIME] embed_dim {old} → {embed_dim} (store cache cleared)")
 
     def get_cache_stats(self) -> dict:
-        """Get cache statistics
-
-        Returns:
-            Dictionary with cache metrics
-        """
+        """Get cache statistics."""
         return {
             'cached_stores': len(self._vector_stores),
             'table_names': list(self._vector_stores.keys()),
             'embed_dim': self._embed_dim
         }
 
-    # ------------------------------------------------------------------
-    # M5: 物理表刪除 —— 從 adapter 收斂進來(vector store 的職責)。
-    # 表名慣例、DROP/DELETE 的 raw SQL 原本散在 rag_maintenance / folder,
-    # 各寫一份;統一在這裡,adapter 只呼叫方法。
-    # ------------------------------------------------------------------
+    # Physical table deletion
     @staticmethod
     def physical_table_name(folder_id: int, vector_table_uuid) -> str:
-        """某 folder 的 pgvector 物理表名(全專案唯一慣例來源)。
+        """A folder's pgvector physical table name (the single source of this convention project-wide).
 
-        llama_index PGVectorStore 會在其 internal table_name 前加 data_ 前綴,
-        實際落庫的表就是 data_{folder_id}_{uuid}。
+        llama_index PGVectorStore prepends a data_ prefix to its internal table_name,
+        so the actual persisted table is data_{folder_id}_{uuid}.
         """
         return f"data_{folder_id}_{vector_table_uuid}"
 
     @staticmethod
     def drop_table_by_name(table_name: str) -> bool:
-        """DROP 一張 pgvector 物理表(CASCADE 連帶刪 HNSW 索引/約束)。無 cache 副作用。
+        """DROP one pgvector physical table (CASCADE also removes its HNSW index/constraints). No cache side effects.
 
-        給沒有 VSM instance 的呼叫端(如 folder.py 刪整個 folder)用;有 instance 的
-        請用 drop_table()(會一併清 cache)。IF EXISTS:表可能不存在。失敗只記
-        log、回 False,不拋 —— 刪除流程不因單一 DDL 失敗而中斷。表名為 int + 服務器
-        UUID 拼成,非用戶輸入,無注入面。
+        For callers without a VSM instance (e.g. folder.py deleting an entire folder);
+        callers that have an instance should use drop_table() (which also clears the
+        cache). IF EXISTS: the table may not exist. On failure it only logs and returns
+        False without raising — a single DDL failure must not interrupt the deletion
+        flow. The table name is int + server-generated UUID, not user input, so there
+        is no injection surface.
         """
         try:
             engine = get_engine()
@@ -212,17 +230,18 @@ class VectorStoreManager:
             return False
 
     def drop_table(self, folder_id: int, vector_table_uuid) -> bool:
-        """DROP 某 folder 的 pgvector 表並清掉對應 cache(有 instance 時用這支)。"""
-        # cache key 無 data_ 前綴(見 get_or_create),清掉避免 stale store 指向已 DROP 表
+        """DROP a folder's pgvector table and clear the corresponding cache (use this when you have an instance)."""
+        # cache key has no data_ prefix (see get_or_create); clear it to avoid a stale store pointing at the dropped table
         self._vector_stores.pop(f"{folder_id}_{vector_table_uuid}", None)
         return self.drop_table_by_name(self.physical_table_name(folder_id, vector_table_uuid))
 
     @staticmethod
     def delete_chunks_by_file(table_name: str, file_id) -> int:
-        """從某 folder 的 pgvector 表刪掉某檔的所有 chunk(比對 metadata_ JSONB)。
+        """Delete all chunks of a file from a folder's pgvector table (matching the metadata_ JSONB).
 
-        file_id 走 bind param(:file_id)防注入;table_name 為服務器產生的表名。
-        回刪除筆數;失敗回 0、不拋。
+        file_id goes through a bind param (:file_id) to prevent injection; table_name
+        is a server-generated table name. Returns the number of rows deleted; on
+        failure returns 0 without raising.
         """
         try:
             engine = get_engine()
@@ -234,8 +253,9 @@ class VectorStoreManager:
                 conn.commit()
                 return result.rowcount or 0
         except Exception as e:
-            # 表不存在 = 沒 chunk 可刪(首次索引的 C2 寫入前 purge 會踩到)—
-            # 正常結果,降級為 debug 免洗版面;其餘錯誤照舊 warning。
+            # Table absent = no chunks to delete (hit by the pre-write purge on a
+            # first index) — a normal outcome, so downgrade to debug to avoid noise;
+            # other errors still log a warning.
             if "does not exist" in str(e).lower() or "undefinedtable" in type(e).__name__.lower():
                 logger.debug(f"delete_chunks: table {table_name} absent (nothing to delete)")
             else:

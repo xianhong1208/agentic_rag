@@ -1,22 +1,27 @@
 
-"""ACL — token 從 Authorization header 抽取 + folder 權限檢查
+"""ACL — extract the token from the Authorization header and check folder access.
 
-設計原則:
-- 單一 entry point:工具呼叫的第一行永遠是 `token = extract_token()`,
-  接著呼叫 `verify_folder_access(token, folder_name)` 拿 folder ORM 物件。
-- ACL 失敗永遠丟 InvalidTokenError / UnauthorizedAccessError(domain exceptions),
-  由 middleware 統一轉換成標準 MCP error response。
-- 不快取 ACL 結果在這裡 — token server 那層已經有 cache_ttl 設定。
+Design principles:
+- Single entry point: the first line of every tool call is always
+  `token = extract_token()`, followed by `verify_folder_access(token,
+  folder_name)` to obtain the folder ORM object.
+- ACL failures always raise InvalidTokenError / UnauthorizedAccessError (domain
+  exceptions), which middleware converts uniformly into a standard MCP error
+  response.
+- ACL results are not cached here — the token server layer already has a
+  cache_ttl setting.
 
-M6: verify_folder_access / list_accessible_folders 已搬進 domain
-(src/domain/rag/folder_acl.py,無 fastmcp 依賴);此處 re-export 向下相容。
-extract_token 讀 MCP HTTP request context,是真正的交付層邏輯,留在這裡。
+verify_folder_access / list_accessible_folders now live in the domain layer
+(src/domain/rag/folder_acl.py, with no fastmcp dependency); they are re-exported
+here for backward compatibility. extract_token reads the MCP HTTP request
+context, which is genuine delivery-layer logic, so it stays here.
 """
 
 from __future__ import annotations
 
 from fastmcp.server.dependencies import get_http_request
 
+from src.auth.owner_key import owner_key_from_bearer
 from src.domain.exceptions import InvalidTokenError
 from src.domain.rag.folder_acl import (  # noqa: F401
     list_accessible_folders,
@@ -28,10 +33,10 @@ logger = get_mcptools_logger()
 
 
 def extract_token() -> str:
-    """從 Authorization header 抽 Bearer token
+    """Extract the Bearer token from the Authorization header.
 
     Raises:
-        InvalidTokenError: header 缺失/格式錯誤
+        InvalidTokenError: header is missing or malformed
     """
     request = get_http_request()
     auth_header = request.headers.get("Authorization", "")
@@ -48,4 +53,5 @@ def extract_token() -> str:
     if len(parts) != 2 or not parts[1]:
         raise InvalidTokenError("Token is empty or malformed")
 
-    return parts[1]
+    # Ownership key = this token's jti (per-token scope), not the raw token.
+    return owner_key_from_bearer(parts[1])

@@ -1,17 +1,17 @@
 
 """RAG Query REST API
 
-只負責檢索查詢:
-- POST /api/rag/query                查詢已索引的內容(走 hybrid + rerank)
+Handles retrieval queries only:
+- POST /api/rag/query                query indexed content (via hybrid + rerank)
 
-Indexing endpoints 已移到 rag_indexing.py。
-注意:此 endpoint 走的是 RAGAdapter.query_rag(flat-style 平面 hybrid 檢索),
-      若要使用 Auto-Merging + 上下文展開,請走 MCP 工具(Agentic_{folder_name}),
-      或在後續版本擴充此 endpoint 加 mode 參數。
+Indexing endpoints have moved to rag_indexing.py.
+Note: this endpoint uses RAGAdapter.query_rag (flat-style hybrid retrieval). For Auto-Merging +
+context expansion, use the MCP tool (Agentic_{folder_name}), or extend this endpoint with a
+mode parameter in a future version.
 
-預設值:四個 retrieval 參數(top_k / similarity_cutoff / sparse_top_k /
-hybrid_alpha)若未提供,會即時讀取 `config.yaml` 的 `rag.retrieval.*`,
-跟 server 整體 config 保持一致。
+Defaults: if the four retrieval parameters (top_k / similarity_cutoff / sparse_top_k /
+hybrid_alpha) are not provided, they are read live from `rag.retrieval.*` in `config.yaml`,
+staying consistent with the server's overall config.
 """
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -28,18 +28,18 @@ from src.log import get_api_logger, log_err, log_op, log_warn
 
 _QUERY_REQUEST_EXAMPLES = {
     "minimal": {
-        "summary": "最小用法(用 config 預設)",
-        "description": "只填必填欄位。4 個 retrieval 參數從 `config.rag.retrieval.default_*` 讀。",
+        "summary": "Minimal usage (config defaults)",
+        "description": "Only required fields. The 4 retrieval params are read from `config.rag.retrieval.default_*`.",
         "value": {
-            "query": "這份文件的核心結論是什麼?",
+            "query": "What is the core conclusion of this document?",
             "folder_name": "my-folder",
         },
     },
     "explicit_match_config": {
-        "summary": "顯式對齊 config 當前值",
-        "description": "把 config 預設複製進 body,方便只調某一個 retrieval 參數。",
+        "summary": "Explicitly match current config values",
+        "description": "Copy the config defaults into the body to tune a single retrieval param.",
         "value": {
-            "query": "這份文件的核心結論是什麼?",
+            "query": "What is the core conclusion of this document?",
             "folder_name": "my-folder",
             "top_k": 10,
             "similarity_cutoff": 0.25,
@@ -48,8 +48,8 @@ _QUERY_REQUEST_EXAMPLES = {
         },
     },
     "vector_heavy": {
-        "summary": "純向量檢索(關掉 BM25)",
-        "description": "hybrid_alpha=1.0 → 完全用向量分數,忽略關鍵字。適合語意接近但用詞不同的查詢。",
+        "summary": "Vector-only retrieval (BM25 off)",
+        "description": "hybrid_alpha=1.0 uses vector scores only, ignoring keywords. Good for semantically close but differently worded queries.",
         "value": {
             "query": "What is the main conclusion?",
             "folder_name": "my-folder",
@@ -57,8 +57,8 @@ _QUERY_REQUEST_EXAMPLES = {
         },
     },
     "keyword_heavy": {
-        "summary": "純關鍵字檢索(關掉向量)",
-        "description": "hybrid_alpha=0.0 → 完全用 BM25。適合查精確字詞(如型號、人名)。",
+        "summary": "Keyword-only retrieval (vector off)",
+        "description": "hybrid_alpha=0.0 uses BM25 only. Good for exact terms (e.g. model numbers, names).",
         "value": {
             "query": "AMD AI 395",
             "folder_name": "my-folder",
@@ -84,11 +84,11 @@ _FALLBACK_RETRIEVAL_DEFAULTS = {
 
 
 def _resolve_retrieval_defaults() -> dict:
-    """從 config.yaml 即時讀 retrieval 預設值。
+    """Read retrieval defaults live from config.yaml.
 
     Returns:
-        含 top_k / similarity_cutoff / sparse_top_k / hybrid_alpha 的 dict;
-        config 缺欄位時 fall back 到模組內常數 _FALLBACK_RETRIEVAL_DEFAULTS。
+        A dict with top_k / similarity_cutoff / sparse_top_k / hybrid_alpha; falls back to the
+        module constant _FALLBACK_RETRIEVAL_DEFAULTS for any field missing from config.
     """
     out = dict(_FALLBACK_RETRIEVAL_DEFAULTS)
     try:
@@ -110,13 +110,13 @@ def _resolve_retrieval_defaults() -> dict:
 
 
 # Response = {data: {query, results[], total_results, retrieval_time_ms}, message}
-# results 走 hybrid (vector + BM25) + 可選 rerank;score 為 reranker enabled 時的 rerank score
+# results use hybrid (vector + BM25) + optional rerank; when the reranker is enabled, score is the rerank score
 @router.post(
     "/query",
     response_model=QueryResponse,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder_name 不存在或無權限"},
-        422: {"model": ErrorDetailResponse, "description": "request body 驗證失敗"},
+        404: {"model": ErrorDetailResponse, "description": "folder_name does not exist or no permission"},
+        422: {"model": ErrorDetailResponse, "description": "request body validation failed"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -125,11 +125,11 @@ async def query_rag(
     query_request: QueryRequest = Body(..., openapi_examples=_QUERY_REQUEST_EXAMPLES),
     token: str = Depends(extract_token),
 ):
-    """以資料夾名稱 + 自然語言查詢 — hybrid retrieval + rerank
+    """Query by folder name + natural language — hybrid retrieval + rerank
 
     Args:
         query_request: query / folder_name / top_k / similarity_cutoff /
-                       sparse_top_k / hybrid_alpha — 缺項用 config 預設
+                       sparse_top_k / hybrid_alpha — missing fields use config defaults
         token: User token (auto-extracted from Authorization header)
 
     Returns:
@@ -183,7 +183,7 @@ async def query_rag(
         )
         _latency_ms = int((_time.perf_counter() - _t0) * 1000)
 
-        # 查詢遙測(best-effort;供 Control Center 分析熱門/零結果/延遲)
+        # Query telemetry (best-effort; feeds Control Center's top-queries/zero-result/latency analytics)
         try:
             from db.query_log_db import QueryLogDB
             from src.log import mask_token

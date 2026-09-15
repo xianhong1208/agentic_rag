@@ -1,18 +1,20 @@
 
-"""Hierarchical chunking — 把 leaf chunks 聚合成 parent
+"""Hierarchical chunking — aggregate leaf chunks into parents
 
-設計取捨:
-- LlamaIndex 內建的 HierarchicalNodeParser 對純文字效果好,但會繞過你的 Docling 結構化 chunk。
-  Docling 已經產出「表格保留 / 標題對齊」的好 chunk,丟掉太可惜。
-- 因此這裡採用後合成策略:Docling 先做 leaf,再用 token 預算把 leaf 聚合成 parent。
-  Parent 不重新切,只是 leaf 的有序 join + metadata 連結。
+Design trade-offs:
+- LlamaIndex's built-in HierarchicalNodeParser works well on plain text, but it bypasses
+  the structured Docling chunks. Docling already produces good chunks (tables preserved /
+  headings aligned), which would be wasteful to discard.
+- So we use a post-synthesis strategy: Docling produces the leaves first, then a token
+  budget aggregates leaves into parents. A parent is not re-split — it is just an ordered
+  join of its leaves plus metadata linkage.
 
-Metadata schema (寫入 LlamaIndex Node.metadata,不動 PGVector schema):
+Metadata schema (written to LlamaIndex Node.metadata; the PGVector schema is untouched):
     leaf:
         node_role:        "leaf"
-        chunk_index:      順序索引(同 file 內 0-based)
-        parent_node_id:   所屬 parent 的 node_id
-        total_chunks:     此 file 的 leaf 總數
+        chunk_index:      sequential index (0-based within the file)
+        parent_node_id:   node_id of the owning parent
+        total_chunks:     total leaf count for this file
 
     parent:
         node_role:        "parent"
@@ -35,16 +37,7 @@ logger = get_api_logger()
 
 
 def estimate_tokens(text: str) -> int:
-    """粗估文字 token 數(中文 1 char ≈ 1.5 token,英文 1 word ≈ 1.3 token)。
-
-    用在 hierarchy 預算決策;要精確請改用 tiktoken。
-
-    Args:
-        text: 要估的文字。
-
-    Returns:
-        粗估 token 數(int)。
-    """
+    """Rough token estimate for hierarchy budget decisions (use tiktoken for accuracy)."""
     if not text:
         return 0
     chinese_chars = sum(1 for c in text if '一' <= c <= '鿿')
@@ -57,20 +50,22 @@ def build_hierarchy(
     parent_target_tokens: int = 1024,
     base_metadata: Optional[dict] = None,
 ) -> Tuple[List[TextNode], List[TextNode]]:
-    """把 leaf documents 聚合成 (leaf_nodes, parent_nodes) 兩階層
+    """Aggregate leaf documents into two levels: (leaf_nodes, parent_nodes)
 
     Args:
-        leaf_documents: Docling/SentenceSplitter 切好的 leaf chunks(已含結構化內容)
-        parent_target_tokens: 每個 parent 累積到此 token 量就封頂(預設對齊 config.hierarchy_sizes[0])
-        base_metadata: 共用 metadata(file_id, file_name 等),會合併進每個 node
+        leaf_documents: leaf chunks produced by Docling/SentenceSplitter (already structured)
+        parent_target_tokens: cap each parent once it accumulates this many tokens
+            (default aligns with config.hierarchy_sizes[0])
+        base_metadata: shared metadata (file_id, file_name, etc.) merged into every node
 
     Returns:
-        (leaf_nodes, parent_nodes) — 兩個 list
-        - leaf_nodes 才會被 embed + 存進 vector store
-        - parent_nodes 也會被存(無 embedding,純文本快取),供 auto-merge 時 lookup
+        (leaf_nodes, parent_nodes) — two lists
+        - only leaf_nodes are embedded and stored in the vector store
+        - parent_nodes are also stored (no embedding, plain-text cache) for lookup during auto-merge
 
-    為什麼 parent 也存:當 auto-merge 觸發時,需要快速取得 parent 的完整文字。
-    存在 PGVector 同一表(用 metadata.node_role 區分)比另開表簡單,且查詢更快。
+    Why parents are stored too: when auto-merge triggers, the parent's full text must be
+    fetched quickly. Storing them in the same PGVector table (distinguished by
+    metadata.node_role) is simpler than a separate table and faster to query.
     """
     if not leaf_documents:
         return [], []
@@ -79,12 +74,11 @@ def build_hierarchy(
     leaf_nodes: List[TextNode] = []
     parent_nodes: List[TextNode] = []
 
-    # Group leaves into parents by token budget
     current_group: List[Tuple[int, Document]] = []  # [(leaf_index, doc), ...]
     current_tokens = 0
 
     def flush_group():
-        """把累積的 leaf group 變成一個 parent + 對應的 leaf nodes"""
+        """Turn the accumulated leaf group into one parent plus its leaf nodes."""
         if not current_group:
             return
 
@@ -94,7 +88,6 @@ def build_hierarchy(
         index_start = current_group[0][0]
         index_end = current_group[-1][0]
 
-        # Create leaf nodes with parent linkage
         for leaf_idx, leaf_doc in current_group:
             leaf_id = str(uuid4())
             leaf_meta = {
@@ -114,8 +107,8 @@ def build_hierarchy(
             leaf_ids.append(leaf_id)
             leaf_texts.append(leaf_doc.text)
 
-        # Create parent node — text 是 children 順序拼接
-        # 用「\n\n」分隔,保留結構可讀性
+        # Create parent node — text is the children joined in order,
+        # separated by "\n\n" to preserve structural readability
         parent_text = "\n\n".join(leaf_texts)
         parent_meta = {
             **base_metadata,
@@ -131,11 +124,9 @@ def build_hierarchy(
         )
         parent_nodes.append(parent_node)
 
-    # Walk leaves, accumulate until budget hit
     for i, leaf_doc in enumerate(leaf_documents):
         tokens = estimate_tokens(leaf_doc.text)
 
-        # If adding this leaf would exceed budget AND we have at least 1 already → flush
         if current_tokens + tokens > parent_target_tokens and current_group:
             flush_group()
             current_group = []
@@ -144,7 +135,6 @@ def build_hierarchy(
         current_group.append((i, leaf_doc))
         current_tokens += tokens
 
-    # Final flush
     flush_group()
 
     logger.info(

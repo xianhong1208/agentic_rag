@@ -1,8 +1,9 @@
 
-"""IndexJob 持久化 — IndexingJobManager 的 write-through projection。
+"""IndexJob persistence — the write-through projection of IndexingJobManager.
 
-DB 是被動投影,manager 仍是 live 狀態的 source of truth。寫入 best-effort,
-DB 失敗只 log warning(table 不存在也能跑)。
+The DB is a passive projection; the manager remains the source of truth for live state.
+Writes are best-effort and DB failures only log a warning (the system runs even if the
+table does not exist).
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from src.log import get_db_logger
 log = get_db_logger()
 
 
-# 已知能寫的欄位;state_dict 內其他 key 自動 drop(forward-compat)
+# Known writable fields; any other key in state_dict is dropped automatically (forward-compat)
 _PERSISTED_FIELDS = {
     "job_id", "folder_id", "status", "total_files", "processed_files",
     "current_index", "current_file_id", "current_file_name",
@@ -39,11 +40,12 @@ class IndexJobDB(BaseDB):
 
     @classmethod
     def ensure_table(cls) -> None:
-        """建 IndexJobs table(IF NOT EXISTS,冪等)。
+        """Create the IndexJobs table (IF NOT EXISTS, idempotent).
 
-        M13: canonical 是 alembic migration 20260819cafe01(IndexJobs 已收進鏈,
-        正常部署由啟動 auto_migrate 建好);這裡是 runtime fallback,讓 manager
-        在沒跑過 Alembic 的環境也能上。
+        The canonical schema is Alembic migration 20260819cafe01 (IndexJobs is in the
+        chain and normal deployments create it via startup auto_migrate); this is a
+        runtime fallback so the manager can still start in environments that have not
+        run Alembic.
         """
         try:
             from db.db import get_engine
@@ -53,10 +55,10 @@ class IndexJobDB(BaseDB):
 
     @classmethod
     def upsert(cls, state_dict: Dict[str, Any]) -> None:
-        """Upsert IndexJobState.to_dict() 到 DB(write-through,失敗只 log 不 raise)。
+        """Upsert IndexJobState.to_dict() to the DB (write-through; failures are logged, not raised).
 
         Args:
-            state_dict: IndexJobState.to_dict() 輸出;不認得的 key 自動 drop。
+            state_dict: Output of IndexJobState.to_dict(); unrecognized keys are dropped automatically.
         """
         try:
             payload = {k: v for k, v in state_dict.items() if k in _PERSISTED_FIELDS}
@@ -77,10 +79,10 @@ class IndexJobDB(BaseDB):
 
     @classmethod
     def load_active(cls) -> List[Dict[str, Any]]:
-        """讀取 DB 內所有 PENDING / RUNNING jobs(供 startup A4 cleanup 用)。
+        """Read all PENDING / RUNNING jobs from the DB (for startup cleanup).
 
         Returns:
-            row dicts list;DB 失敗回空 list。
+            List of row dicts; an empty list on DB failure.
         """
         try:
             with DBSession() as session:
@@ -99,13 +101,13 @@ class IndexJobDB(BaseDB):
 
     @classmethod
     def delete_for_folder(cls, folder_id: int) -> int:
-        """刪除該 folder 的所有 job rows(folder 刪除時的清理,best-effort)。
+        """Delete all job rows for a folder (best-effort cleanup when a folder is deleted).
 
         Args:
-            folder_id: 被刪除的 folder id。
+            folder_id: The id of the deleted folder.
 
         Returns:
-            刪掉的 row 數;DB 失敗回 0。
+            Number of rows deleted; 0 on DB failure.
         """
         try:
             with DBSession() as session:
@@ -126,15 +128,16 @@ class IndexJobDB(BaseDB):
 
     @classmethod
     def purge_terminal_older_than(cls, days: int = 30) -> int:
-        """清掉終態且超過保留期的 job rows(startup 呼叫,擋 unbounded growth)。
+        """Purge terminal job rows older than the retention period (called at startup to prevent unbounded growth).
 
-        timestamps 是 ISO-8601 UTC 字串,同格式下字典序 = 時間序,直接字串比較。
+        Timestamps are ISO-8601 UTC strings; within the same format, lexical order equals
+        chronological order, so string comparison is used directly.
 
         Args:
-            days: 保留天數;last_updated_at 早於 now-days 的終態 row 會被刪。
+            days: Retention window; terminal rows with last_updated_at earlier than now-days are deleted.
 
         Returns:
-            刪掉的 row 數;DB 失敗回 0。
+            Number of rows deleted; 0 on DB failure.
         """
         try:
             from datetime import datetime, timedelta, timezone
@@ -163,13 +166,13 @@ class IndexJobDB(BaseDB):
 
     @classmethod
     def get_by_id(cls, job_id) -> Optional[Dict[str, Any]]:
-        """依 job_id 取單一 job row。
+        """Fetch a single job row by job_id.
 
         Args:
-            job_id: UUID 或 str。
+            job_id: UUID or str.
 
         Returns:
-            row dict 或 None(找不到 / DB 失敗)。
+            A row dict, or None (not found / DB failure).
         """
         try:
             with DBSession() as session:

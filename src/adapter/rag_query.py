@@ -1,12 +1,7 @@
 
-"""RAG query service — flat hybrid (REST) 和 agentic (MCP) 兩套查詢介面。
+"""RAG query service — flat hybrid (REST) and agentic (MCP) query interfaces.
 
-從 RAGAdapter 拆出的三個方法:
-- `query_rag(query, folder_id, token, ...)` — REST 用,flat hybrid + result cache
-- `query_rag_by_folder_name(query, folder_name, token, ...)` — REST,by folder name
-- `query(folder_name, mode, ...)` — agentic / MCP 用,三 mode(search / list / read)+ auto-merge
-
-共用 RAGContext 的 reranker / vector_store_manager / query_engines cache。
+Shares RAGContext's reranker / vector_store_manager / query_engines cache.
 """
 
 from __future__ import annotations
@@ -33,21 +28,22 @@ logger = get_adapter_logger()
 
 
 def _fusion_config() -> tuple:
-    """讀 config.rag.retrieval → (hybrid_fusion, rrf_k, text_search_config)。
+    """Read config.rag.retrieval → (hybrid_fusion, rrf_k, text_search_config).
 
-    缺設定時 fall back rrf/60/jiebacfg(新預設);config 讀不到也不擋查詢。
+    Falls back to rrf/60/simple (the current defaults) when settings are missing;
+    a config read failure never blocks the query.
     """
     try:
         ret = getattr(getattr(Config.get_config_model(), "rag", None), "retrieval", None)
         return (getattr(ret, "hybrid_fusion", "rrf") or "rrf",
                 int(getattr(ret, "rrf_k", 60) or 60),
-                getattr(ret, "text_search_config", "jiebacfg") or "jiebacfg")
+                getattr(ret, "text_search_config", "simple") or "simple")
     except Exception:
-        return "rrf", 60, "jiebacfg"
+        return "rrf", 60, "simple"
 
-# 全域查詢併發閘(REST + MCP 共用)— 上限 config rag.retrieval.max_concurrent_queries。
-# 查詢已真異步(不佔 event loop),這裡管的是「同時打 DB / embedding / rerank
-# 服務的查詢數」;超過上限的排隊等待,不丟棄。lazy 建立(需在 event loop 內)。
+# Global query concurrency gate (REST + MCP), capped at
+# rag.retrieval.max_concurrent_queries; excess queries queue rather than drop.
+# Lazily created because it must be built inside the event loop.
 _query_semaphore: Optional[asyncio.Semaphore] = None
 
 
@@ -64,14 +60,10 @@ def _get_query_semaphore() -> asyncio.Semaphore:
 
 
 class RAGQueryService:
-    """處理 REST flat hybrid query 跟 agentic MCP query 的 service。"""
+    """Service handling REST flat hybrid query and agentic MCP query."""
 
     def __init__(self, ctx: "RAGContext"):
         self._ctx = ctx
-
-    # ------------------------------------------------------------------
-    # REST: flat hybrid query (with result cache)
-    # ------------------------------------------------------------------
 
     async def query_rag(
         self,
@@ -84,29 +76,29 @@ class RAGQueryService:
         sparse_top_k: Optional[int] = None,
         hybrid_alpha: Optional[float] = None,
     ) -> RAGQueryResult:
-        """混合檢索(vector + BM25)+ 可選 rerank,帶結果 cache。
+        """Hybrid retrieval (vector + BM25) with optional rerank and result cache.
 
-        Performance: cache hit < 1ms;cache miss 100-800ms(依索引大小);cache TTL 5 分鐘。
+        Performance: cache hit < 1ms; cache miss 100-800ms (depending on index
+        size); cache TTL 5 minutes.
 
         Args:
-            query: 查詢字串。
-            folder_id: 要查的 folder。
-            token: 使用者 token(權限驗證)。
-            top_k: 返回前 K 個結果(reranker enabled 時為 rerank 後的 top)。
-            similarity_cutoff: 相似度閾值;reranker enabled 時此值會被忽略。
-            use_cache: 是否走結果 cache(False = 強制 retrieval)。
-            sparse_top_k: BM25 候選數量;None = 用 config 預設。
-            hybrid_alpha: 向量 vs BM25 權重(0=純 BM25, 1=純向量);None = 用 config 預設。
+            query: Query string.
+            folder_id: Folder to search.
+            token: User token (access control).
+            top_k: Return the top K results (post-rerank top when the reranker is enabled).
+            similarity_cutoff: Similarity threshold; ignored when the reranker is enabled.
+            use_cache: Whether to use the result cache (False = force retrieval).
+            sparse_top_k: Number of BM25 candidates; None = config default.
+            hybrid_alpha: Vector vs BM25 weight (0=pure BM25, 1=pure vector); None = config default.
 
         Returns:
-            RAGQueryResult(query / results / total_results / retrieval_time_ms)。
+            RAGQueryResult (query / results / total_results / retrieval_time_ms).
         """
         ctx = self._ctx
 
         try:
             folder = ctx.indexing_service.get_folder(folder_id, token)
 
-            # ---- Result cache check ----
             cache_key = None
             cache = CacheService.get_instance()
 
@@ -131,7 +123,6 @@ class RAGQueryService:
 
                 logger.debug(f"RAG query cache MISS: {cache_key}")
 
-            # ---- Vector store + cached QueryEngine ----
             vector_store = ctx.get_vector_store(folder_id, token)
 
             fusion, rrf_k, tsc = _fusion_config()
@@ -204,10 +195,12 @@ class RAGQueryService:
         sparse_top_k: Optional[int] = None,
         hybrid_alpha: Optional[float] = None,
     ) -> dict:
-        """檢索軌跡(診斷)— 不走 cache,拆解 vector / BM25 / hybrid / rerank 名次。
+        """Retrieval trace (diagnostic) — bypasses the cache and breaks down the
+        vector / BM25 / hybrid / rerank rankings.
 
-        供 Control Center 查詢測試台的「檢索軌跡」用:讓客戶看懂每個命中片段
-        在三路檢索各排第幾、rerank 如何改變順序。回 dict(見 QueryEngine.atrace)。
+        Powers the "retrieval trace" view in the Control Center query test bench,
+        letting users see where each hit ranks across the three retrieval paths and
+        how rerank reorders them. Returns a dict (see QueryEngine.atrace).
         """
         ctx = self._ctx
         folder = ctx.indexing_service.get_folder(folder_id, token)
@@ -242,7 +235,7 @@ class RAGQueryService:
         sparse_top_k: Optional[int] = None,
         hybrid_alpha: Optional[float] = None,
     ) -> RAGQueryResult:
-        """使用資料夾名稱查詢(帶身份驗證,delegate 給 query_rag)。"""
+        """Query by folder name (with authentication; delegates to query_rag)."""
         try:
             folder = self._ctx.indexing_service.get_folder_by_name(folder_name, token)
             log_op(
@@ -265,10 +258,6 @@ class RAGQueryService:
             log_err(logger, "QUERY_BY_NAME_FAIL", e, token=token)
             raise ValueError(f"Failed to query RAG by folder name: {str(e)}")
 
-    # ------------------------------------------------------------------
-    # Agentic / MCP: three-mode (search / list / read)
-    # ------------------------------------------------------------------
-
     async def query_agentic(
         self,
         *,
@@ -281,24 +270,22 @@ class RAGQueryService:
         expand_context: bool,
         token: str,
     ) -> Dict[str, Any]:
-        """MCP 查詢入口 — 三 mode(search / list / read)統一介面。
+        """MCP query entry point — unified interface for three modes (search / list / read).
 
         Returns:
-            JSON-serializable dict — 由 agentic_tools 包成 MCP content block。
+            JSON-serializable dict — wrapped into an MCP content block by agentic_tools.
         """
-        # M6: 三模式編排與 folder ACL 已下沉 domain — adapter 不再反向 import
-        # fastmcp 交付層(舊環:fastmcp → adapter → fastmcp)。
+        # Orchestration and folder ACL live in the domain layer so the adapter
+        # need not import back into the fastmcp delivery layer.
         from src.domain.rag.agentic_handlers import handle_list, handle_read, handle_search
         from src.domain.rag.folder_acl import verify_folder_access
 
         ctx = self._ctx
-        # ACL — 確認 token 有權存取此 folder
         folder = verify_folder_access(token=token, folder_name=folder_name)
 
         if mode == "list":
             return handle_list(folder=folder)
 
-        # search / read 都需要 vector_store
         vector_store = ctx.vector_store_manager.get_or_create(
             folder_id=folder.id,
             vector_table_uuid=str(folder.vector_table_uuid),
@@ -313,7 +300,7 @@ class RAGQueryService:
                 )
 
         if mode == "search":
-            # 構建一次性 retriever(輕量,不快取 — folder 切換頻繁時更靈活)
+            # One-shot retriever: not cached, to stay flexible when folders switch often.
             config = Config.get_config_model().rag.retrieval
             retriever = AutoMergingRetriever(
                 vector_store=vector_store,

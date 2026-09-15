@@ -46,8 +46,8 @@ class Reranker:
             top_n: Keep top N results after reranking (None = keep all)
             score_threshold: Minimum rerank score to keep (default 0.0)
             timeout: HTTP request timeout in seconds
-            query_template: 查詢包裝模板,{text} 為佔位符(指令微調型 reranker 用)
-            document_template: 文件包裝模板,{text} 為佔位符
+            query_template: query wrapping template; {text} is the placeholder (for instruction-tuned rerankers)
+            document_template: document wrapping template; {text} is the placeholder
         """
         self._base_url = base_url.rstrip("/")
         self._model = model
@@ -55,10 +55,10 @@ class Reranker:
         self._top_n = top_n
         self._score_threshold = score_threshold
         self._timeout = timeout
-        # 用 str.replace 而非 str.format:chunk 內文可能含 {} 大括號,format 會炸
+        # Use str.replace rather than str.format: chunk text may contain {} braces, which format would choke on
         self._query_template = query_template or "{text}"
         self._document_template = document_template or "{text}"
-        # async client lazy 建立(必須在 event loop 內建);連線池跨查詢重用
+        # async client is created lazily (must be built inside an event loop); the connection pool is reused across queries
         self._async_client: Optional[httpx.AsyncClient] = None
 
         logger.info(
@@ -87,9 +87,10 @@ class Reranker:
                 query_template=getattr(rerank_config, 'query_template', '{text}'),
                 document_template=getattr(rerank_config, 'document_template', '{text}'),
             )
-            # 背景 thread 跑連線驗證 — from_config 由 lazy RAGAdapter 在第一個
-            # request 的 event loop 上呼叫,sync HTTP(3s timeout)直接跑會把
-            # 整個 loop 卡住。驗證只是 log 警告,fire-and-forget 即可。
+            # Run connection verification on a background thread — from_config is
+            # called by the lazy RAGAdapter on the first request's event loop, so
+            # running sync HTTP (3s timeout) inline would block the whole loop.
+            # Verification only logs a warning, so fire-and-forget is fine.
             import threading
             threading.Thread(
                 target=instance.verify_connection,
@@ -102,11 +103,12 @@ class Reranker:
             return None
 
     def verify_connection(self) -> None:
-        """啟動時 best-effort 驗證 rerank 服務有 serve 這個 model 名。
+        """Best-effort startup check that the rerank service serves this model name.
 
-        model 名跟 vllm serve 不一致時 /v1/score 回 404,而 rerank() 對所有
-        錯誤都 fallback 原始排序(只有 warning log)— rerank 形同靜默關閉。
-        這裡在啟動就大聲報 error,不擋啟動(服務可能晚點才起來)。
+        If the model name does not match what vllm serves, /v1/score returns 404,
+        and rerank() falls back to the raw order on any error (only a warning log) —
+        effectively silently disabling reranking. This raises a loud error at startup
+        without blocking it (the service may come up later).
         """
         try:
             resp = http_requests.get(
@@ -152,19 +154,15 @@ class Reranker:
         effective_top_n = top_n or self._top_n
 
         try:
-            # Call score API for each query-chunk pair
             scores = self._get_scores(query, [node.text for node in nodes])
 
-            # Attach rerank scores and sort
             scored_nodes = list(zip(nodes, scores))
             scored_nodes.sort(key=lambda x: x[1], reverse=True)
 
-            # Filter by threshold and top_n
             result = []
             for node, score in scored_nodes:
                 if score < self._score_threshold:
                     continue
-                # Replace node score with rerank score
                 node.score = score
                 result.append(node)
                 if effective_top_n and len(result) >= effective_top_n:
@@ -186,17 +184,17 @@ class Reranker:
         nodes: List["NodeWithScore"],
         top_n: Optional[int] = None,
     ) -> List["NodeWithScore"]:
-        """rerank() 的 async 版 — 查詢路徑用,scoring HTTP 不佔 event loop。
+        """Async version of rerank() — used on the query path so scoring HTTP does not occupy the event loop.
 
-        降級行為與 sync 版完全一致:任何失敗回原始排序(分數保留)。
+        Degradation behavior is identical to the sync version: any failure returns the original order (scores preserved).
 
         Args:
-            query: 原始查詢字串。
-            nodes: 待重排的檢索結果。
-            top_n: 覆寫預設 top_n(可選)。
+            query: original query string.
+            nodes: retrieval results to rerank.
+            top_n: override the default top_n (optional).
 
         Returns:
-            重排後的 NodeWithScore list(分數降冪)。
+            Reranked NodeWithScore list (scores descending).
         """
         if not nodes:
             return nodes
@@ -229,10 +227,11 @@ class Reranker:
             return nodes
 
     async def _aget_scores(self, query: str, texts: List[str]) -> List[float]:
-        """_get_scores 的 async 版(httpx.AsyncClient,連線池重用)。
+        """Async version of _get_scores (httpx.AsyncClient with connection-pool reuse).
 
-        同 sync 版:timeout / 連線錯誤一律讓例外傳播,由 arerank() 統一
-        fallback 原始排序 — 絕不回全零分數(會被 threshold 濾成空結果)。
+        Same as the sync version: timeout / connection errors always propagate, so
+        arerank() uniformly falls back to the original order — it never returns
+        all-zero scores (which the threshold would filter into an empty result).
         """
         if self._async_client is None:
             self._async_client = httpx.AsyncClient(timeout=self._timeout)
@@ -278,10 +277,12 @@ class Reranker:
             "text_2": [self._document_template.replace("{text}", t) for t in texts],
         }
 
-        # ⚠️ timeout / 連線錯誤絕不能在這裡吞掉回全零分數:全零會被上層的
-        # score_threshold 全數濾掉 → 查詢回「空結果」,對呼叫端等於「查無資料」
-        # 的錯誤答案。讓例外往上傳,rerank() 的 except Exception 統一 fallback
-        # 原始檢索排序(分數保留),那才是正確的降級。
+        # WARNING: timeout / connection errors must not be swallowed here into
+        # all-zero scores — all zeros get fully filtered by the upstream
+        # score_threshold, so the query returns an "empty result", which to the
+        # caller is a wrong answer meaning "no data found". Let the exception
+        # propagate so rerank()'s except Exception uniformly falls back to the raw
+        # retrieval order (scores preserved), which is the correct degradation.
         response = http_requests.post(
             url,
             json=payload,
@@ -293,7 +294,6 @@ class Reranker:
         data = response.json()
         # vLLM returns: {"data": [{"index": 0, "score": 0.42}, ...]}
         score_items = data.get("data", [])
-        # Sort by index to ensure correct ordering
         score_items.sort(key=lambda x: x.get("index", 0))
         scores = [item.get("score", 0.0) for item in score_items]
 

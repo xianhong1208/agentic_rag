@@ -1,15 +1,9 @@
 
-"""Domain-level exceptions for RAG system
+"""Domain-level exceptions for the RAG system.
 
-Provides a unified exception hierarchy for business logic errors.
-These exceptions are caught by the API error handler middleware and
-converted to appropriate HTTP responses.
-
-Benefits:
-- Consistent error handling across the application
-- Domain layer doesn't depend on HTTP/FastAPI
-- Easy to add logging, monitoring, and metrics
-- Client-friendly error messages
+Unified exception hierarchy for business logic errors. The API error-handler
+middleware catches these and converts them to HTTP responses, keeping the
+domain layer independent of HTTP/FastAPI.
 """
 
 from typing import Optional, Dict, Any
@@ -50,10 +44,6 @@ class DomainException(Exception):
         return result
 
 
-# ============================================================================
-# Resource Not Found Errors (HTTP 404)
-# ============================================================================
-
 class ResourceNotFoundError(DomainException):
     """Base class for resource not found errors"""
 
@@ -78,9 +68,10 @@ class FolderNotFoundError(ResourceNotFoundError):
 class RAGFileNotFoundError(ResourceNotFoundError):
     """Raised when a file cannot be found.
 
-    M11: 刻意不叫 FileNotFoundError —— 那會遮蔽 Python 內建的同名例外。任何
-    import 這支的模組若寫 `except FileNotFoundError` 想接 OS 檔案不存在,會
-    誤接到本 domain class、真正的 OS 例外漏接冒成 500。
+    Deliberately not named FileNotFoundError, which would shadow Python's built-in of the same
+    name. Any module importing this and writing `except FileNotFoundError` to catch an OS
+    file-not-found would accidentally catch this domain class, letting the real OS exception slip
+    through and surface as a 500.
     """
 
     def __init__(self, file_id: str):
@@ -97,10 +88,6 @@ class FileIndexNotFoundError(ResourceNotFoundError):
             message=f"File {file_id} has not been indexed yet"
         )
 
-
-# ============================================================================
-# Authorization Errors (HTTP 403)
-# ============================================================================
 
 class UnauthorizedAccessError(DomainException):
     """Raised when a user attempts to access a resource they don't own"""
@@ -124,10 +111,6 @@ class InvalidTokenError(DomainException):
         super().__init__(message=reason, error_code="INVALID_TOKEN")
 
 
-# ============================================================================
-# Validation Errors (HTTP 400)
-# ============================================================================
-
 class ValidationError(DomainException):
     """Raised when input validation fails"""
 
@@ -143,10 +126,6 @@ class ValidationError(DomainException):
         )
 
 
-# ============================================================================
-# Business Logic Errors (HTTP 409 Conflict)
-# ============================================================================
-
 class ConflictError(DomainException):
     """Raised when an operation conflicts with current state"""
 
@@ -156,10 +135,6 @@ class ConflictError(DomainException):
             details["resource"] = resource
         super().__init__(message=message, error_code="CONFLICT", details=details)
 
-
-# ============================================================================
-# RAG Operation Errors (HTTP 500)
-# ============================================================================
 
 class RAGOperationError(DomainException):
     """Base class for RAG operation failures"""
@@ -188,10 +163,6 @@ class QueryExecutionError(RAGOperationError):
             details["folder_id"] = folder_id
         super().__init__(operation="query", reason=reason, details=details)
 
-
-# ============================================================================
-# Utility Functions
-# ============================================================================
 
 def get_http_status_for_exception(exception: DomainException) -> int:
     """Map domain exception to HTTP status code"""

@@ -1,15 +1,18 @@
 
-"""db/migrate.py 運行時防護 — chain 完整性 / 多 head / advisory lock。
+"""db/migrate.py runtime guards — chain integrity / multiple heads / advisory lock.
 
-背景(三個真實風險,2026-08 評估):
-1. revision 用 regex 解析,id 含 [a-f0-9] 以外字元的 migration 會被**靜默跳過**
-   (寫了等於沒寫,schema 靜默漂移)→ 現在必須大聲失敗
-2. 多 head / 多 base / 斷鏈原本只 warning → 只走其中一條鏈,另一條靜默不套用
-3. 多實例同時啟動會並發跑同一 migration(無鎖)→ pg_advisory_lock
+Three real risks addressed:
+1. Revisions are parsed by regex, so a migration whose id contains characters
+   outside [a-f0-9] was **silently skipped** (written but never applied, silent
+   schema drift) → it must now fail loudly.
+2. Multiple heads / bases / a broken chain used to be only a warning → only one
+   chain was followed and the other silently went unapplied.
+3. Multiple instances starting at once would run the same migration concurrently
+   (no lock) → pg_advisory_lock.
 
-單測部分:_discover_revisions 純函式(tmp versions 目錄,零 DB);
-advisory lock 用假 engine 驗證取鎖/解鎖/double-check 順序。
-並發實測見 tests/integration/test_migrate_concurrency.py。
+Unit scope: _discover_revisions as a pure function (a tmp versions dir, no DB);
+the advisory lock uses a fake engine to verify the lock/unlock/double-check
+order. Concurrency is exercised in tests/integration/test_migrate_concurrency.py.
 """
 
 from pathlib import Path
@@ -29,8 +32,6 @@ def _write_migration(d: Path, fname: str, rev, down):
     )
 
 
-# ---- _discover_revisions:chain 完整性 ------------------------------------------
-
 class TestDiscoverRevisions:
     def test_valid_linear_chain(self, tmp_path):
         _write_migration(tmp_path, "001_a.py", "aaa111", None)
@@ -48,37 +49,35 @@ class TestDiscoverRevisions:
         assert len(DatabaseMigrator._discover_revisions(tmp_path)) == 1
 
     def test_unparseable_revision_id_fails_loud(self, tmp_path):
-        """regex 抓不到的 revision id(含 [a-f0-9] 以外字元)必須報錯,
-        不得靜默跳過 —— 這是「migration 寫了等於沒寫」的根源。"""
+        """A revision id the regex cannot match (containing characters outside [a-f0-9]) must error, not be silently skipped — the root of "a migration written but never applied"."""
         _write_migration(tmp_path, "001_a.py", "aaa111", None)
-        _write_migration(tmp_path, "002_bad.py", "20261001_add_xyz", "aaa111")  # 含底線
+        _write_migration(tmp_path, "002_bad.py", "20261001_add_xyz", "aaa111")  # contains an underscore
         with pytest.raises(MigrationChainError, match="002_bad.py"):
             DatabaseMigrator._discover_revisions(tmp_path)
 
     def test_multiple_heads_fail(self, tmp_path):
-        """分叉(兩檔同 down_revision)→ 兩個 head → 報錯,不得只走一條。"""
+        """A fork (two files with the same down_revision) → two heads → error, not just following one."""
         _write_migration(tmp_path, "001_a.py", "aaa111", None)
         _write_migration(tmp_path, "002_b.py", "bbb222", "aaa111")
-        _write_migration(tmp_path, "003_c.py", "ccc333", "aaa111")  # 也接在 a 後 → 分叉
+        _write_migration(tmp_path, "003_c.py", "ccc333", "aaa111")  # also chained after a → fork
         with pytest.raises(MigrationChainError, match="head"):
             DatabaseMigrator._discover_revisions(tmp_path)
 
     def test_multiple_bases_fail(self, tmp_path):
         _write_migration(tmp_path, "001_a.py", "aaa111", None)
-        _write_migration(tmp_path, "002_b.py", "bbb222", None)  # 第二個 base
+        _write_migration(tmp_path, "002_b.py", "bbb222", None)  # a second base
         with pytest.raises(MigrationChainError, match="base"):
             DatabaseMigrator._discover_revisions(tmp_path)
 
     def test_dangling_down_revision_fails(self, tmp_path):
-        """down_revision 指向不存在的 rev:兩節點都不被指 → 表現為多 head,
-        一樣大聲失敗(分類不同、結果相同:不得靜默)。"""
+        """A down_revision pointing at a nonexistent rev: neither node is pointed to → manifests as multiple heads, and fails just as loudly (different classification, same outcome: never silent)."""
         _write_migration(tmp_path, "001_a.py", "aaa111", None)
-        _write_migration(tmp_path, "002_b.py", "bbb222", "deadbeef")  # 不存在
+        _write_migration(tmp_path, "002_b.py", "bbb222", "deadbeef")  # nonexistent
         with pytest.raises(MigrationChainError):
             DatabaseMigrator._discover_revisions(tmp_path)
 
     def test_orphan_cycle_fails(self, tmp_path):
-        """孤兒環(c↔d 互指):不增 base/head,但主鏈涵蓋不到 → 斷鏈報錯。"""
+        """An orphan cycle (c↔d pointing at each other): adds no base/head, but is unreachable from the main chain → broken-chain error."""
         _write_migration(tmp_path, "001_a.py", "aaa111", None)
         _write_migration(tmp_path, "002_b.py", "bbb222", "aaa111")
         _write_migration(tmp_path, "003_c.py", "ccc333", "ddd444")
@@ -87,14 +86,12 @@ class TestDiscoverRevisions:
             DatabaseMigrator._discover_revisions(tmp_path)
 
 
-# ---- advisory lock:取鎖 / 解鎖 / double-check ----------------------------------
-
 _LOCK_SQL = "pg_advisory_lock"
 _UNLOCK_SQL = "pg_advisory_unlock"
 
 
 def _bare_migrator(tmp_path) -> DatabaseMigrator:
-    """繞過 __init__(要 Config/DB)手工組裝,只填 upgrade 需要的欄位。"""
+    """Assemble manually, bypassing __init__ (which needs Config/DB), filling only the fields upgrade requires."""
     m = object.__new__(DatabaseMigrator)
     m._engine = MagicMock()
     m.versions_dir = tmp_path
@@ -102,7 +99,7 @@ def _bare_migrator(tmp_path) -> DatabaseMigrator:
 
 
 def _lock_calls(conn) -> list:
-    """從假 connection 的 execute 呼叫序列抽出 lock/unlock 事件。"""
+    """Extract lock/unlock events from the fake connection's execute call sequence."""
     events = []
     for c in conn.execute.call_args_list:
         sql = str(c.args[0])
@@ -115,7 +112,7 @@ def _lock_calls(conn) -> list:
 
 class TestAdvisoryLock:
     def test_noop_when_already_at_target_takes_no_lock(self, tmp_path):
-        """已在 head:短路 return,完全不碰 advisory lock。"""
+        """Already at head: short-circuit return, never touching the advisory lock."""
         m = _bare_migrator(tmp_path)
         with patch.object(DatabaseMigrator, "_get_current_revision", return_value="aaa111"), \
              patch.object(DatabaseMigrator, "_get_head_revision", return_value="aaa111"):
@@ -123,7 +120,7 @@ class TestAdvisoryLock:
         m._engine.connect.assert_not_called()
 
     def test_apply_path_locks_and_unlocks(self, tmp_path):
-        """實際 apply:先取鎖 → 套 migration → 解鎖(finally 保證)。"""
+        """An actual apply: acquire the lock → apply migrations → release (guaranteed in finally)."""
         _write_migration(tmp_path, "001_a.py", "aaa111", None)
         m = _bare_migrator(tmp_path)
         conn = MagicMock()
@@ -137,13 +134,13 @@ class TestAdvisoryLock:
         ex.assert_called_once()
 
     def test_double_check_after_lock_skips_if_peer_already_upgraded(self, tmp_path):
-        """等鎖期間別的 instance 已升到 head:取鎖後重讀 current → 不重跑。"""
+        """Another instance upgraded to head while waiting for the lock: re-read current after acquiring → do not re-run."""
         _write_migration(tmp_path, "001_a.py", "aaa111", None)
         m = _bare_migrator(tmp_path)
         conn = MagicMock()
         m._engine.connect.return_value.__enter__.return_value = conn
 
-        # 鎖前 current=None(看似要升),鎖後 current=head(對手已升完)
+        # Before the lock current=None (looks like it needs upgrading); after, current=head (a peer already finished)
         with patch.object(DatabaseMigrator, "_get_current_revision",
                           side_effect=[None, "aaa111"]), \
              patch.object(DatabaseMigrator, "_get_head_revision", return_value="aaa111"), \

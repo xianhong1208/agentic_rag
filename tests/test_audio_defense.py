@@ -1,5 +1,5 @@
 
-"""audio_defense — Whisper 幻覺過濾(純文字)+ 靜音偵測/裁切(mock ffmpeg)+ patch 機制。"""
+"""audio_defense -- Whisper hallucination filtering (pure text) + silence detection/trimming (mock ffmpeg) + the patch mechanism."""
 
 import sys
 import types
@@ -11,14 +11,12 @@ import pytest
 from src.domain.rag import audio_defense as ad
 
 
-# ---- 幻覺過濾(純文字邏輯)---------------------------------------------------
-
 class TestHallucinationFilter:
     def test_strip_consecutive_repetitions(self):
         text = "會議開始 請回座 請回座 請回座 請回座 然後繼續"
         cleaned, removed = ad._strip_consecutive_repetitions(text)
         assert cleaned.count("請回座") == 1
-        assert removed == 3  # 4 份收成 1 份,拿掉 3 份多餘
+        assert removed == 3  # 4 copies collapsed to 1, 3 redundant removed
 
     def test_no_repetition_untouched(self):
         text = "正常的會議紀錄內容,沒有任何重複段落。"
@@ -30,7 +28,7 @@ class TestHallucinationFilter:
         assert ad._filter_whisper_hallucinations("") == ("", 0)
 
     def test_known_pattern_mingjing_outro(self):
-        """「明镜与点点」YouTube outro — 實錄幻覺樣本。"""
+        """The "明镜与点点" YouTube outro -- a real-world hallucination sample."""
         text = "各位貴賓請就座。請不吝点赞订阅转发打赏支持明镜与点点栏目。正式開始。"
         cleaned, n = ad._filter_whisper_hallucinations(text)
         assert "明镜" not in cleaned and n >= 1
@@ -48,15 +46,13 @@ class TestHallucinationFilter:
         assert "Amara" not in cleaned and n >= 1
 
     def test_both_layers_combined(self):
-        """已知 pattern + 通用重複兩層都觸發,計數相加。"""
+        """Both layers -- known pattern + generic repetition -- fire, counts summed."""
         text = "打赏支持本栏目。重要決議 重要決議 重要決議 結束"
         cleaned, n = ad._filter_whisper_hallucinations(text)
         assert cleaned.count("重要決議") == 1
         assert "打赏" not in cleaned
         assert n >= 3
 
-
-# ---- 靜音偵測 / 裁切(mock ffmpeg subprocess)---------------------------------
 
 def _ffmpeg_result(stderr: str, returncode: int = 0):
     r = MagicMock()
@@ -76,13 +72,13 @@ class TestSilenceTrim:
             assert ad._detect_leading_silence_end("x.mp3") == 0.0
 
     def test_detect_silence_not_at_start_ignored(self):
-        """silence_start > 1.0 = 不是「開頭」靜音 → 不裁。"""
+        """silence_start > 1.0 = not "leading" silence -> do not trim."""
         stderr = "silence_start: 30.0\nsilence_end: 45.0"
         with patch.object(ad.subprocess, "run", return_value=_ffmpeg_result(stderr)):
             assert ad._detect_leading_silence_end("x.mp3") == 0.0
 
     def test_trim_skipped_below_threshold(self):
-        """<0.5s 開頭靜音不值得 re-encode → None。"""
+        """<0.5s of leading silence is not worth a re-encode -> None."""
         with patch.object(ad, "_detect_leading_silence_end", return_value=0.3):
             assert ad._trim_audio_leading_silence("in.mp3", "in.mp3") is None
 
@@ -93,7 +89,7 @@ class TestSilenceTrim:
         assert out is not None and out.endswith(".mp3")
         cmd = m.call_args[0][0]
         assert "-ss" in cmd and "10.0" in cmd
-        assert "libmp3lame" in cmd  # .mp3 → 對應 codec args
+        assert "libmp3lame" in cmd  # .mp3 -> corresponding codec args
         Path(out).unlink(missing_ok=True)
 
     def test_trim_unknown_suffix_uses_copy_codec(self):
@@ -112,11 +108,9 @@ class TestSilenceTrim:
                 ad._trim_audio_leading_silence("in.mp3", "x.mp3")
 
 
-# ---- whisper anti-hallucination patch 機制 ------------------------------------
-
 class TestWhisperPatch:
     def test_patch_wraps_and_injects_defaults(self, monkeypatch):
-        """對「未包裝的 fake whisper」套 patch:load_model 被包、transcribe 帶預設。"""
+        """Applying the patch to an "unwrapped fake whisper": load_model gets wrapped, transcribe carries the defaults."""
         fake_model = MagicMock()
         captured = {}
 
@@ -137,7 +131,7 @@ class TestWhisperPatch:
         assert captured["condition_on_previous_text"] is False
         assert captured["no_speech_threshold"] == 0.7
 
-        # caller 顯式給值時不被覆蓋(setdefault 語義)
+        # A caller-provided explicit value is not overridden (setdefault semantics)
         captured.clear()
         model.transcribe("audio.mp3", no_speech_threshold=0.5)
         assert captured["no_speech_threshold"] == 0.5
@@ -149,5 +143,5 @@ class TestWhisperPatch:
 
         ad._enable_whisper_anti_hallucination_defaults()
         first = fake_whisper.load_model
-        ad._enable_whisper_anti_hallucination_defaults()  # 第二次應 no-op
+        ad._enable_whisper_anti_hallucination_defaults()  # second call should be a no-op
         assert fake_whisper.load_model is first

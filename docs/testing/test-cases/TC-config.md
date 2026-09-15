@@ -1,316 +1,316 @@
-# TC-config:配置模型與配置管理 測試案例
+# TC-config: Configuration Models and Configuration Management Test Cases
 
 
-| 項目 | 內容 |
-|------|------|
-| 對應規格 | [SPEC-config](../specs/SPEC-config.md) |
-| 測試層級 | 單元 |
-| 測試腳本 | `tests/test_config.py` |
+| Item | Content |
+|------|---------|
+| Related spec | [SPEC-config](../specs/SPEC-config.md) |
+| Test level | Unit |
+| Test script | `tests/test_config.py` |
 
 ---
 
-## TC-config-01:ServerConfig 必填齊全與型別轉換
+## TC-config-01: ServerConfig required fields complete and type coercion
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-01 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `host="0.0.0.0", port="8080", transport="sse"` |
-| **測試步驟** | 1. 建立 ServerConfig<br>2. 檢查各欄位值 |
-| **預期結果** | 建立成功;port 字串 "8080" 被轉為 int 8080 |
-| **實作** | `tests/test_config.py::test_server_config_required_and_coercion` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-01 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `host="0.0.0.0", port="8080", transport="sse"` |
+| **Test steps** | 1. Create ServerConfig<br>2. Check each field value |
+| **Expected result** | Created successfully; the string port "8080" is coerced to int 8080 |
+| **Implementation** | `tests/test_config.py::test_server_config_required_and_coercion` |
 
-## TC-config-02:ServerConfig 缺必填欄位
+## TC-config-02: ServerConfig missing a required field
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-01 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 只給 `host="0.0.0.0"` |
-| **測試步驟** | 1. 建立 ServerConfig 並捕捉例外 |
-| **預期結果** | ValidationError,缺漏欄位集合 = {port, transport} |
-| **實作** | `tests/test_config.py::test_server_config_missing_required` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-01 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | Only `host="0.0.0.0"` |
+| **Test steps** | 1. Create ServerConfig and capture the exception |
+| **Expected result** | ValidationError; the set of missing fields = {port, transport} |
+| **Implementation** | `tests/test_config.py::test_server_config_missing_required` |
 
-## TC-config-03:DatabaseConfig 選填欄位預設 None
+## TC-config-03: DatabaseConfig optional fields default to None
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-02 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 只給 url/echo/pool_size/max_overflow/pool_timeout/pool_recycle |
-| **測試步驟** | 1. 建立 DatabaseConfig<br>2. 檢查選填欄位 |
-| **預期結果** | host/port/database/user/password 皆為 None |
-| **實作** | `tests/test_config.py::test_database_config_optional_defaults` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-02 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | Only url/echo/pool_size/max_overflow/pool_timeout/pool_recycle |
+| **Test steps** | 1. Create DatabaseConfig<br>2. Check the optional fields |
+| **Expected result** | host/port/database/user/password are all None |
+| **Implementation** | `tests/test_config.py::test_database_config_optional_defaults` |
 
-## TC-config-04:AuthConfig 預設值
+## TC-config-04: AuthConfig defaults
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-03 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `enabled=True` |
-| **預期結果** | token_server_url=None、cache_ttl=60、request_timeout=5.0、retry_count=2、dynamic_tools=None |
-| **實作** | `tests/test_config.py::test_auth_config_defaults` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-03 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `enabled=True` |
+| **Expected result** | token_server_url=None, cache_ttl=60, request_timeout=5.0, retry_count=2, dynamic_tools=None |
+| **Implementation** | `tests/test_config.py::test_auth_config_defaults` |
 
-## TC-config-05:AuthConfig 缺 enabled
+## TC-config-05: AuthConfig missing enabled
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-03 |
-| **層級** | 單元 |
-| **測試輸入** | 無參數 |
-| **預期結果** | ValidationError |
-| **實作** | `tests/test_config.py::test_auth_config_missing_enabled` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-03 |
+| **Level** | Unit |
+| **Test input** | No parameters |
+| **Expected result** | ValidationError |
+| **Implementation** | `tests/test_config.py::test_auth_config_missing_enabled` |
 
-## TC-config-06:DynamicToolsConfig 預設停用
+## TC-config-06: DynamicToolsConfig disabled by default
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-04 |
-| **層級** | 單元 |
-| **測試輸入** | 無參數 |
-| **預期結果** | enabled 為 False |
-| **實作** | `tests/test_config.py::test_dynamic_tools_config_default_disabled` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-04 |
+| **Level** | Unit |
+| **Test input** | No parameters |
+| **Expected result** | enabled is False |
+| **Implementation** | `tests/test_config.py::test_dynamic_tools_config_default_disabled` |
 
-## TC-config-07:AppConfig 全預設值
+## TC-config-07: AppConfig all defaults
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-05 |
-| **層級** | 單元 |
-| **測試輸入** | 無參數 |
-| **預期結果** | name="Agentic RAG"、version="0.0.0"、title="Agentic RAG MCP Server"、lifespan=None、tool_prefix="Agentic" |
-| **實作** | `tests/test_config.py::test_app_config_all_defaults` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-05 |
+| **Level** | Unit |
+| **Test input** | No parameters |
+| **Expected result** | name="Agentic RAG", version="0.0.0", title="Agentic RAG MCP Server", lifespan=None, tool_prefix="Agentic" |
+| **Implementation** | `tests/test_config.py::test_app_config_all_defaults` |
 
-## TC-config-08:RAGChunkingConfig 預設值
+## TC-config-08: RAGChunkingConfig defaults
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-06 |
-| **層級** | 單元 |
-| **測試輸入** | 無參數 |
-| **預期結果** | default_chunk_size/default_overlap/hierarchy_sizes=None、max_chunk_size=2000、chunk_overlap=50 |
-| **實作** | `tests/test_config.py::test_rag_chunking_config_defaults` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-06 |
+| **Level** | Unit |
+| **Test input** | No parameters |
+| **Expected result** | default_chunk_size/default_overlap/hierarchy_sizes=None, max_chunk_size=2000, chunk_overlap=50 |
+| **Implementation** | `tests/test_config.py::test_rag_chunking_config_defaults` |
 
-## TC-config-09:AutoMergingConfig 預設值
+## TC-config-09: AutoMergingConfig defaults
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-06 |
-| **層級** | 單元 |
-| **測試輸入** | 無參數 |
-| **預期結果** | enabled=True、merge_threshold=0.5 |
-| **實作** | `tests/test_config.py::test_auto_merging_config_defaults` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-06 |
+| **Level** | Unit |
+| **Test input** | No parameters |
+| **Expected result** | enabled=True, merge_threshold=0.5 |
+| **Implementation** | `tests/test_config.py::test_auto_merging_config_defaults` |
 
-## TC-config-10:RAGRetrievalConfig 必填 + 預設值
+## TC-config-10: RAGRetrievalConfig required fields + defaults
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-06 |
-| **層級** | 單元 |
-| **測試輸入** | `default_top_k=10, default_similarity_cutoff=0.25, hybrid_search=True` |
-| **預期結果** | sparse_top_k=12、hybrid_alpha=0.75、text_search_config="jiebacfg"、return_resource_files=False、auto_merging=None、expand_context_default=True、expand_context_neighbors=2 |
-| **實作** | `tests/test_config.py::test_rag_retrieval_config_required_and_defaults` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-06 |
+| **Level** | Unit |
+| **Test input** | `default_top_k=10, default_similarity_cutoff=0.25, hybrid_search=True` |
+| **Expected result** | sparse_top_k=12, hybrid_alpha=0.75, text_search_config="simple", return_resource_files=False, auto_merging=None, expand_context_default=True, expand_context_neighbors=2 |
+| **Implementation** | `tests/test_config.py::test_rag_retrieval_config_required_and_defaults` |
 
-## TC-config-11:ContextualRetrievalConfig 預設值
+## TC-config-11: ContextualRetrievalConfig defaults
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-06 |
-| **層級** | 單元 |
-| **測試輸入** | 無參數 |
-| **預期結果** | enabled=False、max_context_length=150、max_concurrent=5、apply_to="all" |
-| **實作** | `tests/test_config.py::test_contextual_retrieval_config_defaults` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-06 |
+| **Level** | Unit |
+| **Test input** | No parameters |
+| **Expected result** | enabled=False, max_context_length=150, max_concurrent=5, apply_to="all" |
+| **Implementation** | `tests/test_config.py::test_contextual_retrieval_config_defaults` |
 
-## TC-config-12:RerankConfig 預設值
+## TC-config-12: RerankConfig defaults
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-06 |
-| **層級** | 單元 |
-| **測試輸入** | 無參數 |
-| **預期結果** | enabled=False、model="BAAI/bge-reranker-v2-m3"、base_url="http://localhost:8787"、top_n=None、score_threshold=0.0 |
-| **實作** | `tests/test_config.py::test_rerank_config_defaults` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-06 |
+| **Level** | Unit |
+| **Test input** | No parameters |
+| **Expected result** | enabled=False, model="BAAI/bge-reranker-v2-m3", base_url="http://localhost:8787", top_n=None, score_threshold=0.0 |
+| **Implementation** | `tests/test_config.py::test_rerank_config_defaults` |
 
-## TC-config-13:IndexingConfig 預設值
+## TC-config-13: IndexingConfig defaults
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-06 |
-| **層級** | 單元 |
-| **測試輸入** | 無參數 |
-| **預期結果** | max_concurrent_jobs=4(GPU 序列化,見 H2/M7)、per_file_timeout_seconds=864000、job_timeout_seconds=864000(均 10 天,慢機台大檔 OCR 用) |
-| **實作** | `tests/test_config.py::test_indexing_config_defaults` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-06 |
+| **Level** | Unit |
+| **Test input** | No parameters |
+| **Expected result** | max_concurrent_jobs=4 (GPU serialization), per_file_timeout_seconds=864000, job_timeout_seconds=864000 (both 10 days, to accommodate OCR of large files on slow machines) |
+| **Implementation** | `tests/test_config.py::test_indexing_config_defaults` |
 
-## TC-config-14:RAGConfig 巢狀組裝
+## TC-config-14: RAGConfig nested assembly
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-07 |
-| **層級** | 單元 |
-| **測試輸入** | embedding/chunking/retrieval/vector_store 以巢狀 dict 傳入,retrieval 內含 auto_merging dict |
-| **預期結果** | 巢狀 dict 轉為對應子模型;llm/rerank/docling/indexing 未給時為 None;enabled 預設 True |
-| **實作** | `tests/test_config.py::test_rag_config_nested_assembly` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-07 |
+| **Level** | Unit |
+| **Test input** | embedding/chunking/retrieval/vector_store passed as nested dicts, with retrieval containing an auto_merging dict |
+| **Expected result** | Nested dicts are converted to the corresponding submodels; llm/rerank/docling/indexing are None when not provided; enabled defaults to True |
+| **Implementation** | `tests/test_config.py::test_rag_config_nested_assembly` |
 
-## TC-config-15:ConfigModel 主樹組裝
+## TC-config-15: ConfigModel main-tree assembly
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-07 |
-| **層級** | 單元 |
-| **測試輸入** | server/database/auth/logging/app/modules 六區塊巢狀 dict |
-| **預期結果** | 各區塊轉為對應子模型;rag 未給時為 None |
-| **實作** | `tests/test_config.py::test_config_model_full_tree` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-07 |
+| **Level** | Unit |
+| **Test input** | Nested dicts for the six sections server/database/auth/logging/app/modules |
+| **Expected result** | Each section is converted to the corresponding submodel; rag is None when not provided |
+| **Implementation** | `tests/test_config.py::test_config_model_full_tree` |
 
-## TC-config-16:ConfigModel 缺 server 區塊
+## TC-config-16: ConfigModel missing the server section
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-08 |
-| **層級** | 單元 |
-| **測試輸入** | 缺 server 的五區塊 dict |
-| **預期結果** | ValidationError 且錯誤 loc 含 "server" |
-| **實作** | `tests/test_config.py::test_config_model_missing_section` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-08 |
+| **Level** | Unit |
+| **Test input** | A five-section dict missing server |
+| **Expected result** | ValidationError with an error loc containing "server" |
+| **Implementation** | `tests/test_config.py::test_config_model_missing_section` |
 
-## TC-config-17:ModulesConfig 允許額外欄位
+## TC-config-17: ModulesConfig allows extra fields
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-09 |
-| **層級** | 單元 |
-| **測試輸入** | `enabled=["demo"], demo={"description": "x"}` |
-| **預期結果** | 建立成功且 model_dump 保留 demo 區塊 |
-| **實作** | `tests/test_config.py::test_modules_config_extra_allowed` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-09 |
+| **Level** | Unit |
+| **Test input** | `enabled=["demo"], demo={"description": "x"}` |
+| **Expected result** | Created successfully and model_dump retains the demo section |
+| **Implementation** | `tests/test_config.py::test_modules_config_extra_allowed` |
 
-## TC-config-18:路徑驗證允許 cwd 內相對路徑
+## TC-config-18: path validation allows relative paths within cwd
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-10 |
-| **層級** | 單元 |
-| **前置條件** | `monkeypatch.chdir(tmp_path)` |
-| **測試輸入** | `config.yaml`、`config/app.yaml`、`sub/dir/x.yml` |
-| **預期結果** | 三者皆通過驗證回傳 Path |
-| **實作** | `tests/test_config.py::test_validate_config_path_allows_relative_paths` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-10 |
+| **Level** | Unit |
+| **Preconditions** | `monkeypatch.chdir(tmp_path)` |
+| **Test input** | `config.yaml`, `config/app.yaml`, `sub/dir/x.yml` |
+| **Expected result** | All three pass validation and return a Path |
+| **Implementation** | `tests/test_config.py::test_validate_config_path_allows_relative_paths` |
 
-## TC-config-19:路徑驗證拒絕 ../ 穿越
+## TC-config-19: path validation rejects ../ traversal
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-11 |
-| **層級** | 單元 |
-| **前置條件** | `monkeypatch.chdir(tmp_path)` |
-| **測試輸入** | `../evil.yaml` |
-| **預期結果** | ValueError,訊息含 "outside the allowed base directory" |
-| **實作** | `tests/test_config.py::test_validate_config_path_rejects_traversal` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-11 |
+| **Level** | Unit |
+| **Preconditions** | `monkeypatch.chdir(tmp_path)` |
+| **Test input** | `../evil.yaml` |
+| **Expected result** | ValueError, message containing "outside the allowed base directory" |
+| **Implementation** | `tests/test_config.py::test_validate_config_path_rejects_traversal` |
 
-## TC-config-20:路徑驗證拒絕外部絕對路徑
+## TC-config-20: path validation rejects external absolute paths
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-11 |
-| **層級** | 單元 |
-| **前置條件** | `monkeypatch.chdir(tmp_path)` |
-| **測試輸入** | `/etc/passwd.yaml` |
-| **預期結果** | ValueError,訊息含 "outside the allowed base directory" |
-| **實作** | `tests/test_config.py::test_validate_config_path_rejects_absolute_outside` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-11 |
+| **Level** | Unit |
+| **Preconditions** | `monkeypatch.chdir(tmp_path)` |
+| **Test input** | `/etc/passwd.yaml` |
+| **Expected result** | ValueError, message containing "outside the allowed base directory" |
+| **Implementation** | `tests/test_config.py::test_validate_config_path_rejects_absolute_outside` |
 
-## TC-config-21:路徑驗證拒絕非 YAML 副檔名
+## TC-config-21: path validation rejects non-YAML extensions
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-12 |
-| **層級** | 單元 |
-| **測試輸入** | `config.txt` |
-| **預期結果** | ValueError,訊息含 "extension" |
-| **實作** | `tests/test_config.py::test_validate_config_path_rejects_bad_extension` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-12 |
+| **Level** | Unit |
+| **Test input** | `config.txt` |
+| **Expected result** | ValueError, message containing "extension" |
+| **Implementation** | `tests/test_config.py::test_validate_config_path_rejects_bad_extension` |
 
-## TC-config-22:get_config 載入合法 YAML
+## TC-config-22: get_config loads a valid YAML
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-13 |
-| **層級** | 單元 |
-| **前置條件** | tmp_path 內寫入完整合法 config.yaml 並 chdir |
-| **測試輸入** | `get_config("config.yaml")` |
-| **測試步驟** | 1. 呼叫 get_config<br>2. 檢查回傳 ConfigModel<br>3. 逐一檢查 Config.get_server_config 等 getters |
-| **預期結果** | 回傳 ConfigModel;server.port=8080;auth.cache_ttl 補預設 60;get_config() dict 與 YAML 一致 |
-| **實作** | `tests/test_config.py::test_get_config_valid_yaml` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-13 |
+| **Level** | Unit |
+| **Preconditions** | A complete, valid config.yaml is written into tmp_path and chdir'd |
+| **Test input** | `get_config("config.yaml")` |
+| **Test steps** | 1. Call get_config<br>2. Check the returned ConfigModel<br>3. Check each getter such as Config.get_server_config |
+| **Expected result** | Returns a ConfigModel; server.port=8080; auth.cache_ttl filled with the default 60; the get_config() dict matches the YAML |
+| **Implementation** | `tests/test_config.py::test_get_config_valid_yaml` |
 
-## TC-config-23:${VAR:-default} 佔位符不展開
+## TC-config-23: ${VAR:-default} placeholder is not expanded
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-14 |
-| **層級** | 單元 |
-| **前置條件** | `monkeypatch.setenv("TEST_DB_URL", ...)`;YAML 的 database.url 寫成 `${TEST_DB_URL:-postgresql://fallback/db}` |
-| **測試輸入** | `get_config("config.yaml")` |
-| **預期結果** | `model.database.url` 為字面值 `${TEST_DB_URL:-postgresql://fallback/db}`(未展開) |
-| **實作** | `tests/test_config.py::test_get_config_env_var_placeholder_not_expanded` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-14 |
+| **Level** | Unit |
+| **Preconditions** | `monkeypatch.setenv("TEST_DB_URL", ...)`; the YAML's database.url is written as `${TEST_DB_URL:-postgresql://fallback/db}` |
+| **Test input** | `get_config("config.yaml")` |
+| **Expected result** | `model.database.url` is the literal value `${TEST_DB_URL:-postgresql://fallback/db}` (not expanded) |
+| **Implementation** | `tests/test_config.py::test_get_config_env_var_placeholder_not_expanded` |
 
-## TC-config-24:schema 不符的 YAML 回 None
+## TC-config-24: schema-mismatched YAML returns None
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-15 |
-| **層級** | 單元 |
-| **測試輸入** | 只含 `server: {host: only-host}` 的 YAML |
-| **預期結果** | get_config 回 None;get_config_model 亦為 None(例外被內部吞掉) |
-| **實作** | `tests/test_config.py::test_get_config_invalid_schema_returns_none` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-15 |
+| **Level** | Unit |
+| **Test input** | YAML containing only `server: {host: only-host}` |
+| **Expected result** | get_config returns None; get_config_model is also None (the exception is swallowed internally) |
+| **Implementation** | `tests/test_config.py::test_get_config_invalid_schema_returns_none` |
 
-## TC-config-25:YAML 語法錯誤回 None
+## TC-config-25: malformed YAML returns None
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-15 |
-| **層級** | 單元 |
-| **測試輸入** | `server: [unclosed\n  :::` |
-| **預期結果** | get_config 回 None;`Config.get_config()` 為 `{}` |
-| **實作** | `tests/test_config.py::test_get_config_malformed_yaml_returns_none` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-15 |
+| **Level** | Unit |
+| **Test input** | `server: [unclosed\n  :::` |
+| **Expected result** | get_config returns None; `Config.get_config()` is `{}` |
+| **Implementation** | `tests/test_config.py::test_get_config_malformed_yaml_returns_none` |
 
-## TC-config-26:檔案不存在回 None(現行行為)
+## TC-config-26: nonexistent file returns None (current behavior)
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-15 |
-| **層級** | 單元 |
-| **測試輸入** | `get_config("no_such_file.yaml")` |
-| **預期結果** | 回 None、不外拋 FileNotFoundError(被 `_load_config` 的 catch-all 吞掉;docstring 與實作不一致,見 SPEC §5) |
-| **實作** | `tests/test_config.py::test_get_config_missing_file_returns_none` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-15 |
+| **Level** | Unit |
+| **Test input** | `get_config("no_such_file.yaml")` |
+| **Expected result** | Returns None and does not raise FileNotFoundError (swallowed by the catch-all in `_load_config`; the docstring and implementation are inconsistent, see SPEC section 5) |
+| **Implementation** | `tests/test_config.py::test_get_config_missing_file_returns_none` |
 
-## TC-config-27:enabled 模組配置載入
+## TC-config-27: enabled module config loading
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-16 |
-| **層級** | 單元 |
-| **前置條件** | YAML modules 區塊含 enabled=[demo] 與 demo 詳細配置(api_router + mcp_tools: null + description) |
-| **測試步驟** | 1. Config.set_config<br>2. get_module_model("demo")<br>3. get_module_model("not_enabled") |
-| **預期結果** | demo 回 ModuleConfig(prefix="/api/demo"、mcp_tools=None);未啟用模組回 None |
-| **實作** | `tests/test_config.py::test_set_config_loads_enabled_module_configs` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-16 |
+| **Level** | Unit |
+| **Preconditions** | The YAML modules section contains enabled=[demo] and the demo detailed config (api_router + mcp_tools: null + description) |
+| **Test steps** | 1. Config.set_config<br>2. get_module_model("demo")<br>3. get_module_model("not_enabled") |
+| **Expected result** | demo returns ModuleConfig(prefix="/api/demo", mcp_tools=None); a non-enabled module returns None |
+| **Implementation** | `tests/test_config.py::test_set_config_loads_enabled_module_configs` |
 
-## TC-config-28:壞模組配置被跳過
+## TC-config-28: broken module config is skipped
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-16 |
-| **層級** | 單元 |
-| **前置條件** | YAML 內 broken 模組缺必填 api_router/mcp_tools |
-| **預期結果** | 主 config 載入成功(get_config_model 非 None);get_module_model("broken") 回 None |
-| **實作** | `tests/test_config.py::test_set_config_skips_invalid_module_config` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-16 |
+| **Level** | Unit |
+| **Preconditions** | The broken module in the YAML is missing the required api_router/mcp_tools |
+| **Expected result** | The main config loads successfully (get_config_model is not None); get_module_model("broken") returns None |
+| **Implementation** | `tests/test_config.py::test_set_config_skips_invalid_module_config` |
 
-## TC-config-29:未載入時 getters 全回 None
+## TC-config-29: getters all return None before loading
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-config-17 |
-| **層級** | 單元 |
-| **前置條件** | Config 狀態已重置(autouse fixture) |
-| **預期結果** | get_config_model / get_server_config / get_database_config / get_auth_config / get_logging_config / get_app_config_model / get_modules_config / get_module_model 全回 None |
-| **實作** | `tests/test_config.py::test_getters_return_none_before_load` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-config-17 |
+| **Level** | Unit |
+| **Preconditions** | Config state has been reset (autouse fixture) |
+| **Expected result** | get_config_model / get_server_config / get_database_config / get_auth_config / get_logging_config / get_app_config_model / get_modules_config / get_module_model all return None |
+| **Implementation** | `tests/test_config.py::test_getters_return_none_before_load` |
 
-> 撰寫原則:一個案例只驗證一件事;正常路徑與例外路徑分開;預期結果必須是**可觀察、可判定**的。
+> Authoring principles: each case verifies exactly one thing; keep the happy path and the exception path separate; expected results must be **observable and determinable**.

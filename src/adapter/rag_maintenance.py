@@ -1,19 +1,14 @@
 
-"""RAG maintenance service — index 刪除 / orphan 清理 / 索引列表查詢。
+"""RAG maintenance service — index deletion, orphan cleanup, and index listing.
 
-從 RAGAdapter 拆出的三個方法:
-- `delete_document_index(file_id, token)` — 單檔索引刪除(支援 orphan fallback)
-- `delete_folder_index(folder_id, token)` — 整個 folder 索引 + vector store table 刪光
-- `get_indexed_files(folder_id)` — 列出 folder 內已索引檔案(有 cache)
-
-共用 RAGContext.indexing_service / vector_store_manager。
+Shares RAGContext.indexing_service / vector_store_manager.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, TYPE_CHECKING
 
-from src.domain.rag.vector_store_manager import VectorStoreManager  # M5: 物理表刪除收斂於此
+from src.domain.rag.vector_store_manager import VectorStoreManager  # physical-table deletion is centralized here
 from src.api.router.response import DeleteFolderIndexResponse, FileIndexResult
 from src.domain.exceptions import (
     DomainException,
@@ -30,29 +25,26 @@ logger = get_adapter_logger()
 
 
 class RAGMaintenanceService:
-    """處理索引維護(刪除、列表)的 service。"""
+    """Service handling index maintenance (deletion, listing)."""
 
     def __init__(self, ctx: "RAGContext"):
         self._ctx = ctx
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     async def delete_document_index(self, file_id: int, token: str) -> bool:
-        """從向量存儲中刪除文件索引。
+        """Delete a file's index from the vector store.
 
         Args:
-            file_id: 文件 ID
-            token: API token,必填 — 走 _get_vector_store 內的 folder ownership 驗證
+            file_id: File ID
+            token: API token, required — drives the folder-ownership check inside
+                _get_vector_store
 
         Returns:
-            True 如果刪除成功
+            True if deletion succeeded
 
-        Security note:
-            token 不再支援 None。先前的「無 token 跳過權限檢查」分支已移除,因為
-            該路徑容易被 caller 誤用導致 IDOR。如果 file 的 folder 已刪除(orphan
-            index record),`get_vector_store` 會 raise,捕捉後直接刪 DB record。
+        Security: token must be non-empty — the former "skip the access check when
+        no token is supplied" branch was removed to close an IDOR. An orphan index
+        (folder already deleted) makes get_vector_store raise; that is caught and the
+        DB record is deleted directly.
         """
         if not token:
             raise ValueError("delete_document_index requires a non-empty token")
@@ -70,7 +62,7 @@ class RAGMaintenanceService:
 
             folder_id = index_record.folder_id
 
-            # Vector store ownership 驗證 — orphan index 直接刪 DB row
+            # Vector store ownership check — an orphan index just deletes its DB row
             try:
                 vector_store = self._ctx.get_vector_store(folder_id, token)
             except (RAGOperationError, DomainException) as folder_err:
@@ -92,7 +84,8 @@ class RAGMaintenanceService:
             if not deletion_successful:
                 log_warn(logger, "DELETE_NO_CHUNKS", folder_id=folder_id, file_id=file_id)
 
-            # 即使 chunks 刪光失敗,DB record 還是要清,免得殘留指向不存在的 chunks
+            # Even if chunk deletion failed, still clear the DB record so nothing is
+            # left pointing at nonexistent chunks
             indexing_service.delete_index_for_file(file_id)
             indexing_service.invalidate_folder_caches(folder_id)
 
@@ -119,17 +112,18 @@ class RAGMaintenanceService:
         folder_id: int,
         token: str,
     ) -> DeleteFolderIndexResponse:
-        """刪除資料夾的所有索引(保留 folder 跟 files 本身)。
+        """Delete all of a folder's indexes (keeping the folder and files themselves).
 
-        會刪 FileIndexDB 內所有相關 row + DROP 對應的 pgvector table;Folder / File 本身不動。
-        執行前會先 cancel 所有 in-flight indexing jobs(避免 race)。
+        Deletes every related row in FileIndexDB and DROPs the corresponding pgvector
+        table; the Folder / File records are untouched. Cancels all in-flight indexing
+        jobs first to avoid races.
 
         Args:
-            folder_id: 要清索引的 folder。
-            token: 使用者 token(權限驗證)。
+            folder_id: The folder whose indexes to clear.
+            token: User token (access control).
 
         Returns:
-            DeleteFolderIndexResponse(刪除統計 + 細節 list)。
+            DeleteFolderIndexResponse (deletion stats + per-file detail list).
         """
         indexing_service = self._ctx.indexing_service
 
@@ -143,7 +137,8 @@ class RAGMaintenanceService:
                 folder_id=folder_id, token=token, msg=f"name={folder_name}",
             )
 
-            # 先 cancel in-flight job;不然 drop table 時對方還在 embed 會炸
+            # Cancel in-flight jobs first; otherwise dropping the table while another
+            # job is still embedding will blow up
             try:
                 from src.domain.rag.index_job_manager import IndexingJobManager
                 cancelled = await IndexingJobManager.get_instance().cancel_jobs_for_folder(folder_id)
@@ -162,12 +157,11 @@ class RAGMaintenanceService:
             index_records = indexing_service.list_indices_for_folder(folder_id)
             total_files = len(index_records)
 
-            # C1 修:順序 = 先刪 FileIndex rows、再 DROP 表,且兩步失敗都 raise。
-            # 舊順序(先 DROP 後刪 rows、刪 rows 失敗只 log)的致命態:表沒了、
-            # rows 還在且 status=indexed → 之後 reindex 每檔被 content_hash 短路
-            # 跳過 → 全庫宣稱已索引、實際零向量,且無法自癒。
-            # 新順序的中間態(rows 已刪、DROP 失敗)可自癒:重試時 rows 刪除
-            # 冪等、DROP 重跑即可;查詢期間頂多讀到 stale 向量。
+            # Order matters: delete FileIndex rows first, then DROP the table, raising
+            # if either step fails. Dropping first would leave rows with status=indexed
+            # but no vectors — a later reindex then short-circuits on content_hash and
+            # never self-heals. This order self-heals: a retry re-deletes rows
+            # idempotently and re-runs the DROP.
             deleted_indices = indexing_service.delete_indices_for_folder(folder_id)
             log_op(
                 logger, "DELETE_INDICES",
@@ -179,17 +173,17 @@ class RAGMaintenanceService:
             if vsm.drop_table(folder_id, vector_table_uuid):
                 log_op(logger, "DROP_TABLE", folder_id=folder_id, msg=f"table={vector_store_table}")
             else:
-                # DROP 失敗不可吞:留著舊向量表 + 無 FileIndex → 下次 reindex 會
-                # 疊寫重複向量。raise 讓呼叫端(reindex endpoint)中止並回報。
+                # A failed DROP must not be swallowed: leaving the old vector table
+                # behind with no FileIndex means the next reindex overwrites it with
+                # duplicate vectors. Raise so the caller (reindex endpoint) aborts and
+                # reports it.
                 raise ValueError(f"Failed to drop vector table {vector_store_table}")
 
-            # Invalidate caches
             indexing_service.invalidate_folder_caches(folder_id)
             self._ctx.invalidate_query_engine_cache(folder_id)
+            # drop_table() above already cleared the VSM cache entry.
 
-            # M5: VSM cache 已由上面的 drop_table() 一併清掉,不再手動 del 私有 _vector_stores
-
-            # Build per-file result rows (preserves files even though their indices are gone)
+            # Per-file rows: files are preserved even though their indices are gone.
             files = indexing_service.list_files(folder_id)
             results = [
                 FileIndexResult(
@@ -227,7 +221,7 @@ class RAGMaintenanceService:
             raise ValueError(f"Failed to delete folder index: {str(e)}")
 
     async def get_indexed_files(self, folder_id: int) -> List[Dict[str, Any]]:
-        """獲取指定 folder 中所有已索引的文件(有 cache)。"""
+        """Get all indexed files in the given folder (cached)."""
         indexing_service = self._ctx.indexing_service
 
         try:
@@ -250,7 +244,8 @@ class RAGMaintenanceService:
 
             results = []
             for record in index_records:
-                # FileDB.get_by_ids 用 str(uuid) 當 key;原本傳 UUID 物件永遠 miss → fallback "Unknown"
+                # FileDB.get_by_ids keys by str(uuid); passing a UUID object would
+                # always miss and fall back to "Unknown"
                 file_record = files_by_id.get(str(record.file_id))
                 results.append({
                     "file_id": str(record.file_id),
@@ -274,10 +269,6 @@ class RAGMaintenanceService:
             log_err(logger, "GET_INDEXED_FILES_FAIL", e, folder_id=folder_id)
             return []
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
     def _delete_chunks_from_vector_store(
         self,
         *,
@@ -286,16 +277,14 @@ class RAGMaintenanceService:
         folder_id: int,
         file_id: int,
     ) -> bool:
-        """從 vector store 物理刪除 chunks。
+        """Physically delete a file's chunks from the vector store.
 
-        Strategy:
-          - 委派 VectorStoreManager.delete_chunks_by_file(metadata_->>'file_id' 比對)
-          - LlamaIndex 的 `vector_store.delete(ref_doc_id)` 對 hierarchical chunks 寫的
-            ref_doc_id 經常對不上(`file_{file_id}` vs internal hash),所以那條路徑
-            在實務上是 dead code,直接走 raw SQL。
+        Delegates to VectorStoreManager.delete_chunks_by_file (matches on
+        metadata_->>'file_id'). LlamaIndex's vector_store.delete(ref_doc_id) is not
+        used: it frequently fails to match the ref_doc_id written for hierarchical
+        chunks, so we go straight to raw SQL.
 
-        Returns:
-            True 如果至少有一個 chunk 被刪除。
+        Returns True if at least one chunk was deleted.
         """
         try:
             table_name = index_record.vector_store_table
@@ -310,7 +299,8 @@ class RAGMaintenanceService:
                         f"using table={table_name}"
                     )
 
-            # M5: DELETE 收斂進 VectorStoreManager.delete_chunks_by_file(bind param 防注入)
+            # DELETE is centralized in VectorStoreManager.delete_chunks_by_file
+            # (bind params guard against injection)
             deleted_count = VectorStoreManager.delete_chunks_by_file(table_name, file_id)
             if deleted_count > 0:
                 log_op(

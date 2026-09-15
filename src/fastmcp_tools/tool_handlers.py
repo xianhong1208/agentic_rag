@@ -1,11 +1,13 @@
 
-"""Tool Handlers — re-export shim(M6)。
+"""Tool Handlers — re-export shim.
 
-三模式 handler(handle_search / handle_list / handle_read)已搬進 domain:
-src/domain/rag/agentic_handlers.py。它們不含任何 fastmcp 依賴,住在交付層
-造成 adapter 反向 import(fastmcp → adapter → fastmcp 層次環)。
+The three-mode handlers (handle_search / handle_list / handle_read) now live in
+the domain layer: src/domain/rag/agentic_handlers.py. They have no fastmcp
+dependency, and keeping them in the delivery layer created a reverse adapter
+import (a fastmcp -> adapter -> fastmcp layering cycle).
 
-此檔保留原 import 路徑向下相容;新 code 請直接 import domain 模組。
+This file preserves the original import path for backward compatibility; new
+code should import the domain module directly.
 """
 
 from src.domain.rag.agentic_handlers import (  # noqa: F401

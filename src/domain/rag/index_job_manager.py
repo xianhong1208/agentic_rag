@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from cachetools import TTLCache
 
-from src.config.model import IndexingConfig  # M10: timeout default 單一來源
+from src.config.model import IndexingConfig  # single source for the timeout default
 from src.domain.exceptions import ConflictError
 from src.log import get_api_logger
 
@@ -49,13 +49,11 @@ _TERMINAL_STATUSES = {
 class _PendingFileBatch:
     """A file-indexing request that arrived while the folder was busy.
 
-    每個 batch 在入佇列時就擁有**自己的 job 紀錄**(PENDING 狀態、穩定的
-    job_id)— 上傳回應與 /index/jobs 列表從第一刻就看得到它。前一個 job
-    結束時,_cleanup_job_slot 依序啟動佇列中下一個仍為 PENDING 的 job
-    (被取消的自動跳過),job_id 全程不變。
-
-    (舊設計:busy 時回傳「別人的 job_id」,drain 再生全新 id 的合併 job —
-    前端永遠學不到新 id,看起來就是「job 紀錄消失/被覆蓋」。)
+    Each batch owns its own job record (PENDING status, stable job_id) as soon
+    as it is queued — visible in the upload response and the /index/jobs list
+    from the first moment. When the previous job finishes, _cleanup_job_slot
+    launches the next still-PENDING job in the queue (cancelled ones are
+    skipped automatically); the job_id never changes.
     """
 
     job_id: str
@@ -87,23 +85,23 @@ class IndexJobState:
     started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     completed_at: Optional[str] = None
     result_summary: Optional[Dict[str, Any]] = None
-    # 此 job 處理的 file_ids;只有 file-scoped jobs 填,folder-wide 留空
+    # file_ids handled by this job; populated only for file-scoped jobs, empty for folder-wide
     scope_file_ids: List[str] = field(default_factory=list)
-    # A3 heartbeat watchdog: refreshed on every _update_job_state call.
+    # Heartbeat watchdog: refreshed on every _update_job_state call.
     last_updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     # per-file timing: {file_id, file_name, status, total_ms, load_ms, index_ms, chunks}
     file_timings: List[Dict[str, Any]] = field(default_factory=list)
-    # chunk 級進度(僅 current file)。in-memory + SSE 即時視圖,不落 DB —
-    # 檔案完成即被 reset;重啟後 job 會被翻 failed,殘值無意義。
-    # stage: loading(docling 解析)/ contextualizing(LLM 前綴)/ embedding / writing(pgvector 寫入)
+    # Chunk-level progress (current file only). In-memory + SSE live view, not persisted —
+    # reset when the file completes; on restart the job is marked failed, so stale values are meaningless.
+    # stage: loading (docling parse) / contextualizing (LLM prefix) / embedding / writing (pgvector insert)
     current_file_stage: Optional[str] = None
     current_file_chunks_done: Optional[int] = None
     current_file_chunks_total: Optional[int] = None
-    # ETA(秒)— 同 chunk 進度:in-memory + SSE 即時視圖,不落 DB。
-    # current_file_eta_seconds:目前 stage 按實測速率外推的剩餘秒數
-    #   (stage 剛切換 / 尚無速率樣本時為 None,前端顯示「估算中」)
-    # eta_seconds:整個 job 的粗估 = 已完成檔平均耗時 × 剩餘檔數 − 當前檔已耗時
-    #   (第一個檔完成前為 None)
+    # ETA (seconds) — same as chunk progress: in-memory + SSE live view, not persisted.
+    # current_file_eta_seconds: remaining seconds for the current stage, extrapolated from the
+    #   measured rate (None right after a stage switch or before any rate sample; UI shows "estimating").
+    # eta_seconds: coarse estimate for the whole job = avg time per completed file × remaining files
+    #   − elapsed on the current file (None before the first file completes).
     current_file_eta_seconds: Optional[int] = None
     eta_seconds: Optional[int] = None
 
@@ -159,14 +157,14 @@ class IndexProgressTracker:
         done: Optional[int],
         total: Optional[int],
     ):
-        """chunk 級進度(indexer 節流後呼叫:context-gen 每 10 chunk、embedding 每批)。
+        """Chunk-level progress (called after indexer throttling: context-gen every 10 chunks, embedding per batch).
 
         Args:
-            stage: loading / contextualizing / embedding / writing。
-            done: 該 stage 已完成 chunk 數。
-            total: 此檔 chunk 總數。
+            stage: loading / contextualizing / embedding / writing.
+            done: chunks completed in this stage.
+            total: total chunks for this file.
         """
-        # ETA 計算與進度更新一起做(stage 速率外推 + job 級粗估)
+        # Compute ETA alongside the progress update (stage-rate extrapolation + coarse job estimate)
         self._manager._update_chunk_progress(self._job_id, stage, done, total)
 
     def on_file_completed(
@@ -187,22 +185,22 @@ class IndexProgressTracker:
         )
 
     def record_file_timing(self, entry: Dict[str, Any]) -> None:
-        """把一筆 per-file timing 追加到 job state(每檔完成後 indexing service 呼叫)。
+        """Append one per-file timing entry to the job state (called by the indexing service after each file).
 
-        list 是 result_summary 的一部分,讓消費端排序「哪檔最慢」不必 parse log。
+        The list is part of result_summary so consumers can rank the slowest files without parsing logs.
 
         Args:
-            entry: ``{file_id, file_name, status, total_ms, load_ms, index_ms}``。
+            entry: ``{file_id, file_name, status, total_ms, load_ms, index_ms}``.
         """
         with self._manager._lock:
             state = self._manager._jobs.get(self._job_id)
             if not state:
                 return
-            # 同 _update_job_state 的終態閘:terminal 後遲到的 timing 不再寫入
+            # Same terminal gate as _update_job_state: drop timings that arrive after the job is terminal
             if state.status in _TERMINAL_STATUSES:
                 return
             state.file_timings.append(entry)
-            # 剛完成一檔 = job ETA 的最佳更新時點(檔與檔之間,current elapsed=None)
+            # A file just completed = best point to refresh the job ETA (between files, current elapsed=None)
             state.eta_seconds = self._manager._compute_job_eta_locked(
                 state, current_file_elapsed=None
             )
@@ -212,7 +210,7 @@ class IndexProgressTracker:
         self._manager._persist(snapshot)
 
     def mark_completed(self, summary: Dict[str, Any]):
-        # 終態:全成功→SUCCEEDED;部份失敗→PARTIAL_SUCCESS;0 成功 ≥1 失敗→FAILED
+        # Terminal status: all succeeded → SUCCEEDED; some failed → PARTIAL_SUCCESS; 0 succeeded with ≥1 failed → FAILED
         successful = summary.get("successful", 0) or 0
         failed = summary.get("failed", 0) or 0
         if failed > 0 and successful == 0:
@@ -256,33 +254,28 @@ class IndexingJobManager:
     _JOB_TTL_SECONDS = 86400
     _JOB_MAX_ENTRIES = 10000
 
-    # A3 watchdog tunables — scan every 60s, stale after 10min without heartbeat
-    #
-    # ⚠️ 不變式:這個門檻**不是**單檔耗時上限,那是 per-file 的
-    # wait_for(_PER_FILE_TIMEOUT_DEFAULT,現預設 864000s / 10 天)在管的。
-    # 這裡只負責偵測「job 真的死了」。注意兩者差距懸殊(600s vs 10 天,1440 倍):
-    # 合法但慢的檔案落在心跳盲區(semaphore 等待 / docling OCR / context-gen
-    # 節流間隙)時,會在 per-file 預算用完前先被這裡誤殺並 cancel 掉。
-    # 現在由 rag_indexing._ProgressKeepalive 每 60s 補心跳覆蓋所有盲區;
-    # 調小這個值、或新增不經 progress_cb 的長阻塞路徑前,先確認 keepalive 有蓋到。
+    # Watchdog tunables — scan every 60s, stale after 10min without heartbeat.
+    # This threshold detects a genuinely dead job, not a per-file duration cap (that is the per-file
+    # wait_for). A slow file in a heartbeat blind spot would be wrongly cancelled here, so
+    # rag_indexing._ProgressKeepalive emits a heartbeat every 60s to cover all blind spots; confirm
+    # that coverage before lowering this or adding a blocking path that bypasses progress_cb.
     _WATCHDOG_INTERVAL_SECONDS = 60
     _HEARTBEAT_STALE_SECONDS = 600
-    # H4: folder lock 的正常唯一出口是 _cleanup_job_slot(task finally)。task 若卡在
-    # 無法中斷的阻塞呼叫(docling/GPU 真 hang、驅動卡死),finally 永不執行 → folder
-    # 永久鎖死,該 folder 之後所有索引 409 直到 process 重啟。這是最後兜底:job 已
-    # 終態、但持鎖 task 過了這個寬限期仍沒退出,就強制回收 lock(接受「垂死 thread
-    # 之後若醒來寫入」的殘寫風險 —— 大聲記 error)。設 1h:遠大於任何合法阻塞呼叫
-    # (embedding 批次 / insert)的耗時,只會咬到真正 wedged 的 task。
+    # Last-resort folder-lock reclaim. The lock's only normal exit is _cleanup_job_slot (task
+    # finally); an uninterruptible blocking call (docling/GPU hang) can skip it and lock the folder
+    # forever. If a terminal job's task has not exited past this grace period, force-reclaim (accepting
+    # the residual-write risk). 1h is far longer than any legitimate blocking call, so it only catches
+    # a genuinely wedged task.
     _LOCK_RECLAIM_GRACE_SECONDS = 3600
 
-    # D2 fallback job-level cap — only used if config can't be read at all.
-    # 與 IndexingConfig.job_timeout_seconds 的 default 對齊(10 天)。
-    # Normal resolution: env RAG_JOB_TIMEOUT_SECONDS > config.rag.indexing.job_timeout_seconds > this.
-    # M10: 引用 IndexingConfig 欄位 default,不再各處各寫一份 864000 字面值。
+    # Fallback job-level cap — only used if config can't be read at all. References the IndexingConfig
+    # field default (10 days) instead of duplicating the 864000 literal.
+    # Resolution order: env RAG_JOB_TIMEOUT_SECONDS > config.rag.indexing.job_timeout_seconds > this.
     _JOB_TIMEOUT_FALLBACK = IndexingConfig.model_fields["job_timeout_seconds"].default
 
-    # cancel_job 等 task 真正退出的上限。to_thread 內的阻塞呼叫(embedding 批次/
-    # bulk insert)無法中斷,只能等它跑完這一步;30s 蓋得住單批最壞情況。
+    # Upper bound cancel_job waits for a task to actually exit. Blocking calls inside to_thread
+    # (embedding batch / bulk insert) can't be interrupted — we can only wait for the step to finish;
+    # 30s covers the worst case for a single batch.
     _CANCEL_WAIT_SECONDS = 30
 
     def __init__(self):
@@ -293,7 +286,7 @@ class IndexingJobManager:
             ttl=self._JOB_TTL_SECONDS,
         )
         self._lock = Lock()
-        # #28 folder-level lock — at most one running job per folder
+        # Folder-level lock — at most one running job per folder
         self._active_folders: Dict[int, str] = {}
         # Per-folder queue of file-indexing batches that arrived during a
         # running job. Drained by _cleanup_job_slot when the running job
@@ -301,32 +294,33 @@ class IndexingJobManager:
         # batch-upload many files without hitting "Folder already has a
         # running indexing job" and silently losing 9/10 files.
         self._pending_file_batches: Dict[int, List[_PendingFileBatch]] = {}
-        # A1 cancellation — track the asyncio.Task for each running job
+        # Cancellation — track the asyncio.Task for each running job
         self._task_handles: Dict[str, asyncio.Task] = {}
-        # ETA 計算的內部追蹤(不進 state,避免 API 噪音):
+        # Internal tracking for ETA computation (kept out of state to avoid API noise):
         # {job_id: {"file_start": ts, "stage": str, "stage_start": ts, "baseline": int}}
         self._progress_track: Dict[str, Dict[str, Any]] = {}
-        # per-file abort flags — 檔案刪除時由 FileAdapter.delete_file 標記,
-        # adapter 的 mid-stage probe 消費(消費即清除)。TTL 兜底:pending 檔
-        # 由 gate 1 的 DB probe 擋下、不會來消費 flag,靠過期回收避免累積。
+        # per-file abort flags — set by FileAdapter.delete_file when a file is deleted, consumed
+        # (and cleared) by the adapter's mid-stage probe. TTL is a safety net: pending files are
+        # blocked by gate 1's DB probe and never consume their flag, so expiry reclaims them.
         self._file_abort_flags: "TTLCache[str, bool]" = TTLCache(
             maxsize=4096, ttl=self._JOB_TTL_SECONDS,
         )
-        # A3 watchdog handle (idempotent start)
+        # Watchdog handle (idempotent start)
         self._watchdog_task: Optional[asyncio.Task] = None
-        # M8: 主 event loop 參照,供 worker thread 的進度回報 thread-safe 地喚醒 SSE。
-        # 在 start_watchdog(必在 loop thread 內)捕獲。
+        # Reference to the main event loop so worker-thread progress reports can wake SSE
+        # thread-safely. Captured in start_watchdog (which always runs on the loop thread).
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # fire-and-forget 背景 task(drain 等)的強引用 — asyncio 只留 weak ref,
-        # 沒有這個 set,queued job 可能在執行前被 GC 掉
+        # Strong references to fire-and-forget background tasks (drain, etc.) — asyncio keeps only
+        # a weak ref, so without this set a queued job could be garbage-collected before it runs.
         self._bg_tasks: Set[asyncio.Task] = set()
-        # DB persist 專用單工 executor:upsert 是 sync SQLAlchemy(SELECT+commit),
-        # 直接在 event loop 上跑會在每個進度 tick 卡住整個 server(API/SSE/cancel)。
-        # 單 worker 保證寫入順序(亂序會讓舊 snapshot 蓋掉新的)。
+        # Single-worker executor dedicated to DB persistence: upsert is sync SQLAlchemy (SELECT+commit),
+        # and running it directly on the event loop would stall the whole server (API/SSE/cancel) on
+        # every progress tick. A single worker guarantees write ordering (out-of-order writes would let
+        # an old snapshot overwrite a newer one).
         self._persist_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="idxjob-persist",
         )
-        # D1 (SSE) — per-job event subscribers. Each value is the list of live
+        # Per-job SSE event subscribers. Each value is the list of live
         # asyncio.Queue subscribers waiting for state updates of that job.
         self._subscribers: Dict[str, List[asyncio.Queue]] = {}
         # ensure the IndexJobs table exists; persistence is best-effort
@@ -336,7 +330,7 @@ class IndexingJobManager:
             IndexJobDB.ensure_table()
         except Exception as e:
             logger.warning(f"IndexJobs table init skipped (will run in-memory only): {e}")
-        # 借用 manager bootstrap 順便補 content_hash 欄位
+        # Piggyback on manager bootstrap to add the content_hash columns
         try:
             from db.fileindexdb import FileIndexDB
             FileIndexDB.ensure_content_hash_columns()
@@ -351,12 +345,12 @@ class IndexingJobManager:
 
     @classmethod
     def _resolve_job_timeout(cls) -> int:
-        """解析整 job timeout 秒數。
+        """Resolve the job-level timeout in seconds.
 
-        優先序:env RAG_JOB_TIMEOUT_SECONDS > config.rag.indexing.job_timeout_seconds > fallback。
+        Priority: env RAG_JOB_TIMEOUT_SECONDS > config.rag.indexing.job_timeout_seconds > fallback.
 
         Returns:
-            上限秒數;<=0 不設限。
+            Cap in seconds; <=0 means no limit.
         """
         import os
         env_val = os.getenv("RAG_JOB_TIMEOUT_SECONDS")
@@ -390,7 +384,6 @@ class IndexingJobManager:
         job_id = str(uuid.uuid4())
         state = IndexJobState(job_id=job_id, folder_id=folder_id, skip_existing=skip_existing)
 
-        # reject if this folder already has a live job
         with self._lock:
             if folder_id in self._active_folders:
                 existing = self._active_folders[folder_id]
@@ -439,9 +432,9 @@ class IndexingJobManager:
             finally:
                 self._cleanup_job_slot(job_id, folder_id)
 
-        # asyncio task,不開 thread — index_folder 本身就 async,而且把它丟到 thread pool
-        # 加 asyncio.run 會吃掉一個 worker thread 整個 indexing 過程,32 個並發 job 就把
-        # pool 卡死(包括 STT/OCR 的 run_in_threadpool 都 block)。
+        # asyncio task, no thread — index_folder is already async, and running it in a thread pool
+        # via asyncio.run would tie up a worker thread for the entire indexing run; 32 concurrent
+        # jobs would deadlock the pool (blocking even STT/OCR's run_in_threadpool).
         task = asyncio.create_task(_run_folder())
         with self._lock:
             self._task_handles[job_id] = task
@@ -480,7 +473,7 @@ class IndexingJobManager:
         """
         job_id = str(uuid.uuid4())
         state = IndexJobState(job_id=job_id, folder_id=folder_id, skip_existing=False)
-        # Part 3 — record planned scope so per-file status endpoint can detect "queued"
+        # Record planned scope so the per-file status endpoint can detect "queued"
         state.scope_file_ids = [str(fid) for fid in file_ids]
 
         # folder lock applies to file-scoped jobs too — but unlike start_indexing
@@ -488,10 +481,8 @@ class IndexingJobManager:
         # job finishes. This is the upload-N-files-in-a-row case: file 1 starts
         # a job, file 2…10 used to fail with AUTO_INDEX_FAIL. Now they queue.
         #
-        # ⚠️ 排隊的上傳也**立刻**擁有自己的 job 紀錄(PENDING、穩定 job_id)。
-        # 舊設計回「別人的 job_id」+ drain 生新 id:前端拿到的 id 可能瞬間
-        # terminal(如「刪除後馬上重傳」撞上前 job 收尾),真正的 follow-up
-        # job 又換了 id — 使用者看到的就是「job 紀錄消失/被覆蓋」。
+        # A queued upload also owns its own job record immediately (PENDING, stable job_id),
+        # so the id the caller receives stays valid all the way through RUNNING to terminal.
         with self._lock:
             if folder_id in self._active_folders:
                 existing = self._active_folders[folder_id]
@@ -523,8 +514,8 @@ class IndexingJobManager:
                 f"Folder {folder_id} busy with job {existing}; queued job {job_id} "
                 f"({len(file_ids)} file(s), total pending: {pending_total})"
             )
-            # 舊契約的 "queued": True 保留給呼叫端顯示;job_id 就是自己的,
-            # 之後 RUNNING → terminal 全程同一個 id
+            # Keep the legacy "queued": True for the caller to display; job_id is this job's own
+            # and stays the same all the way through RUNNING → terminal.
             return {**state.to_dict(), "queued": True}
 
         self._launch_file_job(
@@ -546,18 +537,19 @@ class IndexingJobManager:
         chunk_size: Optional[int],
         chunk_overlap: Optional[int],
     ) -> None:
-        """啟動一個 file-scoped job(caller 必須已把 folder lock 給這個 job)。
+        """Launch a file-scoped job (the caller must have already assigned the folder lock to it).
 
-        start_indexing_files 的即時路徑與 _cleanup_job_slot 的 dequeue 路徑共用,
-        保證兩條路徑啟動的 job 行為完全一致(timeout / cancel / cleanup / drain)。
-        必須在 event loop 內呼叫(create_task)。
+        Shared by the immediate path in start_indexing_files and the dequeue path in
+        _cleanup_job_slot, so jobs started via either path behave identically
+        (timeout / cancel / cleanup / drain). Must be called on the event loop (create_task).
         """
         job_id = state.job_id
-        # started_at = 真正開始執行的時刻,不是入佇列時刻。排隊 job 在 enqueue
-        # 時就建了 state(started_at=當時),真正啟動可能是幾分鐘後 dequeue ——
-        # 這裡重設,前端顯示的耗時才不會把排隊等待也算進去。即時路徑重設約等於
-        # no-op(state 剛建好)。watchdog 用 last_updated_at 判活、ETA 用 per-file
-        # 均值,兩者都不看 started_at,重設無副作用。
+        # started_at = the moment execution actually begins, not the enqueue moment. A queued job
+        # builds its state at enqueue time (started_at=then) but may not start until it is dequeued
+        # minutes later — resetting here keeps queue wait time out of the displayed elapsed time.
+        # On the immediate path the reset is effectively a no-op (state was just created). The
+        # watchdog uses last_updated_at for liveness and ETA uses per-file averages; neither looks
+        # at started_at, so the reset has no side effects.
         state.started_at = datetime.now(timezone.utc).isoformat()
         self._persist(state.to_dict())
         tracker = IndexProgressTracker(self, job_id)
@@ -603,31 +595,33 @@ class IndexingJobManager:
         )
 
     def _cleanup_job_slot(self, job_id: str, folder_id: int):
-        """Job 結束後釋放 task_handle + folder lock 槽位(冪等);drain pending queue。
+        """Release the task_handle + folder lock slot after a job ends (idempotent); drain the pending queue.
 
-        ⚠️ 這裡是 folder lock 的**唯一**釋放點(task 真正退出時才跑到)。
-        _update_job_state 翻終態不放鎖 — task 可能還卡在 to_thread 的阻塞呼叫,
-        提早放鎖會讓新 job 跟殘存寫入同寫一張表。
+        This is the ONLY release point for the folder lock (reached only when the task truly exits).
+        _update_job_state does not release the lock when flipping to a terminal status — the task may
+        still be stuck in a blocking to_thread call, and releasing early would let a new job write to
+        the same table as a residual write.
 
-        After releasing the lock, dequeue the next still-PENDING batch for this
-        folder and launch **its pre-created job (same job_id)** — 排隊中被
-        cancel 的 job 自動跳過。一次只出一個(folder lock 天然序列化),
-        該 job 結束時它自己的 cleanup 會再出下一個,鏈式消化整條佇列。
+        After releasing the lock, dequeue the next still-PENDING batch for this folder and launch its
+        pre-created job (same job_id) — queued jobs cancelled in the meantime are skipped. Only one is
+        dequeued at a time (the folder lock serialises naturally); when that job ends its own cleanup
+        dequeues the next, draining the whole queue in a chain.
 
         Args:
-            job_id: 要清的 job。
-            folder_id: 對應 folder。
+            job_id: the job to clean up.
+            folder_id: its folder.
         """
         next_batch: Optional[_PendingFileBatch] = None
         with self._lock:
             self._task_handles.pop(job_id, None)
             self._progress_track.pop(job_id, None)
-            # 所有權守衛:只有「目前確實持有 folder lock 的 job」才能釋放鎖、
-            # drain 佇列、把鎖交給下一個 job。H4 watchdog 強制回收後,原 wedged
-            # task 可能之後才醒來跑 finally 重入這裡 —— 它已非持有者,若無此
-            # 守衛會把佇列中的下一個 job 也啟動並搶佔鎖,兩個 job 併發同寫
-            # 一張表(破壞 #28「每 folder 最多一個 running job」不變式)。
-            # 非持有者只清自己的 task_handle / progress_track(冪等、無害)。
+            # Ownership guard: only the job that actually holds the folder lock may release it,
+            # drain the queue, and hand the lock to the next job. After the watchdog force-reclaims,
+            # the original wedged task may wake up later and re-enter here via its finally — it is no
+            # longer the holder, and without this guard it would launch the next queued job and seize
+            # the lock, running two jobs writing the same table concurrently (breaking the "at most one
+            # running job per folder" invariant). A non-owner only clears its own task_handle /
+            # progress_track (idempotent, harmless).
             owned = self._active_folders.get(folder_id) == job_id
             if owned:
                 self._active_folders.pop(folder_id, None)
@@ -639,7 +633,7 @@ class IndexingJobManager:
                     if cand_state is not None and cand_state.status == JobStatus.PENDING:
                         next_batch = cand
                         break
-                    # 排隊期間被 cancel(CANCELLED)或 TTL 蒸發 → 跳過,繼續找下一個
+                    # Cancelled (CANCELLED) or evaporated by TTL while queued → skip and keep looking
                     logger.info(
                         f"Folder {folder_id}: skipping dequeued job {cand.job_id} "
                         f"(status={getattr(cand_state, 'status', 'evicted')})"
@@ -647,8 +641,8 @@ class IndexingJobManager:
                 if not queue:
                     self._pending_file_batches.pop(folder_id, None)
                 if next_batch is not None:
-                    # 在鎖內就把 folder lock 交給下一個 job — create_task 前的空窗
-                    # 不能讓新來的 start_indexing 搶走槽位
+                    # Hand the folder lock to the next job while still holding the lock — the gap
+                    # before create_task must not let an incoming start_indexing steal the slot.
                     self._active_folders[folder_id] = next_batch.job_id
             else:
                 logger.warning(
@@ -674,7 +668,7 @@ class IndexingJobManager:
                 )
             except RuntimeError:
                 # No running loop (e.g. cleanup ran from a non-async context).
-                # 釋放剛佔的槽位並把 job 標 FAILED,不留永久 PENDING 幽靈。
+                # Release the slot just taken and mark the job FAILED; don't leave a permanent PENDING ghost.
                 with self._lock:
                     if self._active_folders.get(folder_id) == next_batch.job_id:
                         self._active_folders.pop(folder_id, None)
@@ -702,8 +696,8 @@ class IndexingJobManager:
         """List jobs in the in-memory cache.
 
         Args:
-            status_filter: 只回特定狀態(RUNNING / PENDING / SUCCEEDED / FAILED / CANCELLED)
-            folder_id: 只回特定 folder 的 jobs
+            status_filter: return only jobs with this status (RUNNING / PENDING / SUCCEEDED / FAILED / CANCELLED)
+            folder_id: return only jobs for this folder
         """
         with self._lock:
             jobs = []
@@ -716,10 +710,10 @@ class IndexingJobManager:
             return jobs
 
     def active_file_stages(self) -> Dict[str, Dict[str, Any]]:
-        """回 {file_id: {stage, done, total, eta}} — 目前正在索引的檔案在哪個階段。
+        """Return {file_id: {stage, done, total, eta}} — which stage each currently-indexing file is in.
 
-        給 admin 檔案清單即時顯示「解析中 / 生成上下文 / 向量化 / 寫入」用。
-        只含 RUNNING job 正在處理的當前檔;in-memory,不落 DB。
+        Used by the admin file list to show "parsing / contextualizing / embedding / writing" live.
+        Only includes the current file of RUNNING jobs; in-memory, not persisted.
         """
         out: Dict[str, Dict[str, Any]] = {}
         with self._lock:
@@ -735,10 +729,10 @@ class IndexingJobManager:
         return out
 
     def count_by_status(self) -> Dict[str, int]:
-        """Return {pending: N, running: N, succeeded: N, failed: N, cancelled: N, total: N}。
+        """Return {pending: N, running: N, succeeded: N, failed: N, cancelled: N, total: N}.
 
-        TTLCache 會自動清掉過期 entries,所以 succeeded/failed 數字是「最近 TTL
-        窗口」內的，不是 all-time。
+        TTLCache evicts expired entries automatically, so the succeeded/failed counts are for the
+        recent TTL window, not all-time.
         """
         counts = {s.value: 0 for s in JobStatus}
         with self._lock:
@@ -748,19 +742,20 @@ class IndexingJobManager:
         return counts
 
     async def cancel_jobs_for_folder(self, folder_id: int) -> list[str]:
-        """取消該 folder 的所有 PENDING/RUNNING jobs。
+        """Cancel all PENDING/RUNNING jobs for the folder.
 
-        刪 folder / 刪 index 等破壞性操作前先呼叫,避免 in-flight job 寫到一個被拆掉的 state。
+        Call before destructive operations (delete folder / delete index) so no in-flight job writes
+        to a state that is being torn down.
 
         Args:
-            folder_id: 要清的 folder id。
+            folder_id: the folder to clear.
 
         Returns:
-            被 cancel 的 job_id list;空 list 代表本來就沒在跑。
+            List of cancelled job_ids; an empty list means nothing was running.
         """
         with self._lock:
-            # 先丟棄排隊中的批次 — 不丟的話,被 cancel 的 job 在 _cleanup_job_slot
-            # 會把它們 drain 成新 job,正好跟破壞性操作(DROP TABLE)對撞
+            # Drop queued batches first — otherwise a cancelled job's _cleanup_job_slot would drain
+            # them into a new job that collides with the destructive operation (DROP TABLE).
             dropped = self._pending_file_batches.pop(folder_id, None)
             targets = [
                 state.job_id
@@ -788,17 +783,17 @@ class IndexingJobManager:
         return cancelled
 
     def purge_jobs_for_folder(self, folder_id: int) -> int:
-        """把該 folder 的所有 job 記錄從 in-memory cache + DB 徹底移除。
+        """Completely remove all job records for the folder from the in-memory cache + DB.
 
-        folder 刪除時呼叫(先 cancel_jobs_for_folder 再 purge)。沒有這步,
-        孤兒 job 會一直留在 /index/jobs 列表,前端順著它的 folder_id 輪詢
-        已不存在的 folder → FOLDER_NOT_FOUND 無限刷 log。
+        Called on folder deletion (cancel_jobs_for_folder first, then purge). Without this, orphan
+        jobs linger in the /index/jobs list and the frontend keeps polling their folder_id for a
+        folder that no longer exists → endless FOLDER_NOT_FOUND log spam.
 
         Args:
-            folder_id: 被刪除的 folder id。
+            folder_id: the deleted folder id.
 
         Returns:
-            從 in-memory cache 移除的 job 數。
+            Number of jobs removed from the in-memory cache.
         """
         with self._lock:
             doomed = [
@@ -812,7 +807,7 @@ class IndexingJobManager:
             self._pending_file_batches.pop(folder_id, None)
             if self._active_folders.get(folder_id) in doomed:
                 self._active_folders.pop(folder_id, None)
-        # DB 側同步清掉(best-effort;失敗只 log,不擋 folder 刪除流程)
+        # Clear the DB side too (best-effort; failures only log, they don't block folder deletion)
         try:
             from db.indexjobdb import IndexJobDB
             IndexJobDB.delete_for_folder(folder_id)
@@ -823,19 +818,19 @@ class IndexingJobManager:
         return len(doomed)
 
     async def cancel_job(self, job_id: str, reason: str = "Cancelled by user") -> bool:
-        """取消一個執行中或排隊中的 job。
+        """Cancel a running or queued job.
 
         Args:
-            job_id: 要 cancel 的 job 識別字。
-            reason: 寫進 job state 的取消原因(前端 job 狀態會顯示)。
+            job_id: identifier of the job to cancel.
+            reason: cancellation reason written into the job state (shown in the frontend job status).
 
         Returns:
-            True 表示成功 cancel;False = 找不到或已 terminal。
+            True on successful cancel; False if not found or already terminal.
 
-        注意:此方法會等 task **真正結束**(上限 _CANCEL_WAIT_SECONDS)才返回。
-        to_thread 裡的阻塞呼叫不會被 cancel() 中斷;不等的話 caller(刪 folder →
-        DROP TABLE)會跟殘存的 insert 競速,PGVectorStore.add 還會把被 DROP 的表
-        自動建回來,留下無主孤兒表。
+        Note: this method waits until the task actually finishes (up to _CANCEL_WAIT_SECONDS) before
+        returning. Blocking calls inside to_thread are not interrupted by cancel(); without the wait,
+        a caller (delete folder → DROP TABLE) would race the residual insert, and PGVectorStore.add
+        would even recreate the dropped table, leaving an orphaned table behind.
         """
         with self._lock:
             state = self._jobs.get(job_id)
@@ -859,29 +854,30 @@ class IndexingJobManager:
                     f"cancel (blocking call in flight); caller proceeds at its own risk"
                 )
             except asyncio.CancelledError:
-                pass  # task 以 CancelledError 收場 = 正常取消完成
+                pass  # task ended with CancelledError = normal cancellation
             except Exception:
-                pass  # task 自己的例外已在 _run_* 內處理過,這裡只關心「停了沒」
+                pass  # the task's own exceptions are handled inside _run_*; here we only care whether it stopped
         return True
 
     async def abort_indexing_for_file(
         self, file_id: str, folder_id: Optional[int] = None,
     ) -> Optional[str]:
-        """檔案被刪除時呼叫:盡快中止該檔的 in-flight indexing。
+        """Called when a file is deleted: abort that file's in-flight indexing as fast as possible.
 
-        兩段式策略:
-        - 單檔 job(scope 恰好只有這檔)→ 直接 cancel 整個 job(preemptive,
-          task.cancel() 在下個 await 點立即生效)。
-        - 多檔 / folder-wide job → 只設 per-file abort flag,由 adapter 的
-          mid-stage probe(cooperative)在下個檢查點中止該檔,其他檔不受影響。
-        還沒輪到的 pending 檔不用管 — adapter 的 gate 1 會用 DB probe 擋下。
+        Two-tier strategy:
+        - Single-file job (scope is exactly this file) → cancel the whole job (preemptive;
+          task.cancel() takes effect at the next await point).
+        - Multi-file / folder-wide job → only set the per-file abort flag, which the adapter's
+          mid-stage probe (cooperative) uses to abort just that file at its next checkpoint; other
+          files are unaffected.
+        Pending files not yet reached need no action — the adapter's gate 1 blocks them via a DB probe.
 
         Args:
-            file_id: 被刪除的檔案 UUID(str)。
-            folder_id: 已知時傳入,縮小掃描範圍。
+            file_id: the deleted file's UUID (str).
+            folder_id: pass when known to narrow the scan.
 
         Returns:
-            ``"cancelled_job:<job_id>"`` / ``"flagged"`` / None(沒有相關 job)。
+            ``"cancelled_job:<job_id>"`` / ``"flagged"`` / None (no relevant job).
         """
         fid = str(file_id)
         with self._lock:
@@ -916,17 +912,17 @@ class IndexingJobManager:
         return "flagged"
 
     def is_file_abort_requested(self, file_id: str) -> bool:
-        """adapter 的 mid-stage probe 用:此檔是否被要求中止。"""
+        """Used by the adapter's mid-stage probe: whether this file has been requested to abort."""
         with self._lock:
             return str(file_id) in self._file_abort_flags
 
     def clear_file_abort(self, file_id: str) -> None:
-        """flag 已被消費(該檔 indexing 已中止)後清除。"""
+        """Clear the flag once it has been consumed (the file's indexing has been aborted)."""
         with self._lock:
             self._file_abort_flags.pop(str(file_id), None)
 
     async def _watchdog_loop(self):
-        """背景輪詢:每 60s 掃 RUNNING jobs,>10min 無心跳就翻成 FAILED。"""
+        """Background poll: scan RUNNING jobs every 60s and mark any with no heartbeat for >10min as FAILED."""
         while True:
             await asyncio.sleep(self._WATCHDOG_INTERVAL_SECONDS)
             try:
@@ -952,32 +948,34 @@ class IndexingJobManager:
                         error="Heartbeat lost (>10min without update)",
                         completed_at=datetime.now(timezone.utc).isoformat(),
                     )
-                    # 翻 FAILED 只是帳面;還要真的 cancel task(終態閘擋回寫)。
-                    # folder lock 不在這裡放 — 它由 _cleanup_job_slot 在 task 真正
-                    # 退出時釋放,所以就算 task 卡在無法中斷的阻塞呼叫裡,新 job
-                    # 也進不來,不會兩個 job 同寫一張表。
+                    # Flipping to FAILED is only bookkeeping; the task must actually be cancelled
+                    # (the terminal gate blocks write-back). The folder lock is not released here —
+                    # _cleanup_job_slot releases it when the task truly exits, so even if the task is
+                    # stuck in an uninterruptible blocking call, no new job can enter and two jobs
+                    # never write the same table.
                     with self._lock:
                         task = self._task_handles.get(job_id)
                     if task and not task.done():
                         task.cancel()
                         logger.warning(f"Cancelled stale task for job {job_id}")
 
-                # H4: 兜底回收「已終態、但持鎖 task 仍未退出」而卡死的 folder lock。
-                # 正常路徑 lock 由 _cleanup_job_slot(task finally)釋放;task 卡在
-                # 無法中斷的阻塞呼叫時 finally 永不跑,folder 會永久鎖死。
+                # Last-resort reclaim of a folder lock wedged because the job is terminal but the
+                # lock-holding task has not exited. Normally the lock is released by _cleanup_job_slot
+                # (task finally); when the task is stuck in an uninterruptible blocking call the finally
+                # never runs and the folder would be locked forever.
                 reclaim: List[tuple] = []
                 with self._lock:
                     for folder_id, holder in list(self._active_folders.items()):
                         state = self._jobs.get(holder)
                         task = self._task_handles.get(holder)
                         if state is None:
-                            # holder 已被 TTL 逐出卻仍持鎖 → 早該回收
+                            # holder was evicted by TTL but still holds the lock → overdue for reclaim
                             reclaim.append((folder_id, holder, "holder evicted from cache"))
                             continue
                         if state.status not in _TERMINAL_STATUSES:
-                            continue  # 運行中 / 排隊中,不動
+                            continue  # running / queued, leave alone
                         if task is None or task.done():
-                            continue  # task 已退出,_cleanup 會/已釋放鎖,不強制
+                            continue  # task already exited; _cleanup will/did release the lock, don't force
                         try:
                             done_at = (
                                 datetime.fromisoformat(state.completed_at)
@@ -999,10 +997,10 @@ class IndexingJobManager:
                 logger.exception("Watchdog tick failed (will retry next interval)")
 
     def start_watchdog(self):
-        """啟動 watchdog 背景任務(冪等,重複呼叫只啟動一次)。"""
+        """Start the watchdog background task (idempotent; repeated calls start it only once)."""
         if self._watchdog_task is not None and not self._watchdog_task.done():
             return
-        self._loop = asyncio.get_running_loop()  # M8: 捕獲主 loop 供跨執行緒喚醒
+        self._loop = asyncio.get_running_loop()  # capture the main loop for cross-thread wakeups
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
         logger.info(
             f"Job watchdog started (interval={self._WATCHDOG_INTERVAL_SECONDS}s, "
@@ -1010,12 +1008,13 @@ class IndexingJobManager:
         )
 
     def mark_all_running_as_restart_failed(self) -> int:
-        """把 DB 內遺留的 PENDING/RUNNING jobs 全翻成 FAILED(reason=server_restart)。
+        """Flip all PENDING/RUNNING jobs left in the DB to FAILED (reason=server_restart).
 
-        重啟時呼叫:之前 process 死掉留下的孤兒 job 沒人在跑,直接收掉。冪等,可多次呼叫。
+        Called on startup: orphan jobs left by a dead previous process are no longer running, so close
+        them out. Idempotent; safe to call multiple times.
 
         Returns:
-            被翻成 failed 的 job 數量。
+            Number of jobs flipped to failed.
         """
         flipped = 0
         # 1. Load DB jobs that were left mid-flight by a previous process
@@ -1072,29 +1071,27 @@ class IndexingJobManager:
             logger.info(f"Marked {flipped} stale running jobs as failed (server_restart)")
         return flipped
 
-    # ------------------------------------------------------------------
-    # ETA — chunk 進度旁的「還剩多久」
-    # ------------------------------------------------------------------
+    # ETA — the "time remaining" shown next to chunk progress
 
     def _note_file_started(self, job_id: str) -> None:
-        """記錄當前檔開始時間;stage 追蹤歸零(per-file)。"""
+        """Record the current file's start time; reset stage tracking (per-file)."""
         with self._lock:
             self._progress_track[job_id] = {"file_start": time.time()}
 
     @staticmethod
     def _compute_job_eta_locked(state: IndexJobState, current_file_elapsed: Optional[float]) -> Optional[int]:
-        """整個 job 的粗估剩餘秒數。caller 必須持有 self._lock。
+        """Coarse estimate of remaining seconds for the whole job. Caller must hold self._lock.
 
-        估法:已完成檔(不含 skipped)的平均耗時 × 剩餘檔數,再扣掉當前檔
-        已經跑掉的時間(有的話)。刻意粗糙但誠實:第一個檔完成前回 None,
-        不編數字。
+        Method: avg time per completed file (excluding skipped) × remaining files, minus the time
+        already spent on the current file (if any). Deliberately coarse but honest: returns None
+        before the first file completes rather than inventing a number.
 
         Args:
-            state: job state(讀 file_timings / total_files / processed_files)。
-            current_file_elapsed: 當前檔已耗秒數;檔與檔之間傳 None。
+            state: job state (reads file_timings / total_files / processed_files).
+            current_file_elapsed: seconds already spent on the current file; pass None between files.
 
         Returns:
-            預估剩餘秒數(≥0)或 None(樣本不足)。
+            Estimated remaining seconds (≥0) or None (insufficient samples).
         """
         durations_ms = [
             t.get("total_ms") for t in state.file_timings
@@ -1108,7 +1105,7 @@ class IndexingJobManager:
             return 0
         eta = remaining * avg_s
         if current_file_elapsed is not None:
-            # 當前檔包含在 remaining 內,扣掉它已跑的部分(不讓 ETA 倒灌成負)
+            # The current file is part of remaining; subtract the time already spent (never let ETA go negative)
             eta -= min(current_file_elapsed, avg_s)
         return int(max(eta, 0))
 
@@ -1119,10 +1116,10 @@ class IndexingJobManager:
         done: Optional[int],
         total: Optional[int],
     ) -> None:
-        """chunk 進度 + 兩級 ETA 一起更新(tracker.on_chunk_progress 的實作)。
+        """Update chunk progress + both ETA levels together (implementation of tracker.on_chunk_progress).
 
-        stage ETA:同 stage 內用 (done − baseline)/elapsed 估速率再外推;
-        stage 剛切換或 elapsed < 1s(樣本太少,估出來會亂跳)時為 None。
+        Stage ETA: within one stage, estimate the rate from (done − baseline)/elapsed and extrapolate;
+        None right after a stage switch or when elapsed < 1s (too few samples, the estimate jumps around).
         """
         now = time.time()
         stage_eta: Optional[int] = None
@@ -1133,7 +1130,7 @@ class IndexingJobManager:
                 return
             track = self._progress_track.setdefault(job_id, {"file_start": now})
             if track.get("stage") != stage:
-                # stage 切換:重置速率基準(不同 stage 速率完全不同,不可混用)
+                # Stage switch: reset the rate baseline (stages have completely different rates, don't mix them)
                 track["stage"] = stage
                 track["stage_start"] = now
                 track["baseline"] = done or 0
@@ -1162,10 +1159,10 @@ class IndexingJobManager:
                 logger.warning(f"Attempted to update unknown job_id={job_id}")
                 return
 
-            # 終態單向閘:job 一旦 SUCCEEDED/FAILED/CANCELLED/PARTIAL,任何遲到的
-            # 更新一律拒絕。沒有這個閘,watchdog 翻 FAILED 後原 task 跑完會把狀態
-            # 翻回 SUCCEEDED;cancel_job 設 CANCELLED 後垂死 task 的 mark_failed
-            # 也會蓋掉取消原因。
+            # One-way terminal gate: once a job is SUCCEEDED/FAILED/CANCELLED/PARTIAL, any late update
+            # is rejected. Without it, after the watchdog flips a job to FAILED the original task could
+            # finish and flip it back to SUCCEEDED; after cancel_job sets CANCELLED, a dying task's
+            # mark_failed would overwrite the cancellation reason.
             if state.status in _TERMINAL_STATUSES:
                 logger.debug(
                     f"Ignoring update to terminal job {job_id} "
@@ -1178,22 +1175,19 @@ class IndexingJobManager:
                     setattr(state, key, value)
             # every state change is a heartbeat
             state.last_updated_at = datetime.now(timezone.utc).isoformat()
-            # H3: 重新寫入 = 續 TTL。TTLCache 的 ttl 從「寫入」起算、GET 不續命,
-            # 而 job_timeout 可達 10 天 >> _JOB_TTL_SECONDS(24h)。不在每次心跳
-            # 重寫,長 job 會在跑到 24h 時被逐出 _jobs → 後續更新變 "unknown
-            # job_id"、進度靜默丟失、watchdog 看不到它、GPU 仍被佔到 10 天。
-            # 心跳(keepalive 每 60s)重寫後 RUNNING job 永不因 TTL 過期;翻終態
-            # 後走上面的閘早退、不再重寫,24h 後正常回收。重寫同 key 不增 size,
-            # 不會誤逐其他 entry。
+            # Rewriting renews the TTL. TTLCache's ttl counts from the write (GET does not renew it),
+            # while job_timeout can reach 10 days >> _JOB_TTL_SECONDS (24h). Without a rewrite on every
+            # heartbeat, a long RUNNING job would be evicted at 24h and later updates would become
+            # "unknown job_id". Terminal jobs early-exit via the gate above and are reclaimed normally
+            # after 24h. Rewriting the same key doesn't grow the cache, so nothing else is evicted.
             self._jobs[job_id] = state
             if updates.get("status") in _TERMINAL_STATUSES and state.completed_at is None:
                 state.completed_at = datetime.now(timezone.utc).isoformat()
 
-            # ⚠️ folder lock 不在這裡釋放 — 唯一出口是 _cleanup_job_slot(task 真正
-            # 退出時)。status 翻終態 ≠ task 已停:watchdog/cancel 從外部翻狀態時,
-            # task 可能還卡在 to_thread 的阻塞呼叫(embedding/insert)裡,thread 無法
-            # 中斷。在這裡提早放鎖,新 job 會跟殘存寫入同寫一張表。
-            # 正常完成路徑 lock 只多held 幾微秒(task finally 馬上跑 cleanup)。
+            # The folder lock is not released here — its only exit is _cleanup_job_slot (when the task
+            # truly exits). A terminal status does not mean the task stopped: it may still be in an
+            # uninterruptible blocking to_thread call, and releasing early would let a new job's write
+            # race the residual write.
 
             # write-through persist (snapshot inside the lock to avoid races)
             snapshot = state.to_dict()
@@ -1202,40 +1196,39 @@ class IndexingJobManager:
     def _persist(self, state_dict: Dict[str, Any]) -> None:
         """best-effort write-through to IndexJobs table. Never raises.
 
-        upsert 是 sync SQLAlchemy,丟到單工 executor 跑 — 進度 tick 很頻繁
-        (context-gen 每 10 chunk、embedding 每批),在 event loop 上直接跑
-        會把 API/SSE/cancel 全卡住。manager 記憶體才是 source of truth,
-        DB 是被動投影,晚幾十 ms 落盤無妨;單 worker 保證 upsert 順序。
+        upsert is sync SQLAlchemy, dispatched to the single-worker executor — progress ticks are
+        frequent (context-gen every 10 chunks, embedding per batch) and running them directly on the
+        event loop would stall API/SSE/cancel. The manager's memory is the source of truth and the DB
+        is a passive projection, so persisting tens of ms late is fine; a single worker guarantees
+        upsert ordering.
         """
         try:
             self._persist_executor.submit(self._persist_sync, state_dict)
         except Exception as e:
             logger.warning(f"IndexJob persist scheduling failed (continuing in-memory): {e}")
-        # SSE 直接吃 in-memory snapshot(canonical),不等 DB 落盤
+        # SSE consumes the in-memory snapshot (canonical) directly, without waiting for the DB write
         self._notify_subscribers(state_dict.get("job_id"), state_dict)
 
     @staticmethod
     def _persist_sync(state_dict: Dict[str, Any]) -> None:
-        """executor worker:實際的 DB upsert(IndexJobDB 自吞例外,只 log)。"""
+        """Executor worker: the actual DB upsert (IndexJobDB swallows exceptions and only logs)."""
         try:
             from db.indexjobdb import IndexJobDB
             IndexJobDB.upsert(state_dict)
         except Exception as e:
             logger.warning(f"IndexJob persist failed (continuing in-memory): {e}")
 
-    # ------------------------------------------------------------------
-    # D1 (T2.2) — SSE subscriber fan-out
-    # ------------------------------------------------------------------
+    # SSE subscriber fan-out
 
     def subscribe(self, job_id: str) -> asyncio.Queue:
-        """訂閱某個 job 的狀態變化(供 SSE endpoint 用)。
+        """Subscribe to a job's state changes (for the SSE endpoint).
 
         Args:
-            job_id: 要訂閱的 job。
+            job_id: the job to subscribe to.
 
         Returns:
-            一個 bounded asyncio.Queue;每次 state 變動會 put 整份 state dict。
-            **caller 結束時務必呼叫 unsubscribe(),否則 manager 會 leak reference。**
+            A bounded asyncio.Queue; the full state dict is put on it on every state change.
+            The caller must call unsubscribe() when done, or the manager will leak the reference.
         """
         # Bounded so a slow consumer cannot OOM the server. 100 updates is
         # plenty for any sane job (we emit ~3-5 events per file processed).
@@ -1245,11 +1238,11 @@ class IndexingJobManager:
         return q
 
     def unsubscribe(self, job_id: str, q: asyncio.Queue) -> None:
-        """移除訂閱者 queue。冪等。
+        """Remove a subscriber queue. Idempotent.
 
         Args:
-            job_id: 對應的 job。
-            q: subscribe() 之前回傳的同一個 queue。
+            job_id: the corresponding job.
+            q: the same queue previously returned by subscribe().
         """
         with self._lock:
             subs = self._subscribers.get(job_id)
@@ -1263,11 +1256,11 @@ class IndexingJobManager:
                 self._subscribers.pop(job_id, None)
 
     def _notify_subscribers(self, job_id: Optional[str], state_dict: Dict[str, Any]) -> None:
-        """把最新 state 推給所有 subscribers(best-effort,slow consumer drop 不報錯)。
+        """Push the latest state to all subscribers (best-effort; a slow consumer is dropped without error).
 
         Args:
-            job_id: 要通知的 job;None → 直接 return。
-            state_dict: 完整 state dict(同 get_status 回傳)。
+            job_id: the job to notify; None → return immediately.
+            state_dict: the full state dict (same as get_status returns).
         """
         if not job_id:
             return
@@ -1286,10 +1279,10 @@ class IndexingJobManager:
                 except Exception as e:
                     logger.warning(f"SSE notify dropped for job {job_id}: {e}")
 
-        # M8: asyncio.Queue 非 thread-safe;put_nowait 內部的 consumer 喚醒走
-        # call_soon(非 threadsafe)。此方法會被 docling worker thread(to_thread
-        # 的頁級進度回報)呼叫,直接 put 可能導致 SSE 喚醒遺失。若不在 loop thread,
-        # 就把投遞排回 loop 上執行。
+        # asyncio.Queue is not thread-safe; put_nowait's internal consumer wakeup uses call_soon
+        # (not threadsafe). This method can be called from the docling worker thread (page-level
+        # progress reports via to_thread), and putting directly could lose an SSE wakeup. If not on
+        # the loop thread, marshal the delivery back onto the loop.
         try:
             asyncio.get_running_loop()
             on_loop = True
@@ -1300,4 +1293,4 @@ class IndexingJobManager:
         elif loop is not None:
             loop.call_soon_threadsafe(_deliver)
         else:
-            _deliver()  # 極端 fallback(loop 未捕獲);不比原行為差
+            _deliver()  # extreme fallback (loop not captured); no worse than the original behaviour

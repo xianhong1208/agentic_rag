@@ -1,22 +1,30 @@
 
-"""DB Bootstrap — 確保目標 DB 存在 + extensions 啟用
+"""DB Bootstrap — ensure the target DB exists and extensions are enabled.
 
-此模組由 main.py 啟動流程呼叫,**先於 Alembic migration**。
-解決雞生蛋問題:CREATE DATABASE 不能在自己內部跑,必須連到 postgres 預設 DB。
+Called from main.py's startup flow, **before Alembic migration**. It solves the
+chicken-and-egg problem: CREATE DATABASE cannot run inside its own database and
+must connect to the default `postgres` DB.
 
-流程:
-1. 查 pg_database 確認目標 DB 存在(參數化查詢)
-2. 不存在 → 連 postgres 預設 DB → CREATE DATABASE(dbname 過白名單 + 跳脫)
-3. 連到目標 DB → CREATE EXTENSION IF NOT EXISTS (pgvector / pg_jieba)
+Flow:
+1. Query pg_database to confirm the target DB exists (parameterized query).
+2. If absent → connect to the default postgres DB → CREATE DATABASE (dbname
+   allowlisted + escaped).
+3. Connect to the target DB → CREATE EXTENSION IF NOT EXISTS vector (pgvector).
 
-安全設計(對齊 MCP_Center a46a4b8 的定案模式,sink 與 proven-clean 的
-coreagent 一致):
-- 全程 SQLAlchemy,不直接使用 psycopg2 — 憑證由 make_url 處理(含特殊
-  字元),密碼永遠不從 URL 拆出、不落任何 dict/kwargs,程式碼中不存在
-  憑證中間持有點(Checkmarx: Use Of Hardcoded Password / Insufficiently
-  Protected Credentials)。
-- CREATE DATABASE 的 identifier 不能 bind param,以 _validate_dbname
-  白名單 + SQL 標準雙引號跳脫雙保險(Checkmarx: Second-Order SQL Injection)。
+NOTE: Chinese word segmentation for BM25/FTS is now done in Python via CKIP
+(ckip-transformers, see src/domain/rag/ckip_segmenter.py), NOT pg_jieba. CKIP
+emits space-joined tokens tokenized by Postgres with the `simple` config, so no
+Chinese FTS dictionary extension is needed.
+
+Security design:
+- SQLAlchemy throughout, no direct psycopg2 — credentials are handled by
+  make_url (including special characters); the password is never split out of
+  the URL, never lands in any dict/kwargs, and there is no intermediate
+  credential-holding point in the code (Checkmarx: Use Of Hardcoded Password /
+  Insufficiently Protected Credentials).
+- The CREATE DATABASE identifier cannot be a bind param, so it is guarded by
+  both the _validate_dbname allowlist and SQL-standard double-quote escaping
+  (Checkmarx: Second-Order SQL Injection).
 """
 
 from __future__ import annotations
@@ -28,35 +36,37 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ProgrammingError
 
-# Postgres 識別字上限 63 bytes(NAMEDATALEN-1),超過會被靜默截斷。
+# Postgres identifier limit is 63 bytes (NAMEDATALEN-1); anything longer is silently truncated.
 _MAX_IDENTIFIER_BYTES = 63
 
-# dbname 白名單 — 啟動時對 DATABASE_URL 做 fail-fast 檢查。
-# 注意這是設定健全性檢查兼縱深防禦:CREATE DATABASE 前另有 `"` 加倍跳脫。
+# dbname allowlist — a fail-fast check on DATABASE_URL at startup.
+# This is both a config sanity check and defense-in-depth: CREATE DATABASE also applies `"` doubling.
 _DBNAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_$-]*")
 
 
 def _validate_dbname(dbname: str) -> str:
-    """驗證從 DATABASE_URL 解析出來的 dbname,不合法就 raise ValueError。"""
+    """Validate the dbname parsed from DATABASE_URL; raise ValueError if invalid."""
     if not _DBNAME_RE.fullmatch(dbname):
         raise ValueError(
-            f"DATABASE_URL 的資料庫名稱不合法: {dbname!r}。"
-            f"只允許字母/數字/底線/連字號/$,且須以字母或底線開頭"
+            f"Invalid database name in DATABASE_URL: {dbname!r}. "
+            f"Only letters/digits/underscore/hyphen/$ are allowed, and it must "
+            f"start with a letter or underscore"
         )
     if len(dbname.encode("utf-8")) > _MAX_IDENTIFIER_BYTES:
         raise ValueError(
-            f"DATABASE_URL 的資料庫名稱超過 Postgres 上限 "
-            f"{_MAX_IDENTIFIER_BYTES} bytes(會被靜默截斷): {dbname!r}"
+            f"Database name in DATABASE_URL exceeds the Postgres limit of "
+            f"{_MAX_IDENTIFIER_BYTES} bytes (would be silently truncated): {dbname!r}"
         )
     return dbname
 
 
 def _ensure_database_exists(db_url: str, logger) -> None:
-    """目標 DB 不存在就建(冪等,含並發競態處理)。
+    """Create the target DB if it does not exist (idempotent, handles concurrent races).
 
-    連 postgres 系統 DB 才能 CREATE DATABASE。make_url 安全處理帳密特殊
-    字元並把目標 dbname 換成 postgres;AUTOCOMMIT 因 CREATE DATABASE 不能
-    在 transaction 內執行。
+    CREATE DATABASE requires connecting to the postgres system DB. make_url
+    safely handles special characters in credentials and swaps the target dbname
+    to postgres; AUTOCOMMIT is used because CREATE DATABASE cannot run inside a
+    transaction.
     """
     target_dbname = _validate_dbname(make_url(db_url).database or "")
 
@@ -73,13 +83,15 @@ def _ensure_database_exists(db_url: str, logger) -> None:
                 return
 
             logger.warning(f"⚠️ Database '{target_dbname}' not found, creating...")
-            # identifier 不能 bind param。SQL 標準跳脫:雙引號括住、內嵌 " 加倍;
-            # dbname 另已過 _validate_dbname 白名單(根本不含 "),此為 defense-in-depth
+            # The identifier cannot be a bind param. SQL-standard escaping: wrap
+            # in double quotes and double any embedded ". The dbname has also
+            # passed the _validate_dbname allowlist (which contains no " at all);
+            # this is defense-in-depth.
             safe_name = target_dbname.replace('"', '""')
             conn.execute(text(f'CREATE DATABASE "{safe_name}"'))
             logger.info(f"✅ Database '{target_dbname}' created")
     except ProgrammingError as e:
-        # 並發下另一個 process 先建好(duplicate_database)→ 視同成功
+        # Another process created it first under concurrency (duplicate_database) → treat as success.
         if "already exists" in str(e).lower():
             logger.info(f"✅ Database '{target_dbname}' was created concurrently")
             return
@@ -89,18 +101,20 @@ def _ensure_database_exists(db_url: str, logger) -> None:
 
 
 def _enable_extensions(db_url: str, logger) -> None:
-    """在 DB 註冊 pgvector(必要)+ pg_jieba(可選,中文 BM25 用)。
+    """Register pgvector in the DB (required). Chinese BM25 segmentation is now
+    handled by Python CKIP, so pg_jieba is no longer needed.
 
-    走 CREATE EXTENSION IF NOT EXISTS;OS 層 .so 須先裝(預期由 Postgres Docker image 提供)。
+    Uses CREATE EXTENSION IF NOT EXISTS; the OS-level .so must already be
+    installed (expected to be provided by the Postgres Docker image).
 
     Args:
-        db_url: PostgreSQL 連線字串。
-        logger: log 給 server 看的 logger。
+        db_url: PostgreSQL connection string.
+        logger: logger for server-facing logs.
     """
     engine = create_engine(db_url, isolation_level="AUTOCOMMIT")
 
     with engine.connect() as conn:
-        # pgvector — 必要,沒有就完全不能用
+        # pgvector — required; nothing works without it
         try:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             logger.info("✅ pgvector extension ready")
@@ -109,7 +123,7 @@ def _enable_extensions(db_url: str, logger) -> None:
             if "could not open extension control file" in err or "control file" in err:
                 logger.error(
                     f"❌ pgvector NOT installed at OS level.\n"
-                    f"   檢查你 Postgres image 有沒有預裝 pgvector,或 bare-metal 安裝:\n"
+                    f"   Check that your Postgres image ships pgvector, or install it on bare metal:\n"
                     f"     apt install postgresql-XX-pgvector\n"
                     f"   Original error: {e}"
                 )
@@ -117,37 +131,29 @@ def _enable_extensions(db_url: str, logger) -> None:
                 logger.error(f"❌ pgvector setup failed: {e}")
             raise
 
-        # pg_jieba — 可選,缺了 BM25 中文分詞降級成 simple
-        try:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_jieba"))
-            logger.info("✅ pg_jieba extension ready")
-        except Exception as e:
-            err = str(e).lower()
-            if "could not open extension control file" in err or "control file" in err:
-                logger.warning(
-                    f"⚠️ pg_jieba NOT installed at OS level — "
-                    f"BM25 will fall back to default tokenizer (English-only,中文檢索效能會差).\n"
-                    f"   檢查 Postgres image 是否含 pg_jieba。\n"
-                    f"   或修改 config.yaml retrieval.text_search_config 為 'english' / 'simple'"
-                )
-            else:
-                logger.warning(f"⚠️ pg_jieba registration failed: {e}")
+        # NOTE: pg_jieba is no longer required. Chinese word segmentation for
+        # BM25/full-text search is now done in Python via CKIP
+        # (ckip-transformers, see src/domain/rag/ckip_segmenter.py): CKIP
+        # produces a space-joined token string that Postgres tokenizes with the
+        # `simple` config. Postgres therefore needs no Chinese FTS dictionary
+        # extension.
 
     engine.dispose()
 
 
 def ensure_hnsw_for_table(engine, table_name: str, logger=None) -> bool:
-    """對單一 PGVector 表確保 HNSW index 存在(冪等,微秒級若已存在)
+    """Ensure a single PGVector table has an HNSW index (idempotent; microsecond-level if already present).
 
-    用途:新 folder 第一次寫 chunks 後立刻補 HNSW,不用等下次重啟。
+    Purpose: add the HNSW index right after a new folder's first chunk write,
+    without waiting for the next restart.
 
     Args:
-        engine: SQLAlchemy engine 連到目標 DB(避免每次重建 engine)
-        table_name: PGVector 表名,例如 'data_2_b09d9acf-d049-...'
-        logger: 可選
+        engine: SQLAlchemy engine connected to the target DB (avoids rebuilding the engine each time)
+        table_name: PGVector table name, e.g. 'data_2_b09d9acf-d049-...'
+        logger: optional
 
     Returns:
-        True 如果建了新 index,False 如果已存在
+        True if a new index was created, False if it already existed.
     """
     idx_name = table_name + "_hnsw_idx"
     sql = text(f'''
@@ -158,7 +164,7 @@ def ensure_hnsw_for_table(engine, table_name: str, logger=None) -> bool:
     ''')
     try:
         with engine.begin() as conn:
-            # 先看 index 是否已存在(更便宜的 check)
+            # Check whether the index already exists first (cheaper check).
             exists = conn.execute(text(
                 "SELECT 1 FROM pg_indexes WHERE indexname = :idx LIMIT 1"
             ), {"idx": idx_name}).first()
@@ -175,14 +181,15 @@ def ensure_hnsw_for_table(engine, table_name: str, logger=None) -> bool:
 
 
 def _ensure_hnsw_indexes(db_url: str, logger) -> None:
-    """為所有 PGVector data_* 表建 HNSW index(冪等,自動修補 LlamaIndex 的 quoting bug)。
+    """Create HNSW indexes on all PGVector data_* tables (idempotent; works around LlamaIndex's quoting bug).
 
-    LlamaIndex 自建 HNSW 對 UUID hyphen 沒做 identifier quoting → 靜默失敗;
-    我們自己跑 IF NOT EXISTS 補。沒 HNSW search 1k+ chunks 後線性惡化。
+    LlamaIndex's own HNSW creation does not quote identifiers containing UUID
+    hyphens → it fails silently; we run IF NOT EXISTS ourselves to backfill.
+    Without HNSW, search degrades linearly past ~1k chunks.
 
     Args:
-        db_url: PostgreSQL 連線字串。
-        logger: log 給 server 看的 logger。
+        db_url: PostgreSQL connection string.
+        logger: logger for server-facing logs.
     """
     engine = create_engine(db_url, isolation_level="AUTOCOMMIT")
     sql = text("""
@@ -197,7 +204,7 @@ def _ensure_hnsw_indexes(db_url: str, logger) -> None:
             WHERE schemaname = 'public' AND tablename LIKE 'data\\_%' ESCAPE '\\'
           LOOP
             cnt := cnt + 1;
-            -- 看這張表是不是已經有 HNSW index
+            -- check whether this table already has an HNSW index
             IF NOT EXISTS (
               SELECT 1 FROM pg_indexes
               WHERE tablename = t
@@ -219,7 +226,7 @@ def _ensure_hnsw_indexes(db_url: str, logger) -> None:
             conn.execute(sql)
         logger.info("✅ HNSW index sweep complete (all PGVector tables checked)")
     except Exception as e:
-        # 不致命 — 沒 HNSW 也能跑,只是 search 慢
+        # Non-fatal — it still runs without HNSW, search is just slower.
         logger.warning(
             f"⚠️ HNSW index sweep failed: {e}. "
             "search will fall back to sequential scan (slower)."
@@ -229,19 +236,21 @@ def _ensure_hnsw_indexes(db_url: str, logger) -> None:
 
 
 def check_vector_dims(db_url: str, expected_dim: int, logger) -> list:
-    """啟動時掃所有 data_* 向量表,回報維度與 config 不符的表。
+    """At startup, scan all data_* vector tables and report those whose dimension differs from config.
 
-    pgvector 的維度在 CREATE TABLE 時凍結(存在 atttypmod),之後改 config
-    不會改表 — 不符的表在 insert 時才會炸「expected N dimensions」。這裡
-    提前到啟動就大聲報,並指出解法(reindex 該 folder)。
+    pgvector's dimension is frozen at CREATE TABLE (stored in atttypmod); later
+    config changes do not alter the table — a mismatched table only blows up at
+    insert time with "expected N dimensions". This surfaces it loudly at startup
+    and points to the fix (reindex that folder).
 
     Args:
-        db_url: PostgreSQL 連線字串。
-        expected_dim: config 的 rag.embedding.dimension。
-        logger: server logger。
+        db_url: PostgreSQL connection string.
+        expected_dim: config's rag.embedding.dimension.
+        logger: server logger.
 
     Returns:
-        [(table_name, actual_dim), ...] 不符清單;掃描失敗回空 list(不擋啟動)。
+        [(table_name, actual_dim), ...] list of mismatches; returns an empty list
+        on scan failure (does not block startup).
     """
     mismatched = []
     engine = create_engine(db_url)
@@ -281,33 +290,34 @@ def check_vector_dims(db_url: str, expected_dim: int, logger) -> list:
 
 
 def ensure_database_ready(db_url: str, logger) -> None:
-    """確保 DB 存在 + extensions 啟用 + HNSW indexes 補齊(idempotent — 跑幾次都安全)
+    """Ensure the DB exists + extensions enabled + HNSW indexes backfilled (idempotent — safe to run repeatedly).
 
-    完整的 declarative provisioning:
-      Step 1: DB 不在 → 建
-      Step 2: pgvector / pg_jieba extension 不在 → 啟用
-      Step 3: PGVector data_* 表沒 HNSW index → 補建
+    Full declarative provisioning:
+      Step 1: DB absent → create it
+      Step 2: pgvector extension absent → enable it (Chinese segmentation now uses Python CKIP, no pg_jieba)
+      Step 3: PGVector data_* tables missing an HNSW index → backfill them
 
-    這個函式涵蓋「換 DB / 換機器 / Docker volume 重置 / 第一次部署」所有場景。
-    跑幾次都安全(IF NOT EXISTS 保證冪等)。
+    This function covers every scenario: switching DB / switching machine /
+    Docker volume reset / first deployment. Safe to run repeatedly (IF NOT
+    EXISTS guarantees idempotence).
 
     Args:
-        db_url: SQLAlchemy DB URL,例如 postgresql://user:pwd@host/dbname
-        logger: server logger 實例
+        db_url: SQLAlchemy DB URL, e.g. postgresql://user:pwd@host/dbname
+        logger: server logger instance
 
     Raises:
-        sqlalchemy.exc.OperationalError: 連 postgres 系統 DB 都失敗(密碼錯/服務沒起)
-        sqlalchemy.exc.ProgrammingError: 無 CREATEDB 權限等
-        Exception: pgvector extension 建立失敗(必要,沒有就完全不能用)
+        sqlalchemy.exc.OperationalError: even connecting to the postgres system DB failed (wrong password / service down)
+        sqlalchemy.exc.ProgrammingError: no CREATEDB privilege, etc.
+        Exception: pgvector extension creation failed (required; nothing works without it)
     """
     logger.info(f"🔍 Bootstrapping database '{make_url(db_url).database}'...")
 
-    # Step 1: ensure DB exists(SQLAlchemy 全程,見模組 docstring 安全設計)
+    # Step 1: ensure DB exists (SQLAlchemy throughout; see the module docstring's security design)
     _ensure_database_exists(db_url, logger)
 
     # Step 2: ensure extensions
     _enable_extensions(db_url, logger)
 
     # Step 3: ensure HNSW indexes on all existing PGVector tables
-    # (LlamaIndex 自己建會炸於 UUID hyphen 的 quoting bug,所以我們承擔這責任)
+    # (LlamaIndex's own creation breaks on the UUID-hyphen quoting bug, so we take this on ourselves)
     _ensure_hnsw_indexes(db_url, logger)

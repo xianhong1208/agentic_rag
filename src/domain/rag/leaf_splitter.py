@@ -1,9 +1,9 @@
 
-"""Leaf Splitter — Document → leaf-sized chunks(M14 自 HierarchicalIndexer 拆出)。
+"""Leaf Splitter — Document → leaf-sized chunks (extracted from HierarchicalIndexer).
 
-兩條路徑(與拆出前完全一致,逐字搬移):
-- Docling pre-parsed(metadata._docling_chunks)直接採用
-- fallback:結構切分(表格 [TABLE_START] 保留)+ 同一套 token budget refine
+Two paths:
+- Docling pre-parsed (metadata._docling_chunks): used directly
+- fallback: structure-aware split (preserving [TABLE_START] tables) + the same token-budget refine
 """
 
 from __future__ import annotations
@@ -19,23 +19,24 @@ from src.domain.rag.document_loader import clean_text
 
 logger = get_api_logger()
 
-# 結尾為「空 code fence」的殘塊偵測:docling 對無法擷取內容的 code block / 圖片
-# 會產出「[描述]\n\n```」這種只有標題/占位描述、正文為空的 chunk(實例見
-# reports 診斷:『代碼區塊占位符』『占位符區塊,表示缺少實際內容』重複 10~12 次)。
-# 這種 chunk 進 index 只會污染檢索(rerank 還會因標題字面命中把它評高分)。
+# Detect trailing "empty code fence" residual chunks: for code blocks / images whose
+# content Docling cannot extract, it emits chunks like "[description]\n\n```" that have
+# only a heading/placeholder description and an empty body. Such chunks only pollute
+# retrieval if indexed (rerank may even score them high on a literal heading match).
 _TRAILING_EMPTY_FENCE = re.compile(r"\n\s*```[a-zA-Z0-9_+-]*\s*$")
 _ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍﻿"), None)
 _STRUCT_CHARS = re.compile(r"[\s`#|>*_~\-→▪●·•]+")
 
 
 def _is_low_value_chunk(text: str) -> bool:
-    """判斷是否為無檢索價值的殘塊(空 code fence 占位符 / 純結構符)。
+    """Decide whether a chunk has no retrieval value (empty code-fence placeholder / structure-only).
 
-    規則(保守,寧可少殺):
-    - 去零寬字元後,若『結尾是空 code fence』且『去掉該 fence 後的實質字元 < 40』
-      → 判為 docling 空塊/占位符殘塊。
-    - 去所有結構符後完全沒有實質字元 → 空塊。
-    正常內容(有正文、或雖短但不以空 fence 結尾)一律保留。
+    Rules (conservative; prefer under-killing):
+    - After stripping zero-width chars, if it "ends with an empty code fence" and has
+      "fewer than 40 substantive chars after removing that fence" → treat as a Docling
+      empty/placeholder residual chunk.
+    - If no substantive char remains after removing all structural symbols → empty chunk.
+    Normal content (has a body, or is short but does not end with an empty fence) is always kept.
     """
     t = (text or "").translate(_ZERO_WIDTH).strip()
     if not t:
@@ -51,8 +52,8 @@ def _is_low_value_chunk(text: str) -> bool:
 
 
 class LeafSplitter:
-    """切分器(HierarchicalIndexer 組合使用;邏輯自其 _structure_aware_split /
-    _split_into_leaf_documents 逐字搬入)。"""
+    """Splitter (composed by HierarchicalIndexer; logic moved from its
+    _structure_aware_split / _split_into_leaf_documents)."""
 
     def __init__(
         self,
@@ -70,7 +71,7 @@ class LeafSplitter:
         )
 
     def structure_aware_split(self, text: str) -> List[str]:
-        """跟前一版 flat RAG 一致 — 表格保留,文字走 SentenceSplitter"""
+        """Same as the previous flat-RAG version — tables preserved, text goes through SentenceSplitter."""
         table_pattern = re.compile(
             r'\[TABLE_START\]\s*(.*?)\s*\[TABLE_END\]',
             re.DOTALL,
@@ -93,28 +94,29 @@ class LeafSplitter:
         return [c for c in chunks if c.strip()]
 
     def split_into_leaf_documents(self, document: Document) -> List[Document]:
-        """產出 leaf-sized Document list(Docling 解析優先,fallback SentenceSplitter)。
+        """Produce a leaf-sized Document list (Docling parsing preferred, SentenceSplitter fallback).
 
-        Docling chunks 可能含 NUL (\\x00) 等控制字元(PDF 字型表 / ICC profile 來源),
-        PostgreSQL 不接受,所以最後強制清洗。
+        Docling chunks may contain control chars such as NUL (\\x00) (from PDF font
+        tables / ICC profiles) that PostgreSQL rejects, so we force a final cleanup.
 
-        fallback 路徑(.txt/.csv/SimpleDirectoryReader)的結構切分後,
-        會再過 docling 路徑同一套 `_refine_chunks_for_token_budget`:
-        同一顆 embedding tokenizer 量 budget、表格 [TABLE_START] 巨塊
-        token-bounded 切分 + 表頭重複、小塊 merge — 兩條路徑保證一致。
+        After the fallback path's structure-aware split (.txt/.csv/SimpleDirectoryReader),
+        it runs the same `_refine_chunks_for_token_budget` as the Docling path: measuring
+        the budget with the same embedding tokenizer, token-bounded splitting of large
+        [TABLE_START] table blocks with header repetition, and merging small chunks —
+        keeping both paths consistent.
 
         Args:
-            document: 已 load 的完整 Document(metadata 內可能藏 `_docling_chunks`)。
+            document: the fully loaded Document (its metadata may hide `_docling_chunks`).
 
         Returns:
-            leaf Document list,空 chunks 已過濾、控制字元已清。
+            Leaf Document list, with empty chunks filtered and control chars cleaned.
         """
         pre_parsed = document.metadata.pop("_docling_chunks", None)
         if pre_parsed:
             chunk_texts = pre_parsed
         else:
             chunk_texts = self.structure_aware_split(clean_text(document.text))
-            # 統一 token budget 保證(與 DocumentLoader 的 docling 路徑同公式)
+            # Uniform token-budget guarantee (same formula as DocumentLoader's docling path)
             try:
                 from src.domain.rag.docling_loader import (
                     get_hf_tokenizer,
@@ -126,19 +128,19 @@ class LeafSplitter:
                 )
                 chunk_texts = _refine_chunks_for_token_budget(chunk_texts, hf_tok, budget)
             except Exception as e:
-                # tokenizer 不可得時降級為結構切分結果(舊行為),不擋索引
+                # When the tokenizer is unavailable, degrade to the structure-only split (legacy behavior) without blocking indexing
                 logger.warning(
                     f"Token-budget refine unavailable for fallback split "
                     f"(degrading to structure-only): {e}"
                 )
 
         leaf_docs: List[Document] = []
-        seen_texts: set = set()  # 同一文件內去重(占位符殘塊常重複 10+ 次)
+        seen_texts: set = set()  # dedupe within the same document (placeholder residual chunks often repeat 10+ times)
         dropped_lowvalue = 0
         dropped_dup = 0
         for item in chunk_texts:
-            # BL-05: chunk 可為記錄 dict({"text","headings","page_no"},docling
-            # 路徑帶引用溯源)或裸字串(audio / 舊資料)— 兩者皆收
+            # A chunk may be a record dict ({"text","headings","page_no"} — the docling
+            # path carries citation provenance) or a bare string (audio / legacy data) — accept both
             if isinstance(item, dict):
                 text = item.get("text", "")
                 provenance = {
@@ -147,15 +149,15 @@ class LeafSplitter:
                 }
             else:
                 text, provenance = item, {}
-            # 強制清洗 — 不論來源都要過,Docling pre-parsed 路徑特別容易帶 NUL
+            # Force cleanup — applied regardless of source; the Docling pre-parsed path is especially prone to NUL
             text = clean_text(text)
             if not text.strip():
                 continue
-            # 品質守門:丟掉空 code fence 占位符 / 純結構殘塊(污染檢索)
+            # Quality gate: drop empty code-fence placeholders / structure-only residuals (they pollute retrieval)
             if _is_low_value_chunk(text):
                 dropped_lowvalue += 1
                 continue
-            # 同文件去重:占位符殘塊常一字不差重複多次,只留一顆
+            # Dedupe within the document: placeholder residuals often repeat verbatim many times; keep only one
             key = text.strip()
             if key in seen_texts:
                 dropped_dup += 1
@@ -165,7 +167,7 @@ class LeafSplitter:
                 text=text,
                 metadata={
                     **{k: v for k, v in document.metadata.items() if v is not None},
-                    **provenance,  # per-chunk 引用欄位(hierarchy 會原樣併進 leaf node)
+                    **provenance,  # per-chunk citation fields (hierarchy merges them into the leaf node as-is)
                 },
             ))
         if dropped_lowvalue or dropped_dup:

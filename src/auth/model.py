@@ -1,12 +1,12 @@
 
-"""Token 管理 API 模型定義"""
+"""Token management API model definitions."""
 
 from pydantic import BaseModel
 from typing import List
 
 
 class TokenCreateRequest(BaseModel):
-    """Token 創建請求模型"""
+    """Token creation request model."""
     user_name: str = "generated_user"
     scopes: List[str] = ["read", "write", "admin"]
     length: int = 24
@@ -14,7 +14,7 @@ class TokenCreateRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    """Token 響應模型"""
+    """Token response model."""
     token: str
     user_name: str
     scopes: List[str]
@@ -24,7 +24,7 @@ class TokenResponse(BaseModel):
 
 
 class TokenInfo(BaseModel):
-    """Token 信息模型"""
+    """Token info model."""
     user_name: str
     scopes: List[str]
     expires_at: int
@@ -33,8 +33,8 @@ class TokenInfo(BaseModel):
 
 
 class TokenListResponse(BaseModel):
-    """Token 列表響應模型"""
-    tokens: dict[str, TokenInfo]  # 扁平化: token_string -> TokenInfo
+    """Token list response model."""
+    tokens: dict[str, TokenInfo]  # Flattened: token_string -> TokenInfo
     source: str
     total_count: int
     modules: List[str]

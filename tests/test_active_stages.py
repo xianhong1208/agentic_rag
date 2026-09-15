@@ -1,4 +1,4 @@
-"""active_file_stages:只回 RUNNING job 正在處理的當前檔 + 其階段。"""
+"""active_file_stages: returns only the current file being processed by RUNNING jobs + its stage."""
 from src.domain.rag.index_job_manager import IndexingJobManager, IndexJobState, JobStatus
 
 

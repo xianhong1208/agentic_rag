@@ -1,46 +1,45 @@
-# 測試案例範本 (Test Case Template)
+# Test Case Template
 
 >
-> 用法:複製本檔到 `docs/testing/test-cases/TC-<模組>.md`。每個案例對應一條需求 (REQ),
-> 詳細記錄步驟、輸入與預期結果,讓測試人員或自動化系統有所依循。
+> Usage: copy this file to `docs/testing/test-cases/TC-<module>.md`. Each case maps to one requirement (REQ),
+> documenting steps, inputs, and expected results in detail so a tester or an automated system can follow it.
 
 ---
 
-# TC-<模組>:<模組中文名稱> 測試案例
+# TC-<module>: <module name> Test Cases
 
-| 項目 | 內容 |
-|------|------|
-| 對應規格 | [SPEC-<模組>](../specs/SPEC-<模組>.md) |
-| 測試層級 | 單元 / 整合 / 系統 |
-| 測試腳本 | `tests/test_xxx.py` |
-
----
-
-## TC-<模組>-01:<案例標題>
-
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-<模組>-01 |
-| **層級** | 單元 / 整合 / 系統 |
-| **前置條件** | <需要的環境 / 資料 / 登入狀態> |
-| **測試輸入** | <具體輸入值 / 請求 body / 參數> |
-| **測試步驟** | 1. …<br>2. …<br>3. … |
-| **預期結果** | <明確可判定的輸出 / 狀態碼 / 副作用> |
-| **實作** | `tests/test_xxx.py::test_yyy` |
+| Item | Content |
+|------|---------|
+| Related spec | [SPEC-<module>](../specs/SPEC-<module>.md) |
+| Test level | Unit / Integration / System |
+| Test script | `tests/test_xxx.py` |
 
 ---
 
-## TC-<模組>-02:<案例標題>
+## TC-<module>-01: <case title>
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-<模組>-01 |
-| **層級** | |
-| **前置條件** | |
-| **測試輸入** | |
-| **測試步驟** | |
-| **預期結果** | |
-| **實作** | |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-<module>-01 |
+| **Level** | Unit / Integration / System |
+| **Preconditions** | <required environment / data / login state> |
+| **Test input** | <concrete input values / request body / parameters> |
+| **Test steps** | 1. ...<br>2. ...<br>3. ... |
+| **Expected result** | <clearly determinable output / status code / side effect> |
+| **Implementation** | `tests/test_xxx.py::test_yyy` |
 
-> 撰寫原則:一個案例只驗證一件事;正常路徑與例外路徑分開;預期結果必須是**可觀察、可判定**的
-> (避免「應該正常」這類模糊描述)。
+---
+
+## TC-<module>-02: <case title>
+
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-<module>-01 |
+| **Level** | |
+| **Preconditions** | |
+| **Test input** | |
+| **Test steps** | |
+| **Expected result** | |
+| **Implementation** | |
+
+> Authoring principles: each case verifies exactly one thing; keep the happy path and the exception path separate; expected results must be **observable and determinable** (avoid vague phrasing such as "should work").

@@ -1,9 +1,11 @@
 
-"""Control Center 管理面 API 契約(act-as-owner 模式)。
+"""Control Center management-plane API contract (act-as-owner mode).
 
-釘住:①一律以 folder 的擁有者 token 呼叫既有端點函式(不繞過任何
-既有安全/清理邏輯)②無主 folder 拒管(409)③folder 不存在 404
-④建 folder 必帶 owner_token。底層端點函式 mock — 其行為由各自測試守。
+Pins down: (1) existing endpoint functions are always called with the folder
+owner's token (bypassing none of the existing security/cleanup logic);
+(2) an ownerless folder cannot be managed (409); (3) a nonexistent folder is
+404; (4) creating a folder requires owner_token. The underlying endpoint
+functions are mocked -- their behavior is guarded by their own tests.
 """
 
 from types import SimpleNamespace
@@ -76,8 +78,9 @@ class TestActAsOwner:
         assert kw["folder"] is f
 
     def test_full_rebuild_uses_reindex_endpoint(self, client):
-        # 全量重建必須走 reindex(先刪索引記錄)— index(skip_existing=False)
-        # 會被 content_hash 短路,重建無效(2026-09-07 用戶 log 實證)
+        # A full rebuild must go through reindex (deletes index records first) --
+        # index(skip_existing=False) is short-circuited by content_hash, making
+        # the rebuild a no-op
         f = _folder()
         with patch(_DB, return_value=f), \
              patch("src.api.router.rag_indexing.reindex_folder_endpoint",
@@ -164,7 +167,7 @@ class TestQueryPlayground:
         assert r.status_code == 422
 
     def test_trace_uses_query_trace_and_maps_results(self, client):
-        """trace=true 走 query_trace,並用軌跡最終命中組成 results(不重跑一般查詢)。"""
+        """trace=true routes to query_trace and builds results from the trace's final hits (does not re-run a normal query)."""
         f = _folder()
         trace = {"reranked": True, "candidates": 30, "results": [
             {"text": "seg1", "final_score": 0.9, "reranked": True, "rerank_score": 0.9,
@@ -181,7 +184,7 @@ class TestQueryPlayground:
         assert r.status_code == 200
         d = r.json()["data"]
         assert d["trace"]["reranked"] is True and d["trace"]["candidates"] == 30
-        # results 由 trace 映射:score = final_score
+        # results mapped from the trace: score = final_score
         assert d["total_results"] == 1
         assert d["results"][0] == {"text": "seg1", "score": 0.9,
             "metadata": {"file_name": "a.pdf", "page": 2, "headings": ["H"], "node_id": "n1"}}
@@ -234,13 +237,13 @@ class TestGenerateAnswer:
             azure_deployment=None)))
 
     def test_crag_relevant_generates_answer(self):
-        """grade 回全相關 → 用相關段生成,confidence 依相關段數。"""
+        """grade returns all-relevant -> generate from the relevant segments, confidence by relevant count."""
         from src.api.router import admin_manage as am
         fake = MagicMock()
-        # 第1次呼叫=評分(回 JSON 陣列),第2次=生成
+        # 1st call = grading (returns a JSON array), 2nd = generation
         fake.chat.completions.create.side_effect = [
             SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="[true, true]"))]),
-            # gpt-oss 風格引註,應被正規化成 [1][2]
+            # gpt-oss-style citations, should be normalized to [1][2]
             SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Ans【1†L1-L3】【2†L2】"))]),
         ]
         with patch("src.config.config_manager.Config.get_config_model", return_value=self._cfg()), \
@@ -249,12 +252,12 @@ class TestGenerateAnswer:
             out = am._generate_answer("what files?", [
                 {"text": "ctx one", "score": 0.9}, {"text": "ctx two", "score": 0.8}])
         assert out["answer"] == "Ans[1][2]" and out["confidence"] == "high" and out["kept"] == 2
-        # 生成 prompt(第2次呼叫)帶 context 與 question
+        # The generation prompt (2nd call) carries context and question
         prompt = fake.chat.completions.create.call_args_list[1].kwargs["messages"][0]["content"]
         assert "ctx one" in prompt and "what files?" in prompt
 
     def test_empty_generation_returns_note_not_silent_none(self):
-        """grade 通過但生成回空(reasoning 吃光額度)→ 給明確截斷訊息,不靜默回 None。"""
+        """grade passes but generation returns empty (reasoning consumed the budget) -> give an explicit truncation message, do not silently return None."""
         from src.api.router import admin_manage as am
         fake = MagicMock()
         fake.chat.completions.create.side_effect = [
@@ -271,7 +274,7 @@ class TestGenerateAnswer:
         assert out["confidence"] == "low" and "finish=length" in out["note"]
 
     def test_crag_gate_blocks_when_nothing_relevant(self):
-        """grade 全不相關 → CRAG gate 擋下,不硬答(不呼叫生成)。"""
+        """grade all-irrelevant -> the CRAG gate blocks, no forced answer (generation not called)."""
         from src.api.router import admin_manage as am
         fake = MagicMock()
         fake.chat.completions.create.return_value = SimpleNamespace(
@@ -282,4 +285,4 @@ class TestGenerateAnswer:
             out = am._generate_answer("unrelated?", [{"text": "irrelevant", "score": 0.2}])
         assert out["confidence"] == "low" and out["kept"] == 0 and out["dropped"] == 1
         assert "找不到足夠依據" in out["answer"]
-        assert fake.chat.completions.create.call_count == 1  # 只評分,未生成
+        assert fake.chat.completions.create.call_count == 1  # graded only, no generation

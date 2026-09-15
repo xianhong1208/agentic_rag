@@ -1,14 +1,14 @@
 
 """Media REST API — STT / OCR via Docling's pre-loaded models.
 
-直接呼叫 docling 的 singleton DocumentConverter,共用 hierarchical_indexer 已 load
-的 Whisper turbo (ASR) + RapidOCR (PDF/Image OCR) 模型。不額外載入,不 proxy 外部
-container。
+Calls docling's singleton DocumentConverter directly, sharing the Whisper turbo (ASR) + RapidOCR
+(PDF/Image OCR) models already loaded by hierarchical_indexer. No extra loading, no proxying to an
+external container.
 
 Endpoints:
-- POST /v1/transcriptions/general  — audio → text(後端跟隨 rag.asr.provider)
+- POST /v1/transcriptions/general  — audio → text (backend follows rag.asr.provider)
 - POST /v1/ocr/general             — image/pdf → text (Docling OCR pipeline)
-- GET  /v1/models                  — 列出已 load 的模型
+- GET  /v1/models                  — list the loaded models
 """
 import subprocess
 import tempfile
@@ -32,19 +32,20 @@ from src.log import get_api_logger
 
 logger = get_api_logger()
 
-# PyTorch transformer 模型不是 thread-safe — 同一個 model instance 並發兩個 transcribe()
-# 會觸發 "cannot reshape tensor of 0 elements" 之類的 KV-cache race。
-# 單 GPU 本來就無法並行兩個 forward,serialize 也不損吞吐量。
-# STT / OCR 模型不同,獨立 lock 不互鎖。
+# PyTorch transformer models are not thread-safe — two concurrent transcribe() calls on the same
+# model instance trigger a KV-cache race such as "cannot reshape tensor of 0 elements".
+# A single GPU can't run two forwards in parallel anyway, so serializing costs no throughput.
+# STT and OCR use different models, so their independent locks don't block each other.
 _WHISPER_INFER_LOCK = threading.Lock()
-# H2: docling converter 是全 process 單例,索引路徑也會 convert 它。改用
-# docling_loader 的同一把推論鎖,讓「索引」與「/v1/ocr、/v1/transcriptions」
-# 之間也序列化,否則同一 instance 並發 forward 會 CUDA crash / OOM。
+# The docling converter is a process-wide singleton that the indexing path also runs convert() on.
+# Reuse docling_loader's same inference lock so "indexing" and "/v1/ocr, /v1/transcriptions" are
+# serialized against each other too; otherwise concurrent forwards on the same instance CUDA crash / OOM.
 _DOCLING_INFER_LOCK = DOCLING_INFER_LOCK
 
-# ⚠️ 刻意不掛認證(2026-07 決策):STT/OCR 的呼叫端拿不到 token,豁免 auth、
-# 只留 100MB 上傳上限擋濫用。代價是匿名端可驅動 Whisper/OCR GPU 推論 —
-# 僅適用於內網部署;要重新上鎖,加回 dependencies=[Depends(authenticate_request)]
+# Deliberately unauthenticated: STT/OCR callers can't obtain a token, so auth is waived and only a
+# 100MB upload cap guards against abuse. The cost is that anonymous callers can drive Whisper/OCR
+# GPU inference — suitable for internal-network deployment only. To lock it back down, re-add
+# dependencies=[Depends(authenticate_request)].
 router = APIRouter(
     tags=["Media"],
     prefix="/v1",
@@ -54,27 +55,27 @@ router = APIRouter(
 _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus", ".webm"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif", ".webp", ".pdf"}
 
-# 上傳大小上限 — 對齊 FileDB.MAX_FILE_SIZE(100MB)。UploadFile 是串流寫入
-# temp file,沒有上限的話單一 request 就能塞爆 temp disk
+# Upload size cap — matches FileDB.MAX_FILE_SIZE (100MB). UploadFile streams to a temp file, so
+# without a cap a single request could fill the temp disk.
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 
 def _get_config_asr_provider():
-    """media STT 的語音來源 = config `rag.asr.provider`,與索引同一個 —
-    設定一處、所有語音任務生效。
+    """The speech source for media STT = config `rag.asr.provider`, the same one used for indexing —
+    configured in one place, effective for all speech tasks.
 
-    - docling-whisper(或 config 缺省)→ 回 (None, None):走原 whisper-direct
-      路徑(**同一個** config 選定的模型,只是直呼以保留 language/prompt 控制)
-    - fireredasr / openai-compatible → 回 (provider, name);**不可用時由呼叫端
-      回 503**,絕不靜默改用別的模型(config 選了誰就是誰)
-    - 非 whisper provider 不支援 language/prompt(FireRedASR 為中英 AED、無
-      prompt bias)— 端點收到會記 log 並忽略
+    - docling-whisper (or config default) -> returns (None, None): use the original whisper-direct
+      path (the *same* model chosen by config, just called directly to retain language/prompt control)
+    - fireredasr / openai-compatible -> returns (provider, name); when unavailable the caller returns
+      503, never silently falling back to a different model (whatever config chose is what runs)
+    - non-whisper providers don't support language/prompt (FireRedASR is a Chinese/English AED with
+      no prompt bias) — the endpoint logs and ignores them if received
     """
     try:
         from src.config.config_manager import Config as _Cfg
         asr_cfg = getattr(getattr(_Cfg.get_config_model(), "rag", None), "asr", None)
     except Exception:
-        asr_cfg = None  # config 讀不到 → 視同缺省(docling-whisper 舊語義)
+        asr_cfg = None  # config unreadable -> treat as default (docling-whisper legacy semantics)
     if asr_cfg is None or not asr_cfg.enabled or asr_cfg.provider == "docling-whisper":
         return None, None
     from src.domain.rag.asr_provider import create_asr_provider
@@ -82,14 +83,14 @@ def _get_config_asr_provider():
 
 
 def _get_loaded_whisper():
-    """從 docling 已初始化的 AsrPipeline 抓出底層 whisper.Whisper instance。
+    """Extract the underlying whisper.Whisper instance from docling's initialized AsrPipeline.
 
-    docling 的 _NativeWhisperModel.transcribe() 沒把 options 裡的 `language` 傳給
-    whisper(忽略掉),也沒暴露 `initial_prompt`。直接拿 raw whisper model 自己呼叫
-    才能完整控制這些參數。
+    docling's _NativeWhisperModel.transcribe() doesn't pass the options' `language` through to
+    whisper (it's ignored) and doesn't expose `initial_prompt`. Taking the raw whisper model and
+    calling it directly is the only way to fully control these parameters.
 
     Returns whisper model instance (with `.transcribe(audio, language=..., initial_prompt=...)`),
-    or None if AsrPipeline 還沒 warm。
+    or None if the AsrPipeline isn't warm yet.
     """
     converter = get_converter()
     pipes = getattr(converter, "initialized_pipelines", {}) or {}
@@ -101,13 +102,13 @@ def _get_loaded_whisper():
 
 
 async def _save_upload_to_temp(file: UploadFile) -> tuple[str, int]:
-    """串流寫入 temp file,避免一次把整個 audio 載入記憶體。
+    """Stream-write to a temp file, avoiding loading the whole audio into memory at once.
 
     Args:
-        file: FastAPI UploadFile 物件。
+        file: The FastAPI UploadFile object.
 
     Returns:
-        ``(temp_path, bytes_written)`` ─ caller 用完務必 unlink。
+        ``(temp_path, bytes_written)`` — the caller must unlink it when done.
     """
     suffix = Path(file.filename or "upload").suffix.lower() or ".bin"
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
@@ -126,8 +127,9 @@ async def _save_upload_to_temp(file: UploadFile) -> tuple[str, int]:
                 )
             tmp.write(chunk)
     except BaseException:
-        # 失敗路徑(含 client 斷線的 CancelledError、413)清掉半成品 temp,
-        # 別留在磁碟。成功路徑不 unlink —— caller 要用 tmp.name。
+        # On the failure path (including CancelledError from client disconnect, and 413), clean up
+        # the half-written temp so it doesn't linger on disk. The success path does not unlink —
+        # the caller needs tmp.name.
         tmp.close()
         Path(tmp.name).unlink(missing_ok=True)
         raise
@@ -142,53 +144,52 @@ def _unlink_safe(path: Optional[str]) -> None:
 
 
 # Extensions where docling's format dispatcher reliably routes to the
-# AudioPipeline。 Everything else (.webm,future containers) gets
-# transcoded to .wav first ─ see _transcode_to_wav 的 docstring 細節。
+# AudioPipeline. Everything else (.webm, future containers) gets
+# transcoded to .wav first — see _transcode_to_wav's docstring for details.
 _DOCLING_AUDIO_SAFE_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus"}
 
 
 def _transcode_to_wav(input_path: str) -> str:
-    """Transcode an audio file to 16 kHz mono WAV via ffmpeg。
+    """Transcode an audio file to 16 kHz mono WAV via ffmpeg.
 
     Why this exists:
-        docling's format dispatcher runs a three-stage waterfall ─
+        docling's format dispatcher runs a three-stage waterfall —
         ``filetype.guess_mime`` (magic bytes) → extension lookup →
-        content sniff ─ and the magic-byte stage is *content*-driven,
-        not extension-driven。 We previously tried to renaming
-        ``.webm`` to ``.ogg`` thinking docling keyed off the suffix,
-        but the magic-byte stage saw the EBML/Matroska header
-        (``1A 45 DF A3``) and tagged the file as webm regardless of
-        the renamed extension。 docling has no webm → audio mapping,
-        so the dispatcher returned ``None`` and the convert call
-        failed before AudioPipeline could ever see it。
+        content sniff — and the magic-byte stage is *content*-driven,
+        not extension-driven. Renaming ``.webm`` to ``.ogg`` does not
+        help: the magic-byte stage sees the EBML/Matroska header
+        (``1A 45 DF A3``) and tags the file as webm regardless of the
+        renamed extension. docling has no webm → audio mapping, so the
+        dispatcher returns ``None`` and the convert call fails before
+        AudioPipeline can ever see it.
 
-        Stop fighting the dispatcher。 Run a tiny ffmpeg pass that
+        Rather than fight the dispatcher, run a tiny ffmpeg pass that
         re-packages whatever container the browser sent (typically
-        webm/opus on Chrome,mp4/aac on Safari) into a plain
-        ``RIFF....WAVE`` PCM-16 WAV at 16 kHz mono。 docling's first
-        waterfall stage recognises WAV by magic bytes,routes to
-        AudioPipeline,Whisper runs。 Same downstream pipeline that
-        already works for ``.wav`` uploads。
+        webm/opus on Chrome, mp4/aac on Safari) into a plain
+        ``RIFF....WAVE`` PCM-16 WAV at 16 kHz mono. docling's first
+        waterfall stage recognizes WAV by magic bytes, routes to
+        AudioPipeline, and Whisper runs — the same downstream pipeline
+        that already works for ``.wav`` uploads.
 
     Performance:
-        For a 60-second browser recording (~100 KB opus,~1.9 MB
-        as wav at 16k mono) the transcode runs in ~150 ms on a
-        modern CPU ─ negligible compared to the 1-3 second Whisper
-        inference that follows。 The wav is bigger on disk but
-        nobody keeps it ─ the caller unlinks it after the response。
+        For a 60-second browser recording (~100 KB opus, ~1.9 MB as wav
+        at 16k mono) the transcode runs in ~150 ms on a modern CPU —
+        negligible compared to the 1-3 second Whisper inference that
+        follows. The wav is bigger on disk but nobody keeps it — the
+        caller unlinks it after the response.
 
     Args:
-        input_path: Source audio path。 ffmpeg auto-detects the
+        input_path: Source audio path. ffmpeg auto-detects the
             container from content, so the extension can be wrong
-            or missing。
+            or missing.
 
     Returns:
-        Path to a new ``.wav`` temp file。 Caller owns it (unlink
-        when done)。
+        Path to a new ``.wav`` temp file. Caller owns it (unlink
+        when done).
 
     Raises:
-        RuntimeError: ffmpeg failure。 Caller should surface this
-            as a 502 so the FE knows to retry。
+        RuntimeError: ffmpeg failure. Caller should surface this
+            as a 502 so the frontend knows to retry.
     """
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
@@ -196,19 +197,9 @@ def _transcode_to_wav(input_path: str) -> str:
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", input_path,
-        "-vn",          # belt-and-braces:browser blobs are audio-only,
-                        # but a stray cover-art image inside a webm/mp4
-                        # would otherwise become a video stream and break
-                        # the WAV output。 The ffmpeg `-vn` flag matches
-                        # the audio-pipeline gotcha we hit on YouTube
-                        # downloads ─ keeping it here as a deliberate
-                        # invariant。
-        "-ar", "16000",  # Whisper's native sample rate ─ saves an internal
-                         # resample step。
-        "-ac", "1",      # Mono。 Browser mic captures are nearly always
-                         # mono already;forcing it here avoids a
-                         # downstream stereo-to-mono fold for the rare
-                         # multi-channel input。
+        "-vn",           # drop any stray cover-art stream that would break WAV output
+        "-ar", "16000",  # Whisper's native sample rate — avoids an internal resample
+        "-ac", "1",      # mono
         "-f", "wav",
         out_path,
     ]
@@ -220,7 +211,7 @@ def _transcode_to_wav(input_path: str) -> str:
 
 
 def _fmt_size(n: int) -> str:
-    """Human-friendly byte size:1234 → '1.2 KB'。"""
+    """Human-friendly byte size: 1234 → '1.2 KB'."""
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
@@ -228,21 +219,21 @@ def _fmt_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
-# Response = json (預設) 含 {text, language, duration, segments[]} 或 plain text (response_format=text)
+# Response = json (default) with {text, language, duration, segments[]}, or plain text (response_format=text)
 @router.post(
     "/transcriptions/general",
-    summary="Audio → text(跟隨 rag.asr.provider)",
-    description="OpenAI-compatible-ish 多媒體 STT 端點。後端跟隨 config rag.asr.provider:docling-whisper(共用已 load 的 Whisper turbo,支援 language/prompt)或 fireredasr / openai-compatible(與索引同一 AsrProvider;language/prompt 忽略)。",
+    summary="Audio → text (follows rag.asr.provider)",
+    description="OpenAI-compatible-ish media STT endpoint. Backend follows config rag.asr.provider: docling-whisper (shares the loaded Whisper turbo, supports language/prompt) or fireredasr / openai-compatible (same AsrProvider as indexing; language/prompt ignored).",
     responses={
         200: {
             "description": "json: {text, language, duration, segments} / text: plain transcript",
             "content": {
-                "application/json": {"example": {"text": "今天天氣很好。", "language": "zh", "duration": 12.3}},
-                "text/plain": {"example": "今天天氣很好。"},
+                "application/json": {"example": {"text": "The weather is nice today.", "language": "zh", "duration": 12.3}},
+                "text/plain": {"example": "The weather is nice today."},
             },
         },
-        415: {"model": ErrorDetailResponse, "description": "不支援的音檔格式"},
-        500: {"model": ErrorDetailResponse, "description": "Whisper 推論失敗"},
+        415: {"model": ErrorDetailResponse, "description": "Unsupported audio format"},
+        500: {"model": ErrorDetailResponse, "description": "Whisper inference failed"},
     },
 )
 async def transcribe(
@@ -254,12 +245,12 @@ async def transcribe(
     strip_hallucinations: bool = Form(True),
 ):
     """Args:
-        audio:                 音檔(mp3 / wav / m4a / flac / ogg / aac / opus)— 對齊 mistt 欄位名
-        language:              ISO-639-1 語言碼(例:'zh' / 'en' / 'ja');None = Whisper 自動偵測
-        prompt:                上下文提示給 Whisper(專有名詞 / 領域術語 bias),預設 None
-        response_format:       json | text(預設 json)
-        trim_leading_silence:  是否先用 ffmpeg silencedetect 砍掉開頭沉默(預設 True)
-        strip_hallucinations:  是否套 Whisper 幻覺過濾 + 重複收斂(預設 True)
+        audio:                 Audio file (mp3 / wav / m4a / flac / ogg / aac / opus) — field name aligned with mistt
+        language:              ISO-639-1 language code (e.g. 'zh' / 'en' / 'ja'); None = Whisper auto-detect
+        prompt:                Context hint for Whisper (bias toward proper nouns / domain terms); default None
+        response_format:       json | text (default json)
+        trim_leading_silence:  Whether to first strip leading silence with ffmpeg silencedetect (default True)
+        strip_hallucinations:  Whether to apply Whisper hallucination filtering + repetition collapse (default True)
     """
     t_start = time.time()
     file_name = audio.filename or "audio"
@@ -287,17 +278,8 @@ async def transcribe(
     transcoded_path: Optional[str] = None
     effective_path = src_path
     try:
-        # ── Transcode-to-wav for docling-unfriendly containers ──
-        # Browser MediaRecorder produces ``.webm`` on Chrome / Edge ─
-        # docling's format dispatcher (magic-byte first stage) tags
-        # the bytes as webm and has no webm → audio mapping。 When
-        # whisper-direct is unavailable the request falls back to
-        # docling-asr,which then rejects the file。 The fix is to
-        # re-package the audio into a plain WAV (PCM-16 16 kHz mono)
-        # via ffmpeg before any downstream step ─ both whisper-direct
-        # and docling-asr accept WAV unconditionally。 We only do this
-        # for the docling-unfriendly extensions to keep the happy
-        # path (``.mp3`` / ``.wav`` etc.) at zero overhead。
+        # Transcode docling-unfriendly containers (e.g. browser .webm) to WAV first;
+        # see _transcode_to_wav. Skip the safe extensions to keep the happy path overhead-free.
         if ext not in _DOCLING_AUDIO_SAFE_EXTS:
             t_transcode = time.time()
             try:
@@ -338,27 +320,27 @@ async def transcribe(
                 trim_elapsed = time.time() - t_trim
                 logger.warning(
                     f"[transcribe] ⚠ trim failed for {file_name} "
-                    f"(elapsed={trim_elapsed:.2f}s,使用原始檔): {e}"
+                    f"(elapsed={trim_elapsed:.2f}s, using original file): {e}"
                 )
 
         cfg_provider, cfg_provider_name = _get_config_asr_provider()
         whisper_model = None if cfg_provider is not None else _get_loaded_whisper()
         if cfg_provider is not None:
             if not cfg_provider.available():
-                # config 選定的模型不可用 → 明確 503,不偷換別的模型
+                # The config-selected model is unavailable -> explicit 503; do not swap in another model
                 logger.error(
                     f"[transcribe] ✗ configured provider {cfg_provider_name} unavailable "
                     "(weights/endpoint not ready)"
                 )
                 raise HTTPException(
                     503,
-                    f"rag.asr.provider={cfg_provider_name} 不可用(權重/端點未就緒)— "
-                    "檢查 assets/ 權重或 rag.asr 設定",
+                    f"rag.asr.provider={cfg_provider_name} unavailable (weights/endpoint not ready) — "
+                    "check assets/ weights or the rag.asr configuration",
                 )
             backend = f"asr-provider:{cfg_provider_name}"
             if language or prompt:
                 logger.info(
-                    f"[transcribe] · language/prompt 參數對 {cfg_provider_name} 不適用,忽略"
+                    f"[transcribe] · language/prompt not applicable to {cfg_provider_name}, ignored"
                 )
         else:
             backend = "whisper-direct" if whisper_model is not None else "docling-asr"
@@ -373,8 +355,8 @@ async def transcribe(
         t_lock_request = time.time()
 
         if cfg_provider is not None:
-            # config 指定的 AsrProvider(fireredasr / openai-compatible)—
-            # 與索引路徑同一實作;fireredasr 內部自帶推論鎖(FIRERED_INFER_LOCK)
+            # The config-specified AsrProvider (fireredasr / openai-compatible) —
+            # same implementation as the indexing path; fireredasr has its own internal inference lock (FIRERED_INFER_LOCK)
             def _run_cfg_provider():
                 t_compute = time.time()
                 r = cfg_provider.transcribe(
@@ -385,9 +367,9 @@ async def transcribe(
             text = text.strip()
             detected_lang = None
         elif whisper_model is not None:
-            # 直接呼叫底層 whisper.Whisper.transcribe → 完整 language + initial_prompt 控制
-            # 用 lock serialize 避免 KV-cache race(PyTorch transformer 不是 thread-safe)。
-            # 內部分別計時 lock-wait 跟真推論,讓 metric 區分 queue / compute 兩種延遲。
+            # Call the underlying whisper.Whisper.transcribe directly -> full language + initial_prompt control.
+            # Serialize with a lock to avoid the KV-cache race (PyTorch transformer is not thread-safe).
+            # Time lock-wait and actual inference separately so the metric distinguishes queue vs compute latency.
             def _run_whisper():
                 with _WHISPER_INFER_LOCK:
                     t_compute = time.time()
@@ -404,7 +386,7 @@ async def transcribe(
             text = result.get("text", "").strip()
             detected_lang = result.get("language")
         else:
-            # AsrPipeline 還沒 warm → fallback docling.convert(失去 language/prompt)
+            # AsrPipeline isn't warm yet -> fall back to docling.convert (loses language/prompt)
             def _run_docling_asr():
                 with _DOCLING_INFER_LOCK:
                     t_compute = time.time()
@@ -454,8 +436,8 @@ async def transcribe(
         logger.info(f"[transcribe] · preview: {_preview(text)!r}")
 
         if response_format == "text":
-            # PlainTextResponse 才會正確設 Content-Type: text/plain
-            # 否則 FastAPI 預設 JSON 序列化會把 str 包成 "..."(整段引號 + escape)
+            # Only PlainTextResponse sets Content-Type: text/plain correctly
+            # Otherwise FastAPI's default JSON serialization wraps the str as "..." (whole thing quoted + escaped)
             return PlainTextResponse(content=text, media_type="text/plain; charset=utf-8")
 
         return {
@@ -486,11 +468,11 @@ async def transcribe(
         _unlink_safe(src_path)
 
 
-# Response = json {text, pages, mime_type} 或 plain text (response_format=text)
+# Response = json {text, pages, mime_type}, or plain text (response_format=text)
 @router.post(
     "/ocr/general",
     summary="Image / PDF → text via Docling OCR",
-    description="共用 Docling 已 load 的 OCR pipeline(RapidOCR torch backend)。",
+    description="Shares the OCR pipeline already loaded by Docling (RapidOCR torch backend).",
     responses={
         200: {
             "description": "json: {text, pages, mime_type} / text: plain extracted text",
@@ -499,8 +481,8 @@ async def transcribe(
                 "text/plain": {"example": "..."},
             },
         },
-        415: {"model": ErrorDetailResponse, "description": "不支援的圖檔 / PDF 格式"},
-        500: {"model": ErrorDetailResponse, "description": "OCR 推論失敗"},
+        415: {"model": ErrorDetailResponse, "description": "Unsupported image / PDF format"},
+        500: {"model": ErrorDetailResponse, "description": "OCR inference failed"},
     },
 )
 async def ocr(
@@ -508,8 +490,8 @@ async def ocr(
     response_format: str = Form("json"),
 ):
     """Args:
-        file:             圖片或 PDF(png / jpg / bmp / tiff / webp / pdf …)
-        response_format:  json | text(預設 json)
+        file:             Image or PDF (png / jpg / bmp / tiff / webp / pdf …)
+        response_format:  json | text (default json)
     """
     t_start = time.time()
     file_name = file.filename or "image"
@@ -538,8 +520,8 @@ async def ocr(
             logger.info("[ocr] · docling pipeline start")
         t_lock_request = time.time()
 
-        # docling 的 PdfPipeline 內有 TableFormer transformer + RapidOCR session,
-        # 同樣 thread-safety 顧慮,serialize。同步分計 lock-wait / compute。
+        # docling's PdfPipeline contains a TableFormer transformer + RapidOCR session,
+        # with the same thread-safety concern, so serialize. Time lock-wait / compute separately.
         def _run_docling_ocr():
             with _DOCLING_INFER_LOCK:
                 t_compute = time.time()
@@ -586,15 +568,15 @@ async def ocr(
 
 
 # Response = {object: "list", data: [{id, object, type, owned_by, backend, warmed}, ...]}
-# 對齊 OpenAI /v1/models 風格;type ∈ "transcription" / "ocr"
+# Mirrors the OpenAI /v1/models style; type ∈ "transcription" / "ocr"
 @router.get(
     "/models",
     summary="List loaded media models",
-    description="回報 Docling 已 load 的 STT / OCR pipeline 狀態。",
+    description="Reports the status of the STT / OCR pipelines loaded by Docling.",
     responses={500: {"model": ErrorDetailResponse}},
 )
 async def list_models():
-    """OpenAI `/v1/models` 風格的回應。"""
+    """OpenAI `/v1/models`-style response."""
     try:
         from docling.datamodel.base_models import InputFormat
         converter = get_converter()

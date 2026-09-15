@@ -1,22 +1,24 @@
 
-"""FireRedASR-AED-L 本地 provider(BL-08)。
+"""Local FireRedASR-AED-L provider.
 
-工程約束(模型卡與上游 issue 實證):
-- **60s 輸入硬上限**:>60s 開始幻覺、>200s 位置編碼越界 → 先用 ffmpeg
-  silencedetect 找靜音點,貪婪切成 ≤55s 段(留 5s 安全邊);整段無靜音
-  時硬切 55s。
-- **16kHz mono**:ffmpeg 統一重採樣(任何來源格式 → pcm_s16le wav)。
-- **輸出簡體**:AED 訓練語料為簡中 → OpenCC `s2twp`(簡→繁+台灣用語)
-  後處理,繁中驗收由 evals 的簡體字比率把關。
-- **AED 無標點**:輸出交 leaf_splitter 純文字路徑(chunks=None)。
+Engineering constraints (from the model card and upstream issues):
+- **60s hard input limit**: >60s starts hallucinating, >200s overflows the
+  positional encoding. Use ffmpeg silencedetect to find silence points and
+  greedily split into <=55s segments (5s safety margin); hard-cut at 55s when
+  a stretch has no silence.
+- **16kHz mono**: ffmpeg resamples every source format to pcm_s16le wav.
+- **Simplified-Chinese output**: the AED training corpus is Simplified Chinese,
+  so post-process with OpenCC `s2twp` (Simplified -> Traditional + Taiwan
+  terminology); Traditional-Chinese output is gated by the Simplified-character
+  ratio check in evals.
+- **No punctuation**: AED output has no punctuation, so it goes down the
+  leaf_splitter plain-text path (chunks=None).
 
-程式碼來源:vendor/fireredasr_src(官方 FireRedTeam/FireRedASR,Apache-2.0,
-無 PyPI 發佈故 vendor;以 uv path dependency 裝進 site-packages,Nuitka
-打包時隨依賴編進 binary — 部署不需外帶 vendor/;見該目錄 README)。
-權重:assets/fireredasr/FireRedASR-AED-L/(~4.7GB,不進 repo,要外帶)。
+Weights: assets/fireredasr/FireRedASR-AED-L/ (~4.7GB, shipped separately).
 
-模型載入為 lazy singleton(首次 transcribe 才載,與 docling converter 同
-模式);推論鎖序列化 — 1.1B 模型並發 forward 會 OOM。
+The model loads as a lazy singleton (first transcribe loads it, same pattern as
+the docling converter); the inference lock serializes calls because concurrent
+forward passes on the 1.1B model cause OOM.
 """
 
 from __future__ import annotations
@@ -33,21 +35,24 @@ from src.domain.rag.asr_base import AsrProvider, AsrResult
 
 logger = get_api_logger()
 
-# 60s 硬上限留 5s 安全邊(模型卡:>60s 幻覺、>200s 位置編碼越界)
+# 55s = 60s hard limit minus a 5s safety margin (model card: >60s hallucinates,
+# >200s overflows the positional encoding).
 MAX_SEGMENT_SECONDS = 55.0
-# silencedetect 參數:-35dB 以下持續 0.3s 視為靜音(會議語音的自然停頓)
+# silencedetect parameters: below -35dB for 0.3s counts as silence (a natural
+# pause in meeting speech).
 _SILENCE_FILTER = "silencedetect=noise=-35dB:d=0.3"
 
 _model_lock = threading.Lock()
 _model = None  # lazy singleton: (FireRedAsr, use_gpu)
-# 推論鎖:索引路徑(document_loader)與 media 的 /v1/transcriptions 共用同
-# 一顆 1.1B 模型 instance,並發 forward 會 KV-cache race / OOM(與 docling
-# 的 DOCLING_INFER_LOCK 同理)。所有 model.transcribe 都必須在這把鎖內。
+# Inference lock: the indexing path (document_loader) and media's
+# /v1/transcriptions share the same single 1.1B model instance; concurrent
+# forward passes cause KV-cache races / OOM (same rationale as docling's
+# DOCLING_INFER_LOCK). Every model.transcribe call must hold this lock.
 FIRERED_INFER_LOCK = threading.Lock()
 
 
 def _resolve_model_dir() -> Optional[Path]:
-    """權重目錄:assets/fireredasr/FireRedASR-AED-L(model.pth.tar 在才算就緒)。"""
+    """Weights directory assets/fireredasr/FireRedASR-AED-L (ready only if model.pth.tar exists)."""
     from src.domain.rag.docling_loader import resolve_assets_dir
     assets = resolve_assets_dir()
     if assets is None:
@@ -57,29 +62,33 @@ def _resolve_model_dir() -> Optional[Path]:
 
 
 def _load_model(model_dir: Path):
-    """載入 AED 模型(singleton;fireredasr 為已安裝套件,正常 import)。"""
+    """Load the AED model (singleton; fireredasr is an installed package, imported normally)."""
     global _model
     with _model_lock:
         if _model is not None:
             return _model
         import torch
-        # fireredasr = uv path dependency(vendor/fireredasr_src 裝進
-        # site-packages)→ 正常 import,Nuitka 打包時當一般依賴編進 binary,
-        # 部署不需外帶 vendor/。缺套件時給可行動錯誤(而非裸 ImportError)。
+        # fireredasr is a uv path dependency (vendor/fireredasr_src installed
+        # into site-packages), so it imports normally and Nuitka compiles it
+        # into the binary like any dependency; deployment does not need
+        # vendor/. Raise an actionable error (rather than a bare ImportError)
+        # when the package is missing.
         try:
             from fireredasr.models.fireredasr import FireRedAsr
         except ImportError as e:
             raise RuntimeError(
-                "fireredasr 套件不可 import — 開發環境跑 `uv sync --group <gpu>`"
-                "(path dep 指向 vendor/fireredasr_src);打包環境確認 Nuitka 有"
-                "收錄 fireredasr(必要時加 --include-package=fireredasr)"
+                "fireredasr package cannot be imported — in dev run "
+                "`uv sync --group <gpu>` (path dep points at vendor/fireredasr_src); "
+                "for packaged builds ensure Nuitka bundles fireredasr "
+                "(add --include-package=fireredasr if needed)"
             ) from e
 
         use_gpu = torch.cuda.is_available()
         logger.info(f"[FIREREDASR] loading AED-L from {model_dir} (gpu={use_gpu})")
-        # torch 2.6+ 預設 weights_only=True,官方 checkpoint 的 "args" 是
-        # argparse.Namespace → 需白名單放行(僅此類;其餘反序列化保護不變,
-        # 也不改 vendor 程式碼)
+        # torch 2.6+ defaults to weights_only=True, but the official
+        # checkpoint's "args" is an argparse.Namespace, which must be
+        # allowlisted (only this type; all other deserialization protections
+        # stay unchanged, and vendor code is not modified).
         import argparse
         with torch.serialization.safe_globals([argparse.Namespace]):
             model = FireRedAsr.from_pretrained("aed", str(model_dir))
@@ -88,15 +97,13 @@ def _load_model(model_dir: Path):
         return _model
 
 
-# ---------------------------------------------------------------------------
-# 切段規劃(純函式,可單測)
-# ---------------------------------------------------------------------------
+# Segment planning (pure functions, unit-testable)
 
 def parse_silences(ffmpeg_stderr: str) -> List[Tuple[float, float]]:
-    """從 ffmpeg silencedetect stderr 抽 (silence_start, silence_end) 對。
+    """Extract (silence_start, silence_end) pairs from ffmpeg silencedetect stderr.
 
-    末段 silence 可能只有 start(檔案在靜音中結束)— 丟棄不完整對即可,
-    切段規劃只需要「檔案中間」的靜音。
+    The final silence may have only a start (the file ends in silence); drop the
+    incomplete pair, since segment planning only needs silences within the file.
     """
     starts = [float(m) for m in re.findall(r"silence_start:\s*([\d.]+)", ffmpeg_stderr)]
     ends = [float(m) for m in re.findall(r"silence_end:\s*([\d.]+)", ffmpeg_stderr)]
@@ -108,11 +115,14 @@ def plan_segments(
     silences: List[Tuple[float, float]],
     max_seg: float = MAX_SEGMENT_SECONDS,
 ) -> List[Tuple[float, float]]:
-    """貪婪切段:每段 ≤ max_seg,切點取「窗內最後一個靜音的中點」。
+    """Greedy segmentation: each segment <= max_seg, cutting at the midpoint of
+    the last silence within the window.
 
-    - duration ≤ max_seg → 單段
-    - 窗內無靜音 → 硬切 max_seg(寧可切在字中間,也不能餵 >60s 產生幻覺)
-    - 靜音中點 = 停頓中央,兩側語音都完整
+    - duration <= max_seg -> single segment
+    - no silence in the window -> hard-cut at max_seg (better to cut mid-word
+      than to feed >60s and trigger hallucination)
+    - the silence midpoint sits at the center of the pause, leaving the speech
+      on both sides intact
     """
     if duration <= max_seg:
         return [(0.0, duration)]
@@ -129,9 +139,7 @@ def plan_segments(
     return segments
 
 
-# ---------------------------------------------------------------------------
-# 音訊前處理(ffmpeg)
-# ---------------------------------------------------------------------------
+# Audio preprocessing (ffmpeg)
 
 def _resample_to_wav16k(src: str, dst: Path) -> None:
     proc = subprocess.run(
@@ -140,7 +148,7 @@ def _resample_to_wav16k(src: str, dst: Path) -> None:
         capture_output=True, text=True, timeout=600,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg 重採樣失敗: {proc.stderr[-500:]}")
+        raise RuntimeError(f"ffmpeg resample failed: {proc.stderr[-500:]}")
 
 
 def _detect_silences(wav_path: Path) -> List[Tuple[float, float]]:
@@ -149,12 +157,14 @@ def _detect_silences(wav_path: Path) -> List[Tuple[float, float]]:
          "-af", _SILENCE_FILTER, "-f", "null", "-"],
         capture_output=True, text=True, timeout=600,
     )
-    # silencedetect 寫 stderr;非零退出也照 parse(空清單 → 硬切,不擋轉錄)
+    # silencedetect writes to stderr; parse even on a non-zero exit (an empty
+    # list falls back to hard-cutting rather than blocking transcription).
     return parse_silences(proc.stderr)
 
 
 def _slice_wav(wav_path: Path, segments: List[Tuple[float, float]], out_dir: Path) -> List[Path]:
-    """stdlib wave 切段(16k mono pcm16,一次讀入切 N 份,比 N 次 ffmpeg 快)。"""
+    """Slice with the stdlib wave module (16k mono pcm16; read once and split
+    into N pieces, faster than N ffmpeg invocations)."""
     paths: List[Path] = []
     with wave.open(str(wav_path), "rb") as w:
         rate = w.getframerate()
@@ -173,11 +183,11 @@ def _slice_wav(wav_path: Path, segments: List[Tuple[float, float]], out_dir: Pat
 
 
 class FireRedAsrProvider(AsrProvider):
-    """本地 FireRedASR-AED-L(切段 → 逐段推論 → 拼接 → s2twp 繁化)。"""
+    """Local FireRedASR-AED-L (segment -> per-segment inference -> concatenate -> s2twp to Traditional Chinese)."""
 
     def __init__(self, *, beam_size: int = 3):
         self._beam_size = beam_size
-        self._s2twp = None  # lazy(opencc 載字典)
+        self._s2twp = None  # lazy (opencc loads its dictionaries)
 
     def available(self) -> bool:
         return _resolve_model_dir() is not None
@@ -189,14 +199,15 @@ class FireRedAsrProvider(AsrProvider):
         return self._s2twp.convert(text)
 
     def _transcribe_segments(self, seg_paths: List[Path]) -> List[str]:
-        """逐段推論(不 batch:段長已近上限,batch pad 只會浪費;OOM 風險低)。"""
+        """Per-segment inference (no batching: segments are already near the length
+        limit, so batch padding only wastes work and OOM risk is low)."""
         model_dir = _resolve_model_dir()
-        if model_dir is None:  # available() 守過,這裡是二次防禦
+        if model_dir is None:  # available() already guards this; second line of defense
             raise RuntimeError("FireRedASR 權重不在 assets/fireredasr/FireRedASR-AED-L")
         model, use_gpu = _load_model(model_dir)
         texts: List[str] = []
         for p in seg_paths:
-            with FIRERED_INFER_LOCK:  # 索引與 media STT 共用模型,序列化推論
+            with FIRERED_INFER_LOCK:  # indexing and media STT share the model; serialize inference
                 results = model.transcribe(
                     [p.stem], [str(p)],
                     {"use_gpu": use_gpu, "beam_size": self._beam_size, "nbest": 1},

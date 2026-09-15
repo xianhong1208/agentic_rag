@@ -1,22 +1,13 @@
 
-"""RAG 檢索評測 harness — 把「感覺準不準」變成可比較的指標數據。
+"""RAG retrieval evaluation harness — turn subjective accuracy into comparable metrics.
 
-用法:
-    uv run --no-sync python scripts/rag_eval.py --folder <名稱或ID> --n 20
+Usage:
+    uv run --no-sync python scripts/rag_eval.py --folder <name or ID> --n 20
 
-流程:
-    1) generate:從該 folder 已索引的 leaf chunk 隨機抽 N 段,用 config 的 LLM
-       各生成一個「答案就在這段裡」的繁中問題 → 標註集(gold = 該 chunk node_id)。
-       存到 reports/eval_set_<folder>.jsonl,下次帶 --eval-set 重用(免重生)。
-    2) eval:每題分別用 vector / hybrid / hybrid+rerank 三種檢索,算出 gold chunk
-       的名次,彙總 Recall@k、MRR、nDCG@k,印對照表 + 寫 reports/rag_eval_<folder>.json。
-
-指標(單一相關 chunk 的檢索評測):
-    Recall@k = gold 是否落在 top-k(命中率)
-    MRR      = 1 / gold 名次(名次越前越高)
-    nDCG@k   = 1 / log2(gold名次+1),gold 不在 top-k 記 0(排序品質,懲罰排後面)
-
-這是「先量測再優化」的基準:改 BM25 斷詞 / rerank 參數後,重跑同一標註集比分數。
+Samples N indexed leaf chunks, uses the configured LLM to generate one question
+per chunk (gold = that chunk's node_id), then runs vector / hybrid / rrf / rerank
+retrieval and reports Recall@k, MRR, and nDCG@k for each mode. The eval set is
+cached under reports/ and reused so scores are comparable across parameter changes.
 """
 from __future__ import annotations
 
@@ -42,7 +33,7 @@ def _resolve_folder(folder_arg: str):
 
 
 def _sample_chunks(folder, n: int):
-    """從 folder 的 pgvector 物理表隨機抽 n 段 leaf chunk(node_id, text)。"""
+    """Randomly sample n leaf chunks (node_id, text) from the folder's pgvector physical table."""
     from sqlalchemy import text
     from db.db import get_engine
     from src.domain.rag.vector_store_manager import VectorStoreManager
@@ -60,8 +51,8 @@ def _gen_question(client, model: str, chunk_text: str) -> str:
         "以下是一份文件的片段。請生成一個使用者可能會問、且答案明確就在這段文字裡的"
         "繁體中文問題。問題要具體(可含專有名詞),不要用「這段文字」這種指涉詞。"
         "只輸出問題本身,不要任何前綴。\n\n片段:\n" + chunk_text[:1500] + "\n\n問題:")
-    # gpt-oss 等 reasoning 模型會先吃 reasoning token,max_tokens 太小會導致
-    # content 為 None(reasoning 未留額度給答案)→ 給足 1024。
+    # Reasoning models (e.g. gpt-oss) spend reasoning tokens first; too small a
+    # max_tokens leaves content None (no budget left for the answer) -> allow 1024.
     r = client.chat.completions.create(
         model=model, messages=[{"role": "user", "content": prompt}],
         max_tokens=1024, temperature=0.3)
@@ -118,10 +109,11 @@ def _rrf(lists, k, rrf_k=60):
 
 
 async def _rank_of_gold(index, reranker, query: str, gold: str, mode: str, k: int):
-    """回 gold node_id 在該 mode top-k 的名次(1-based),不在則 None。
+    """Return the gold node_id's rank (1-based) in this mode's top-k, or None if absent.
 
-    mode:vector(dense)/ hybrid(llama_index concat)/ rrf(dense+sparse RRF)/
-         rerank(RRF 候選再 cross-encoder rerank — 對齊 production aquery)。
+    mode: vector (dense) / hybrid (llama_index concat) / rrf (dense+sparse RRF) /
+          rerank (cross-encoder rerank over the RRF candidates — matches
+          production aquery).
     """
     retrieve_k = k * 3 if mode == "rerank" else k
     if mode == "vector":
@@ -145,9 +137,9 @@ async def _rank_of_gold(index, reranker, query: str, gold: str, mode: str, k: in
 
 
 async def evaluate(folder, items, k: int, progress=None) -> dict:
-    """跑三路檢索評測,回報告 dict(不印、不寫檔 — 交給呼叫端)。
+    """Run the multi-mode retrieval eval and return a report dict (no printing or file writing — left to the caller).
 
-    progress(done, total) 選填,供 UI 回報進度。
+    progress(done, total) is optional, for a UI to report progress.
     """
     from llama_index.core import VectorStoreIndex
     from src.adapter.rag import get_rag_adapter
@@ -194,9 +186,10 @@ def _print_report(rep: dict):
 
 def run_eval(folder_name: str, n: int = 15, k: int = 10,
              regenerate: bool = False, progress=None) -> dict:
-    """一站式:載入/生成標註集 → 評測 → 寫報告 → 回 dict(CLI 與 API 共用)。
+    """One-stop: load/generate eval set -> evaluate -> write report -> return dict (shared by CLI and API).
 
-    regenerate=True 強制重生標註集(reindex 後 node_id 變,舊集失效時用)。
+    regenerate=True forces regenerating the eval set (use when node_ids have
+    changed after a reindex and the old set is stale).
     """
     folder = _resolve_folder(folder_name)
     slug = str(folder.name).replace("/", "_")
@@ -218,11 +211,13 @@ def run_eval(folder_name: str, n: int = 15, k: int = 10,
 
 async def run_eval_async(folder_name: str, n: int = 15, k: int = 10,
                          regenerate: bool = False, progress=None) -> dict:
-    """run_eval 的 async 版 — **在呼叫端的 event loop 上**跑 evaluate。
+    """Async version of run_eval — runs evaluate on the caller's event loop.
 
-    給伺服器用:必須跑在主 loop(與快取的 PGVectorStore async engine 同 loop),
-    否則 asyncpg 會噴『attached to a different loop』。同步阻塞的問題生成丟
-    executor,不佔 loop。CLI 仍走 run_eval(asyncio.run 自帶 loop,獨立進程無此問題)。
+    For server use: it must run on the main loop (the same loop as the cached
+    PGVectorStore async engine), otherwise asyncpg raises "attached to a
+    different loop". The blocking synchronous question generation is offloaded to
+    an executor so it does not occupy the loop. The CLI still uses run_eval
+    (asyncio.run brings its own loop, and a separate process avoids this issue).
     """
     import datetime
     folder = _resolve_folder(folder_name)

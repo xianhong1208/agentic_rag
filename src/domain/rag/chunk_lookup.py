@@ -1,17 +1,17 @@
 
-"""ChunkLookup — 直接 SQL 查詢 PGVector 表的 metadata,bypass LlamaIndex retrieval
+"""ChunkLookup — query PGVector table metadata directly via SQL, bypassing LlamaIndex retrieval.
 
-為什麼需要這層:
-- LlamaIndex 的 retriever 是「query → embedding → 相似度排序」,
-  不適合「給定 node_id 取單一節點」或「給定 file_id 取一段 chunk_index 區間」這類精確查詢。
-- PGVector 表結構(LlamaIndex 自動建立):
+Why this layer exists:
+- LlamaIndex's retriever is "query → embedding → similarity ranking", which is unsuited to
+  exact lookups like "fetch a single node by node_id" or "fetch a chunk_index range by file_id".
+- PGVector table schema (auto-created by LlamaIndex):
     data_{folder_id}_{uuid}:
         id           bigserial primary key
         text         text
-        metadata_    jsonb        (!! 注意底線後綴 — LlamaIndex 慣例 !!)
+        metadata_    jsonb        (note the trailing underscore — a LlamaIndex convention)
         node_id      varchar
         embedding    vector(N)
-- 用 JSONB operator (->>) 查 metadata 比走 LlamaIndex 抽象層快 10-100 倍。
+- Querying metadata with the JSONB operator (->>) is 10-100x faster than going through LlamaIndex's abstraction layer.
 """
 
 from __future__ import annotations
@@ -28,26 +28,17 @@ logger = get_api_logger()
 
 
 class ChunkLookup:
-    """無狀態工具類 — 全部是 staticmethod"""
+    """Stateless utility class — everything is a staticmethod."""
 
     @staticmethod
     def _get_table_name(vector_store: PGVectorStore) -> str:
-        """取得 PGVectorStore 對應的 SQL table 名(含 `data_` 前綴)。
-
-        對不同 LlamaIndex 版本的內部屬性做容錯抽取。
-
-        Args:
-            vector_store: PGVectorStore instance。
-
-        Returns:
-            完整 table 名,例如 `data_5_<uuid>`;抽不到 raise ValueError。
-        """
-        # 主路徑:vector_store.table_name(較新版本)
+        """Return the full SQL table name (incl. `data_` prefix), tolerant across
+        LlamaIndex versions; raises if it can't be determined."""
         name = getattr(vector_store, "table_name", None)
         if name:
             return name if name.startswith("data_") else f"data_{name}"
 
-        # 備援:從 _table_class 取
+        # Fallback: read from _table_class
         table_class = getattr(vector_store, "_table_class", None)
         if table_class is not None:
             return table_class.__tablename__
@@ -58,46 +49,29 @@ class ChunkLookup:
 
     @staticmethod
     def _get_engine(vector_store: PGVectorStore):
-        """取得 SQLAlchemy engine — 統一走 db.db.get_engine() 避開雙軌 pool。
-
-        舊版自建 cache 沒 health check;DB 重啟後 cached engine 壞掉到 server restart。
-        現在 PGVectorStore 已 lazy-init 的就用它,否則走主 engine。
-
-        Args:
-            vector_store: PGVectorStore instance。
-
-        Returns:
-            SQLAlchemy engine。
+        """Return a SQLAlchemy engine. Prefer the one LlamaIndex already built (avoids
+        a dual-track pool); otherwise use the shared main engine. A self-built cache
+        would have no health check and stay broken after a DB restart.
         """
-        # 優先用 LlamaIndex 已建好的(避免雙寫不一致)
         existing = getattr(vector_store, "_engine", None)
         if existing is not None:
             return existing
 
-        # PGVector 跟 metadata 表共用同一個 DB,直接用主 engine
         from db.db import get_engine
         return get_engine()
 
-    # ----------------------------------------------------------------------
-    # Async batched API — 查詢熱路徑用
-    # 一次 search 會需要 N 個 parent 計數 + M 個鄰居窗口;逐筆查是 N+1
-    # (10-30 次串行 round trip)。這裡全部批次成單一查詢,並走 async engine
-    # 不佔 event loop。sync 版保留給非熱路徑(read mode / 舊呼叫端)。
-    # ----------------------------------------------------------------------
+    # Async batched API for the query hot path: batch N parent counts + M neighbor
+    # windows into single queries on the async engine, avoiding N+1 serial round
+    # trips. Sync versions below remain for non-hot paths (read mode / older callers).
 
     @staticmethod
     async def aget_parent_children_counts(
         vector_store: PGVectorStore, parent_ids: List[str],
     ) -> Dict[str, int]:
-        """批次讀多個 parent 的 chunk_count(單一查詢)。
+        """Batch-read chunk_count for multiple parents in one query.
 
-        Args:
-            vector_store: 目標 folder 的 PGVectorStore。
-            parent_ids: parent node_id list。
-
-        Returns:
-            {parent_id: chunk_count};查不到的 id 不在 dict 裡。DB 失敗回空 dict
-            (fail-open:caller 視為 count=0 → 不觸發 merge,檢索仍有結果)。
+        Returns {parent_id: chunk_count}; missing ids are absent. Fail-open on DB
+        error (empty dict → caller treats as count=0, no merge, retrieval still works).
         """
         if not parent_ids:
             return {}
@@ -122,10 +96,10 @@ class ChunkLookup:
     async def afetch_nodes(
         vector_store: PGVectorStore, node_ids: List[str],
     ) -> Dict[str, TextNode]:
-        """批次撈多個 node 的完整內容(單一查詢)。
+        """Batch-fetch the full content of multiple nodes (single query).
 
         Returns:
-            {node_id: TextNode};查不到的不在 dict。DB 失敗回空 dict。
+            {node_id: TextNode}; nodes not found are absent from the dict. On DB failure returns an empty dict.
         """
         if not node_ids:
             return {}
@@ -154,18 +128,11 @@ class ChunkLookup:
         requests: List[Tuple[str, int]],
         n: int,
     ) -> List[dict]:
-        """批次撈多個 (file_id, center_chunk_index±n) 鄰居窗口(單一查詢)。
+        """Batch-fetch multiple (file_id, center_chunk_index±n) neighbor windows in one query.
 
-        SQL 用 OR-chain 的參數化區間條件(每窗 3 個 bind param,top_k≤10 → 條件
-        數有限);Python 端再按窗口切分。窗口可能互相重疊,各窗獨立取自己的列。
-
-        Args:
-            vector_store: 目標 folder 的 PGVectorStore。
-            requests: [(file_id, center_chunk_index), ...],順序保留。
-            n: 左右各展開的鄰居數。
-
-        Returns:
-            與 requests 等長的 dict list,格式同 fetch_neighbor_window。
+        Uses an OR-chain of parameterized range conditions, then splits by window on
+        the Python side; overlapping windows each take their own rows. Returns a list
+        the same length/order as requests, each in fetch_neighbor_window's format.
         """
         empty = lambda c: {"text": "", "index_range": [c, c], "chunks": []}  # noqa: E731
         if not requests:
@@ -201,7 +168,7 @@ class ChunkLookup:
             logger.warning(f"afetch_neighbor_windows failed ({len(requests)} windows): {e}")
             return [empty(c) for _, c in requests]
 
-        # 按 file_id 分桶後,各窗自取區間(窗口重疊時同列可進多窗)
+        # Bucket by file_id, then each window takes its own range (an overlapping window can include the same row)
         by_file: Dict[str, List[Tuple[int, str]]] = {}
         for fid, txt, idx in rows:
             by_file.setdefault(fid, []).append((idx, txt))
@@ -224,13 +191,9 @@ class ChunkLookup:
             })
         return results
 
-    # ----------------------------------------------------------------------
-    # Public API
-    # ----------------------------------------------------------------------
-
     @staticmethod
     def get_parent_children_count(vector_store: PGVectorStore, parent_id: str) -> int:
-        """從 parent node 的 metadata 讀 chunk_count(由 hierarchy.build_hierarchy 寫入)"""
+        """Read chunk_count from a parent node's metadata (written by hierarchy.build_hierarchy)."""
         table = ChunkLookup._get_table_name(vector_store)
         engine = ChunkLookup._get_engine(vector_store)
 
@@ -251,7 +214,7 @@ class ChunkLookup:
 
     @staticmethod
     def fetch_node(vector_store: PGVectorStore, node_id: str) -> Optional[TextNode]:
-        """撈單一 node(leaf 或 parent)的完整內容"""
+        """Fetch the full content of a single node (leaf or parent)."""
         table = ChunkLookup._get_table_name(vector_store)
         engine = ChunkLookup._get_engine(vector_store)
 
@@ -282,11 +245,11 @@ class ChunkLookup:
         center_chunk_index: int,
         n: int,
     ) -> dict:
-        """撈 (file_id, chunk_index ± n) 的 leaf chunks,順序拼接
+        """Fetch the (file_id, chunk_index ± n) leaf chunks and join them in order.
 
         Returns:
             {
-                "text": "拼接後的擴展段落",
+                "text": "the joined, expanded passage",
                 "index_range": [start, end],
                 "chunks": [{"chunk_index": i, "text": "..."}, ...]
             }
@@ -297,7 +260,7 @@ class ChunkLookup:
         start = max(center_chunk_index - n, 0)
         end = center_chunk_index + n
 
-        # 向下相容:legacy chunks(舊版 flat 索引)沒有 node_role,視為 leaf 也撈
+        # Backward compatibility: legacy chunks (old flat index) have no node_role; treat them as leaves and fetch too
         query = sql_text(f"""
             SELECT
                 node_id,
@@ -333,11 +296,11 @@ class ChunkLookup:
 
     @staticmethod
     def fetch_file_full(vector_store: PGVectorStore, file_id: str, max_tokens: int = 30000) -> dict:
-        """撈整份檔案的所有 leaf chunks,順序拼成全文(供 mode='read' 用)
+        """Fetch all leaf chunks of an entire file and join them in order into the full text (for mode='read').
 
         Returns:
             {
-                "text": "完整文字",
+                "text": "the full text",
                 "tokens_estimated": int,
                 "truncated": bool,
                 "chunk_count": int,
@@ -346,7 +309,7 @@ class ChunkLookup:
         table = ChunkLookup._get_table_name(vector_store)
         engine = ChunkLookup._get_engine(vector_store)
 
-        # 向下相容:legacy chunks 視為 leaf
+        # Backward compatibility: treat legacy chunks as leaves
         query = sql_text(f"""
             SELECT
                 text,

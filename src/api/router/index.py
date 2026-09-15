@@ -1,5 +1,5 @@
 
-"""首頁 (landing page) 路由。"""
+"""Landing page routes."""
 
 import base64
 import html
@@ -17,10 +17,10 @@ _LOGO_PATH = Path(__file__).resolve().parents[3] / "assets" / "logo.png"
 
 @lru_cache(maxsize=1)
 def _logo_data_uri() -> str:
-    """將 logo 檔讀成可內嵌於 HTML 的 base64 data URI（結果會被快取）。
+    """Read the logo file into an HTML-embeddable base64 data URI (the result is cached).
 
     Returns:
-        `data:image/png;base64,...` 字串；找不到 logo 檔時回傳空字串。
+        A `data:image/png;base64,...` string; an empty string if the logo file is not found.
     """
     try:
         data = base64.b64encode(_LOGO_PATH.read_bytes()).decode("ascii")
@@ -29,15 +29,14 @@ def _logo_data_uri() -> str:
         return ""
 
 
-# 輕量 Markdown → HTML 轉換器
 def _inline(text: str) -> str:
-    """套用行內 Markdown 語法（程式碼、粗體、連結）。
+    """Apply inline Markdown syntax (code, bold, links).
 
     Args:
-        text: 已經過 HTML escape 的文字。
+        text: Text that has already been HTML-escaped.
 
     Returns:
-        套用行內語法後的 HTML 片段。
+        The HTML fragment after applying inline syntax.
     """
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
     text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
@@ -59,18 +58,19 @@ def _split_table_row(row: str) -> list[str]:
 
 
 def _try_consume_table(lines: list[str], i: int) -> tuple[str | None, int]:
-    """嘗試把 lines[i:] 解析成 markdown table(GFM 風格)。
+    """Try to parse lines[i:] as a markdown table (GFM style).
 
-    需 lines[i] 是 header row、lines[i+1] 是 `|---|---|` separator,後續連續的
-    `| ... |` row 都吃進來。不像 table 就 return (None, 0) 讓 caller 走原邏輯。
+    Requires lines[i] to be a header row and lines[i+1] to be a `|---|---|` separator; subsequent
+    consecutive `| ... |` rows are consumed. If it doesn't look like a table, returns (None, 0) so
+    the caller falls back to its original logic.
 
     Args:
-        lines: markdown 全文按行切的 list。
-        i: 起始 index。
+        lines: The full markdown split into a list of lines.
+        i: The starting index.
 
     Returns:
-        ``(html, consumed)`` ─ html 是組好的 ``<table>...</table>``;
-        ``consumed`` 是吃掉的行數。不是 table → ``(None, 0)``。
+        ``(html, consumed)`` — html is the assembled ``<table>...</table>``; ``consumed`` is the
+        number of lines consumed. Not a table -> ``(None, 0)``.
     """
     if i + 1 >= len(lines):
         return None, 0
@@ -103,13 +103,13 @@ def _try_consume_table(lines: list[str], i: int) -> tuple[str | None, int]:
 
 
 def markdown_to_html(md: str) -> str:
-    """將 Markdown 轉成 HTML，支援標題、清單、程式碼區塊、表格、粗體、連結與分隔線。
+    """Convert Markdown to HTML, supporting headings, lists, code blocks, tables, bold, links, and horizontal rules.
 
     Args:
-        md: Markdown 原始字串。
+        md: The raw Markdown string.
 
     Returns:
-        轉換後的 HTML 字串（內容均經 HTML escape）。
+        The converted HTML string (all content is HTML-escaped).
     """
     lines = md.split("\n")
     out: list[str] = []
@@ -134,7 +134,6 @@ def markdown_to_html(md: str) -> str:
         line = lines[i]
         stripped = line.strip()
 
-        # 程式碼區塊 ```
         if stripped.startswith("```"):
             flush_para(); close_list()
             i += 1
@@ -146,13 +145,12 @@ def markdown_to_html(md: str) -> str:
             i += 1
             continue
 
-        # 空行
         if not stripped:
             flush_para(); close_list()
             i += 1
             continue
 
-        # 表格(必須在水平分隔線/段落 fallback 之前;`|---|---|` 對 hr 來說也可能像分隔線)
+        # Table (must come before the horizontal-rule / paragraph fallback; `|---|---|` can also look like an hr separator)
         table_html, consumed = _try_consume_table(lines, i)
         if table_html is not None:
             flush_para(); close_list()
@@ -160,14 +158,12 @@ def markdown_to_html(md: str) -> str:
             i += consumed
             continue
 
-        # 水平分隔線
         if re.match(r"^(-{3,}|\*{3,})$", stripped):
             flush_para(); close_list()
             out.append("<hr>")
             i += 1
             continue
 
-        # 標題 #..######
         m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
         if m:
             flush_para(); close_list()
@@ -176,7 +172,6 @@ def markdown_to_html(md: str) -> str:
             i += 1
             continue
 
-        # 無序清單 - / *
         m = re.match(r"^[-*]\s+(.*)$", stripped)
         if m:
             flush_para()
@@ -186,7 +181,6 @@ def markdown_to_html(md: str) -> str:
             i += 1
             continue
 
-        # 有序清單 1. 2. ...
         m = re.match(r"^\d+\.\s+(.*)$", stripped)
         if m:
             flush_para()
@@ -196,7 +190,6 @@ def markdown_to_html(md: str) -> str:
             i += 1
             continue
 
-        # 一般段落
         para.append(html.escape(stripped))
         i += 1
 
@@ -204,7 +197,6 @@ def markdown_to_html(md: str) -> str:
     return "\n".join(out)
 
 
-# 頁面樣板
 _PAGE = """<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
@@ -253,8 +245,8 @@ body{margin:0;font-family:-apple-system,"Segoe UI","PingFang TC","Microsoft Jhen
     <h1>%%TITLE%%</h1>
     <p>%%DESC%%</p>
     <div class="actions">
-      <a class="btn btn-primary" href="/docs">📘 API 文件 (Swagger)</a>
-      <a class="btn btn-ghost" href="/health">❤ 健康檢查</a>
+      <a class="btn btn-primary" href="/docs">📘 API Docs (Swagger)</a>
+      <a class="btn btn-ghost" href="/health">❤ Health</a>
     </div>
   </div>
   <div class="container">
@@ -270,13 +262,13 @@ body{margin:0;font-family:-apple-system,"Segoe UI","PingFang TC","Microsoft Jhen
 
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def index(request: Request) -> HTMLResponse:
-    """服務首頁：顯示服務名稱與版本、進入 /docs 的按鈕，以及 instructions 內容。
+    """Service home page: shows the service name and version, a button to /docs, and the instructions content.
 
     Args:
-        request: 進來的請求，用以取得 app 的 title/version/description 與 instructions。
+        request: The incoming request, used to obtain the app's title/version/description and instructions.
 
     Returns:
-        渲染後的首頁 HTMLResponse。
+        The rendered home page HTMLResponse.
     """
     app = request.app
     title = getattr(app, "title", "MCP Service")
@@ -284,7 +276,7 @@ async def index(request: Request) -> HTMLResponse:
     description = getattr(app, "description", "") or "Agentic RAG MCP Service"
 
     instructions_md = getattr(app.state, "instructions", "") or ""
-    instructions_html = markdown_to_html(instructions_md) if instructions_md else "<p>（尚未提供 instructions）</p>"
+    instructions_html = markdown_to_html(instructions_md) if instructions_md else "<p>(no instructions provided)</p>"
 
     logo = _logo_data_uri()
     topbar = f'  <div class="topbar"><img src="{logo}" alt="logo"></div>' if logo else ""

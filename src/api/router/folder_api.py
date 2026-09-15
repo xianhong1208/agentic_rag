@@ -1,7 +1,7 @@
 
-"""資料夾操作 API 路由
+"""Folder operations API routes.
 
-提供資料夾創建、查詢、更新、刪除等 REST API 接口
+Provides REST API endpoints for folder creation, querying, updating, and deletion.
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Request, Query
@@ -22,35 +22,34 @@ from src.adapter.folder import FolderAdapter
 from src.log import get_api_logger
 from src.auth.dependencies import authenticate_request
 from src.api.dependencies.auth import extract_token
-# 獲取日誌實例
 logger = get_api_logger()
 
 router = APIRouter(tags=["Folders"], prefix="/folders", dependencies=[Depends(authenticate_request)])
 
-# Resource = FolderResource。Response = List[FolderResource](即使按 ID 查也以 list 包裝,維持 adapter 既有行為)。
+# Resource = FolderResource. Response = List[FolderResource] (even a by-ID lookup is wrapped in a list, preserving the adapter's existing behavior).
 @router.get(
     "/",
     summary="List or get folders",
     response_model=List[FolderResource],
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder_id / folder_name 找不到"},
-        400: {"model": ErrorDetailResponse, "description": "參數型別錯"},
+        404: {"model": ErrorDetailResponse, "description": "folder_id / folder_name not found"},
+        400: {"model": ErrorDetailResponse, "description": "invalid parameter type"},
     },
 )
 async def list_folders(
-    folder_id: Optional[int] = Query(None, description="資料夾 ID"),
-    folder_name: Optional[str] = Query(None, description="資料夾名稱"),
+    folder_id: Optional[int] = Query(None, description="folder ID"),
+    folder_name: Optional[str] = Query(None, description="folder name"),
     user_token: str = Depends(extract_token),
 ):
-    """列出資料夾或依 ID / 名稱取單筆。
+    """List folders, or fetch a single one by ID / name.
 
     Args:
-        folder_id: 給就回該 ID;優先序最高。
-        folder_name: 給就依名稱查;次優先。
-        user_token: 使用者 token(權限驗證)。
+        folder_id: If given, returns that ID; highest priority.
+        folder_name: If given, looks up by name; second priority.
+        user_token: User token (permission check).
 
     Returns:
-        FolderResource list(即使按 ID 查也以 list 包裝,維持 adapter 行為)。
+        A FolderResource list (even a by-ID lookup is wrapped in a list, preserving the adapter's behavior).
     """
     try:
         logger.debug(f'user_token: {user_token[:8] if user_token else "N/A"}...')
@@ -86,32 +85,30 @@ async def list_folders(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Resource = FolderResource(剛建立的那一筆)。
 @router.post(
     "/",
     summary="Create folder",
     response_model=List[FolderResource],
     responses={
-        409: {"model": ErrorDetailResponse, "description": "同名 folder 已存在"},
-        400: {"model": ErrorDetailResponse, "description": "參數錯"},
-        422: {"model": ErrorDetailResponse, "description": "Pydantic 驗證失敗"},
+        409: {"model": ErrorDetailResponse, "description": "a folder with the same name already exists"},
+        400: {"model": ErrorDetailResponse, "description": "invalid parameters"},
+        422: {"model": ErrorDetailResponse, "description": "Pydantic validation failed"},
     },
 )
 async def create_folder(
     folder_request: CreateFolderRequest,
     user_token: str = Depends(extract_token),
 ):
-    """建一個新資料夾(綁在當前 user_token 下)。
+    """Create a new folder (bound to the current user_token).
 
     Args:
-        folder_request: CreateFolderRequest(name + 可選 description)。
-        user_token: 使用者 token(會記在 Folder.user_token,後續權限過濾用)。
+        folder_request: CreateFolderRequest (name + optional description).
+        user_token: User token (stored in Folder.user_token, used later for permission filtering).
 
     Returns:
-        新建的 FolderResource。
+        The newly created FolderResource.
     """
     try:
-        # 從 Authorization header 提取 token
         logger.debug(f'user_token: {user_token[:8] if user_token else "N/A"}...')
 
         result = FolderAdapter.create_folder(
@@ -147,35 +144,36 @@ async def create_folder(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Response = {detail: "Folder X deleted successfully"}(刪 folder 同時 cancel 進行中 indexing job)。
+# Response = {detail: "Folder X deleted successfully"} (deleting a folder also cancels in-progress indexing jobs).
 @router.delete(
     "/{folder_id}",
     summary="delete folder",
     response_model=FolderDeletedResponse,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder 不存在或無權限"},
-        400: {"model": ErrorDetailResponse, "description": "參數錯"},
+        404: {"model": ErrorDetailResponse, "description": "folder not found or no permission"},
+        400: {"model": ErrorDetailResponse, "description": "invalid parameters"},
     },
 )
 async def delete_folder(
     folder_id: int,
     user_token: str = Depends(extract_token),
 ):
-    """刪除指定 ID 的資料夾
+    """Delete the folder with the given ID.
 
-    刪除資料夾時會自動刪除其中的所有文件（軟刪除）。
-    任何 indexing job 還在跑的會先 cancel,避免它繼續寫入即將消失的 folder。
+    Deleting a folder automatically deletes all files within it (soft delete).
+    Any still-running indexing job is cancelled first, so it doesn't keep writing to a folder that is about to disappear.
 
     Args:
-        folder_id: 資料夾 ID
+        folder_id: Folder ID
     """
     try:
         logger.debug(f'user_token: {user_token[:8] if user_token else "N/A"}...')
 
-        # ⚠️ 先驗證所有權,再做任何副作用。cancel_jobs_for_folder 只吃 folder_id、
-        #    不含 token,若放在驗權前,任一租戶 DELETE 別人的 folder_id 會在拿到
-        #    404 之前先杀掉對方 in-flight job(跨租戶 DoS)。fail-closed:無主
-        #    (user_token=None)或非本人一律 404,不洩漏 folder 是否存在。
+        # Verify ownership before any side effect. cancel_jobs_for_folder takes only folder_id,
+        # not a token; placed before the ownership check, any tenant DELETEing someone else's
+        # folder_id would kill the other tenant's in-flight job before getting a 404 (cross-tenant
+        # DoS). Fail-closed: unowned (user_token=None) or not-the-owner always returns 404, without
+        # leaking whether the folder exists.
         from db.cached_folderdb import CachedFolderDB
         _folder = CachedFolderDB.get_by_id(folder_id)
         if not _folder or _folder.user_token != user_token:
@@ -209,16 +207,16 @@ async def delete_folder(
         logger.error(f"Failed to delete folder {folder_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Resource = FolderResource(更新後的)— adapter 回 list 包裝(維持 historical
-# behavior),所以 response_model 跟 list_folders / create_folder 一致用 List。
+# Resource = FolderResource (after update) — the adapter returns a list wrapper (preserving
+# historical behavior), so response_model uses List, consistent with list_folders / create_folder.
 @router.patch(
     "/{folder_id}",
     summary="Update folder details",
     response_model=List[FolderResource],
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder 不存在"},
-        409: {"model": ErrorDetailResponse, "description": "改名後撞名"},
-        400: {"model": ErrorDetailResponse, "description": "參數錯"},
+        404: {"model": ErrorDetailResponse, "description": "folder not found"},
+        409: {"model": ErrorDetailResponse, "description": "rename collides with an existing name"},
+        400: {"model": ErrorDetailResponse, "description": "invalid parameters"},
     },
 )
 async def update_folder_api(
@@ -226,20 +224,19 @@ async def update_folder_api(
     requests: UpdateFolderRequest,
     user_token: str = Depends(extract_token),
 ):
-    """更新指定資料夾的 name / description(只 patch 有給的欄位)。
+    """Update a folder's name / description (only patches the fields provided).
 
     Args:
-        folder_id: 要更新的 folder。
-        requests: UpdateFolderRequest(name / description 都可選)。
-        user_token: 使用者 token(權限驗證)。
+        folder_id: The folder to update.
+        requests: UpdateFolderRequest (name / description both optional).
+        user_token: User token (permission check).
 
     Returns:
-        更新後的 FolderResource。
+        The updated FolderResource.
     """
     try:
         logger.debug(f'user_token: {user_token[:8] if user_token else "N/A"}...')
 
-        # 更新資料夾名稱和描述
         result = await FolderAdapter.update_folder(
             folder_id=folder_id,
             user_token=user_token,

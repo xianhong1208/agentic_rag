@@ -1,10 +1,9 @@
 
-"""M6 前置 harness — 三模式查詢編排(query_agentic)的行為契約。
+"""Behavior contract for three-mode query orchestration (query_agentic).
 
-M6 要把 handle_search/list/read 從 fastmcp_tools 搬進 domain。搬動最怕靜默改到:
-  (1) 鑑權時序:ACL 必須在「碰任何資料(vector store)之前」—— 越權不得觸及資料
-  (2) 三模式路由:list/search/read 各自分派正確、未知 mode 回 error
-這份測試把當前行為釘死,重構後可比對不走樣。純 mock ctx / handlers,零外部依賴。
+Pins down two invariants: the ACL runs before any data (vector store) access,
+and list/search/read each dispatch correctly while an unknown mode returns an
+error dict.
 """
 
 from types import SimpleNamespace
@@ -15,14 +14,14 @@ import pytest
 from src.adapter.rag_query import RAGQueryService
 from src.domain.exceptions import UnauthorizedAccessError
 
-# M6 後編排與 ACL 住在 domain;patch 目標跟著搬(契約斷言本身一字未改)
+# Orchestration and ACL live in domain (folder_acl / agentic_handlers).
 _ACL = "src.domain.rag.folder_acl"
 _TH = "src.domain.rag.agentic_handlers"
 _RQ = "src.adapter.rag_query"
 
 
 def _make_service():
-    """假 ctx:vector_store_manager.get_or_create 可觀察是否被呼叫。"""
+    """Fake ctx: vector_store_manager.get_or_create is observable for whether it was called."""
     ctx = MagicMock()
     ctx.vector_store_manager.get_or_create.return_value = MagicMock(name="vector_store")
     ctx.auto_merging_enabled = True
@@ -40,7 +39,7 @@ _FAKE_CFG = SimpleNamespace(rag=SimpleNamespace(retrieval=SimpleNamespace(
 
 
 async def test_acl_runs_before_any_data_access():
-    """越權:verify_folder_access 拋 → query_agentic 拋,且絕不碰 vector store。"""
+    """Unauthorized: verify_folder_access raises -> query_agentic raises, and never touches the vector store."""
     svc, ctx = _make_service()
     with patch(f"{_ACL}.verify_folder_access",
                side_effect=UnauthorizedAccessError(
@@ -53,7 +52,7 @@ async def test_acl_runs_before_any_data_access():
 
 
 async def test_list_mode_routes_and_skips_vector_store():
-    """list 模式:走 handle_list,不需要 vector store(不該建)。"""
+    """list mode: routes to handle_list, needs no vector store (should not create one)."""
     svc, ctx = _make_service()
     sentinel = {"mode": "list", "ok": True}
     with patch(f"{_ACL}.verify_folder_access", return_value=_fake_folder()), \
@@ -67,7 +66,7 @@ async def test_list_mode_routes_and_skips_vector_store():
 
 
 async def test_read_mode_routes_with_vector_store():
-    """read 模式:建 vector store 後走 handle_read。"""
+    """read mode: creates the vector store, then routes to handle_read."""
     svc, ctx = _make_service()
     sentinel = {"mode": "read"}
     with patch(f"{_ACL}.verify_folder_access", return_value=_fake_folder()), \
@@ -81,7 +80,7 @@ async def test_read_mode_routes_with_vector_store():
 
 
 async def test_search_mode_routes_with_retriever():
-    """search 模式:建 vector store + retriever 後走 handle_search。"""
+    """search mode: creates the vector store + retriever, then routes to handle_search."""
     svc, ctx = _make_service()
     sentinel = {"mode": "search"}
     with patch(f"{_ACL}.verify_folder_access", return_value=_fake_folder()), \
@@ -97,7 +96,7 @@ async def test_search_mode_routes_with_retriever():
 
 
 async def test_unknown_mode_returns_error():
-    """未知 mode:回 error dict,不拋、不碰資料。"""
+    """Unknown mode: returns an error dict, does not raise, does not touch data."""
     svc, ctx = _make_service()
     with patch(f"{_ACL}.verify_folder_access", return_value=_fake_folder()):
         out = await svc.query_agentic(
@@ -107,8 +106,8 @@ async def test_unknown_mode_returns_error():
 
 
 async def test_search_response_carries_provenance():
-    """BL-05:MergedResult 的 page/headings 透傳進 search response;
-    無溯源的結果(舊索引資料)不出現這兩個 key。"""
+    """BL-05: MergedResult's page/headings pass through into the search response;
+    results without provenance (old indexed data) do not carry these two keys."""
     from src.domain.rag.agentic_handlers import handle_search
     from src.domain.rag.auto_merging import MergedResult
 

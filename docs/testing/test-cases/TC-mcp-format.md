@@ -1,202 +1,202 @@
-# TC-mcp-format:MCP 工具 log 摘要格式化 測試案例
+# TC-mcp-format: MCP Tool Log Summary Formatting Test Cases
 
 
-| 項目 | 內容 |
-|------|------|
-| 對應規格 | [SPEC-mcp-format](../specs/SPEC-mcp-format.md) |
-| 測試層級 | 單元(僅格式化純函式) |
-| 測試腳本 | `tests/test_mcp_format_helpers.py` |
+| Item | Content |
+|------|---------|
+| Related spec | [SPEC-mcp-format](../specs/SPEC-mcp-format.md) |
+| Test level | Unit (formatting pure functions only) |
+| Test script | `tests/test_mcp_format_helpers.py` |
 
 ---
 
-## TC-mcp-format-01:_truncate 輸入 None
+## TC-mcp-format-01: _truncate with None input
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-01 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `_truncate(None, 10)` |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | 回 `""` |
-| **實作** | `tests/test_mcp_format_helpers.py::test_truncate_none_returns_empty_string` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-01 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `_truncate(None, 10)` |
+| **Test steps** | 1. Call |
+| **Expected result** | Returns `""` |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_truncate_none_returns_empty_string` |
 
-## TC-mcp-format-02:_truncate 未超長原樣回傳
+## TC-mcp-format-02: _truncate returns string unchanged when within length
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-02 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `("abc", 10)`、`("abcdefghij", 10)`(剛好等長) |
-| **測試步驟** | 1. 各呼叫一次 |
-| **預期結果** | 皆原樣回傳 |
-| **實作** | `tests/test_mcp_format_helpers.py::test_truncate_short_and_exact_length_unchanged` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-02 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `("abc", 10)`, `("abcdefghij", 10)` (exact length) |
+| **Test steps** | 1. Call each once |
+| **Expected result** | Both returned as-is |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_truncate_short_and_exact_length_unchanged` |
 
-## TC-mcp-format-03:_truncate 超長截斷加省略號
+## TC-mcp-format-03: _truncate appends ellipsis when overlong
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-03 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `("abcdefghijk", 10)` |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | 回 `"abcdefghi…"`,總長 == 10 |
-| **實作** | `tests/test_mcp_format_helpers.py::test_truncate_long_string_appends_ellipsis` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-03 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `("abcdefghijk", 10)` |
+| **Test steps** | 1. Call |
+| **Expected result** | Returns `"abcdefghi…"`, total length == 10 |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_truncate_long_string_appends_ellipsis` |
 
-## TC-mcp-format-04:_truncate 非字串輸入
+## TC-mcp-format-04: _truncate with non-string input
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-04 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `(12345, 10)`、`(12345678901, 10)` |
-| **測試步驟** | 1. 各呼叫一次 |
-| **預期結果** | `"12345"`;`"123456789…"`(先 `str()` 再截斷) |
-| **實作** | `tests/test_mcp_format_helpers.py::test_truncate_coerces_non_string_input` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-04 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `(12345, 10)`, `(12345678901, 10)` |
+| **Test steps** | 1. Call each once |
+| **Expected result** | `"12345"`; `"123456789…"` (coerce with `str()`, then truncate) |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_truncate_coerces_non_string_input` |
 
-## TC-mcp-format-05:_visual_width ASCII
+## TC-mcp-format-05: _visual_width with ASCII
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-05 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `"abc 123"` |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | 7 |
-| **實作** | `tests/test_mcp_format_helpers.py::test_visual_width_ascii_one_column_each` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-05 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `"abc 123"` |
+| **Test steps** | 1. Call |
+| **Expected result** | 7 |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_visual_width_ascii_one_column_each` |
 
-## TC-mcp-format-06:_visual_width CJK / 全形
+## TC-mcp-format-06: _visual_width with CJK / full-width
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-06 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `"中文"`、`"Ａ"`(fullwidth A) |
-| **測試步驟** | 1. 各呼叫一次 |
-| **預期結果** | 4;2 |
-| **實作** | `tests/test_mcp_format_helpers.py::test_visual_width_cjk_and_fullwidth_two_columns` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-06 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `"中文"`, `"Ａ"` (fullwidth A) |
+| **Test steps** | 1. Call each once |
+| **Expected result** | 4; 2 |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_visual_width_cjk_and_fullwidth_two_columns` |
 
-## TC-mcp-format-07:_visual_width emoji
+## TC-mcp-format-07: _visual_width with emoji
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-07 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `"😀"`(0x1F600)、`"☀"`(0x2600) |
-| **測試步驟** | 1. 各呼叫一次 |
-| **預期結果** | 皆為 2 |
-| **實作** | `tests/test_mcp_format_helpers.py::test_visual_width_emoji_two_columns` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-07 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `"😀"` (0x1F600), `"☀"` (0x2600) |
+| **Test steps** | 1. Call each once |
+| **Expected result** | Both 2 |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_visual_width_emoji_two_columns` |
 
-## TC-mcp-format-08:_visual_width 混合與空字串
+## TC-mcp-format-08: _visual_width with mixed and empty strings
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-08 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `""`、`"a中b"` |
-| **測試步驟** | 1. 各呼叫一次 |
-| **預期結果** | 0;4(1+2+1) |
-| **實作** | `tests/test_mcp_format_helpers.py::test_visual_width_mixed_and_empty` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-08 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `""`, `"a中b"` |
+| **Test steps** | 1. Call each once |
+| **Expected result** | 0; 4 (1+2+1) |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_visual_width_mixed_and_empty` |
 
-## TC-mcp-format-09:_center_line ASCII 置中
+## TC-mcp-format-09: _center_line centers ASCII
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-09 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `("ab", width=10)` |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | `"    ab"`(左補 4 空格,不補右側) |
-| **實作** | `tests/test_mcp_format_helpers.py::test_center_line_pads_ascii` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-09 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `("ab", width=10)` |
+| **Test steps** | 1. Call |
+| **Expected result** | `"    ab"` (4 spaces of left padding, none on the right) |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_center_line_pads_ascii` |
 
-## TC-mcp-format-10:_center_line 中文寬度納入
+## TC-mcp-format-10: _center_line accounts for CJK width
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-10 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `("中文", width=10)` |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | `"   中文"`(視覺寬 4 → 左補 3 空格) |
-| **實作** | `tests/test_mcp_format_helpers.py::test_center_line_accounts_for_cjk_width` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-10 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `("中文", width=10)` |
+| **Test steps** | 1. Call |
+| **Expected result** | `"   中文"` (visual width 4 -> 3 spaces of left padding) |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_center_line_accounts_for_cjk_width` |
 
-## TC-mcp-format-11:_center_line 過寬原樣回傳
+## TC-mcp-format-11: _center_line returns overwide text as-is
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-11 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `("x"*12, width=10)` |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | 原樣回傳(無 padding) |
-| **實作** | `tests/test_mcp_format_helpers.py::test_center_line_wide_text_returned_as_is` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-11 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `("x"*12, width=10)` |
+| **Test steps** | 1. Call |
+| **Expected result** | Returned as-is (no padding) |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_center_line_wide_text_returned_as_is` |
 
-## TC-mcp-format-12:_center_line 預設寬度 _BOX_WIDTH
+## TC-mcp-format-12: _center_line default width _BOX_WIDTH
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-12 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `_center_line("hi")` |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | `" " * ((_BOX_WIDTH - 2) // 2) + "hi"` |
-| **實作** | `tests/test_mcp_format_helpers.py::test_center_line_default_width_is_box_width` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-12 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `_center_line("hi")` |
+| **Test steps** | 1. Call |
+| **Expected result** | `" " * ((_BOX_WIDTH - 2) // 2) + "hi"` |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_center_line_default_width_is_box_width` |
 
-## TC-mcp-format-13:_format_search_body 空 response
+## TC-mcp-format-13: _format_search_body with empty response
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-13 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `{}` |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | 恰為兩行:`  Query     : ""` 與 `  Results   : 0`;無 Roles / Files / Scores / Hint |
-| **實作** | `tests/test_mcp_format_helpers.py::test_format_search_body_empty_response` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-13 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `{}` |
+| **Test steps** | 1. Call |
+| **Expected result** | Exactly two lines: `  Query     : ""` and `  Results   : 0`; no Roles / Files / Scores / Hint |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_format_search_body_empty_response` |
 
-## TC-mcp-format-14:_format_search_body 完整 response
+## TC-mcp-format-14: _format_search_body with a full response
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-14 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 3 筆 results(leaf / parent(merged 2) / expanded,兩個檔名,scores 0.9/0.8/0.7)+ `_hint` |
-| **測試步驟** | 1. 呼叫<br>2. 檢查各區塊 |
-| **預期結果** | Query 原文;Results 3;`leaf:1`、`parent:1(+2 merged)`、`expanded:1`;`a.pdf:2`、`b.txt:1`;`min=0.700  max=0.900  avg=0.800`;Hint 行存在 |
-| **實作** | `tests/test_mcp_format_helpers.py::test_format_search_body_full_response` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-14 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | 3 results (leaf / parent (2 merged) / expanded, two file names, scores 0.9/0.8/0.7) plus `_hint` |
+| **Test steps** | 1. Call<br>2. Check each section |
+| **Expected result** | Query verbatim; Results 3; `leaf:1`, `parent:1(+2 merged)`, `expanded:1`; `a.pdf:2`, `b.txt:1`; `min=0.700  max=0.900  avg=0.800`; Hint line present |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_format_search_body_full_response` |
 
-## TC-mcp-format-15:檔案超過 3 個顯示 +N more
+## TC-mcp-format-15: more than 3 files shown as +N more
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-15 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 4 筆 results,檔名各不相同 |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | Files 行含 `+1 more` |
-| **實作** | `tests/test_mcp_format_helpers.py::test_format_search_body_more_than_three_files_summarized` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-15 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | 4 results, each with a distinct file name |
+| **Test steps** | 1. Call |
+| **Expected result** | Files line includes `+1 more` |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_format_search_body_more_than_three_files_summarized` |
 
-## TC-mcp-format-16:長 query 截斷
+## TC-mcp-format-16: long query truncation
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-mcp-format-16 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | query 為 100 個 `q` |
-| **測試步驟** | 1. 呼叫 |
-| **預期結果** | Query 行為 69 個 `q` + `…`(70 字元截斷) |
-| **實作** | `tests/test_mcp_format_helpers.py::test_format_search_body_long_query_truncated` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-mcp-format-16 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | query of 100 `q` characters |
+| **Test steps** | 1. Call |
+| **Expected result** | Query line is 69 `q` characters + `…` (truncated at 70 characters) |
+| **Implementation** | `tests/test_mcp_format_helpers.py::test_format_search_body_long_query_truncated` |

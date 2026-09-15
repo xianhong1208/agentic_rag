@@ -1,18 +1,8 @@
 
-"""RAG 適配器模組 — 對外的薄 facade。
+"""RAG adapter facade (obtained via `get_rag_adapter()`).
 
-Public API(callers 走 `get_rag_adapter()` 拿這個 instance):
-  - index_document / index_folder / index_files / trigger_auto_index
-  - query_rag / query_rag_by_folder_name / query
-  - delete_document_index / delete_folder_index / get_indexed_files
-
-實際邏輯分散在四個 sub-modules(同 package):
-  - rag_context.py     — 共享狀態 / config 載入 / vector store helper
-  - rag_indexing.py    — indexing 三件套 + auto-index trigger
-  - rag_query.py       — flat hybrid + agentic three-mode
-  - rag_maintenance.py — delete + indexed-files 列表
-
-從原本 1330 行單檔重構為 5 個 ~200-470 行檔案,2026-05-26 Phase 1-5 完成。
+Coordinates the sub-modules in this package: rag_context (shared state),
+rag_indexing, rag_query, and rag_maintenance.
 """
 
 from typing import Any, Dict, List, Optional
@@ -39,31 +29,19 @@ logger = get_adapter_logger()
 
 
 class RAGAdapter:
-    """LlamaIndex 基礎的 RAG 適配器
+    """LlamaIndex-based RAG adapter for indexing, querying, and management,
+    backed by PostgreSQL pgvector.
 
-    提供文件索引、查詢和管理功能,使用 PostgreSQL pgvector 進行向量存儲。
-
-    狀態管理委派給 RAGContext(`self._ctx`):embedding provider / indexer /
-    vector store manager / reranker / 各種 size 設定全部歸 ctx 管,RAGAdapter
-    只負責協調 indexing / query / maintenance 三類 use case。
-
-    為了 backwards compat,所有 `self._xxx` 私有屬性仍可用 — 透過 @property
-    delegate 到 ctx。phases 2-4 把方法搬出去後,這些 alias 會逐步移除。
+    State lives on RAGContext (`self._ctx`); this class coordinates the
+    indexing, query, and maintenance sub-services. The `self._xxx` properties
+    are backwards-compat delegates to the context.
     """
 
     def __init__(self):
-        """初始化 RAG 適配器 — 委派給 RAGContext.from_config()"""
         self._ctx: RAGContext = RAGContext.from_config()
-        # Sub-services receive shared ctx, expose narrower SRP-aligned interfaces.
         self._indexing = RAGIndexingService(self._ctx)
         self._query_svc = RAGQueryService(self._ctx)
         self._maintenance = RAGMaintenanceService(self._ctx)
-
-    # ------------------------------------------------------------------
-    # Backwards-compat property aliases — 讓 phase 1 之後本檔內既有 method body
-    # 可以繼續 self._xxx 不必同步改。phase 2-4 把方法搬到 sub-services 後,
-    # service 內直接 self._ctx.xxx,這層 alias 屆時可刪。
-    # ------------------------------------------------------------------
 
     @property
     def _embedding_provider(self):
@@ -103,8 +81,7 @@ class RAGAdapter:
 
     @property
     def _document_indexer(self):
-        # 舊別名 — phase 2 搬走後可刪
-        return self._ctx.indexer
+        return self._ctx.indexer  # legacy alias
 
     @property
     def _indexing_service(self):
@@ -128,12 +105,7 @@ class RAGAdapter:
 
     @property
     def _query_engines(self) -> Dict[str, QueryEngine]:
-        # mutable dict — 改變會傳回 ctx,因為這是 reference
         return self._ctx.query_engines
-
-    # ------------------------------------------------------------------
-    # Runtime helpers — delegate to RAGContext
-    # ------------------------------------------------------------------
 
     def _invalidate_query_engine_cache(self, folder_id: int) -> None:
         """Remove cached QueryEngine for a folder (call after index changes)."""
@@ -142,7 +114,7 @@ class RAGAdapter:
     def _get_vector_store(
         self, folder_id: int, token: str, folder: Optional[Any] = None
     ) -> PGVectorStore:
-        """獲取或創建指定 folder/token 的向量存儲(委派給 RAGContext)。"""
+        """Get or create the vector store for a folder/token (delegates to RAGContext)."""
         return self._ctx.get_vector_store(folder_id, token, folder)
 
     async def index_document(
@@ -153,7 +125,7 @@ class RAGAdapter:
         chunk_overlap: Optional[int] = None,
         folder_id_override: Optional[int] = None,
     ) -> IndexDocumentResponse:
-        """委派給 RAGIndexingService — 單檔索引。"""
+        """Delegates to RAGIndexingService — single-document indexing."""
         return await self._indexing.index_document(
             file_record=file_record,
             token=token,
@@ -171,7 +143,7 @@ class RAGAdapter:
         skip_existing: bool = True,
         progress_tracker: Optional["IndexProgressTracker"] = None,
     ) -> IndexFolderResponse:
-        """委派給 RAGIndexingService — 整個資料夾索引。"""
+        """Delegates to RAGIndexingService — whole-folder indexing."""
         return await self._indexing.index_folder(
             folder_id=folder_id,
             token=token,
@@ -190,7 +162,7 @@ class RAGAdapter:
         chunk_overlap: Optional[int] = None,
         progress_tracker: Optional["IndexProgressTracker"] = None,
     ) -> IndexFolderResponse:
-        """委派給 RAGIndexingService — 指定檔案清單索引(auto-index 上傳用)。"""
+        """Delegates to RAGIndexingService — index a specified list of files (used by upload auto-index)."""
         return await self._indexing.index_files(
             file_ids=file_ids,
             folder_id=folder_id,
@@ -211,7 +183,7 @@ class RAGAdapter:
         sparse_top_k: Optional[int] = None,
         hybrid_alpha: Optional[float] = None,
     ) -> RAGQueryResult:
-        """委派給 RAGQueryService — flat hybrid query with result cache。"""
+        """Delegates to RAGQueryService — flat hybrid query with result cache."""
         return await self._query_svc.query_rag(
             query=query,
             folder_id=folder_id,
@@ -233,7 +205,7 @@ class RAGAdapter:
         sparse_top_k: Optional[int] = None,
         hybrid_alpha: Optional[float] = None,
     ) -> dict:
-        """委派給 RAGQueryService — 檢索軌跡拆解(診斷用,不走 cache)。"""
+        """Delegates to RAGQueryService — retrieval-trace breakdown (diagnostic, bypasses cache)."""
         return await self._query_svc.query_trace(
             query=query,
             folder_id=folder_id,
@@ -254,7 +226,7 @@ class RAGAdapter:
         sparse_top_k: Optional[int] = None,
         hybrid_alpha: Optional[float] = None,
     ) -> RAGQueryResult:
-        """委派給 RAGQueryService — query by folder name(帶身份驗證)。"""
+        """Delegates to RAGQueryService — query by folder name (with authorization)."""
         return await self._query_svc.query_rag_by_folder_name(
             query=query,
             folder_name=folder_name,
@@ -277,7 +249,7 @@ class RAGAdapter:
         expand_context: bool,
         token: str,
     ) -> Dict[str, Any]:
-        """委派給 RAGQueryService — MCP agentic three-mode(search / list / read)。"""
+        """Delegates to RAGQueryService — MCP agentic three-mode (search / list / read)."""
         return await self._query_svc.query_agentic(
             folder_name=folder_name,
             mode=mode,
@@ -290,7 +262,7 @@ class RAGAdapter:
         )
 
     async def delete_document_index(self, file_id: int, token: str) -> bool:
-        """委派給 RAGMaintenanceService — 從向量存儲中刪除文件索引。"""
+        """Delegates to RAGMaintenanceService — remove a document's index from the vector store."""
         return await self._maintenance.delete_document_index(file_id, token)
 
     async def trigger_auto_index(
@@ -300,7 +272,7 @@ class RAGAdapter:
         token: str,
         auto_index: bool = True,
     ) -> Dict[str, Any]:
-        """委派給 RAGIndexingService — 觸發背景 auto-index job。"""
+        """Delegates to RAGIndexingService — trigger a background auto-index job."""
         return await self._indexing.trigger_auto_index(
             file_ids=file_ids,
             folder_id=folder_id,
@@ -313,25 +285,21 @@ class RAGAdapter:
         folder_id: int,
         token: str,
     ) -> DeleteFolderIndexResponse:
-        """委派給 RAGMaintenanceService — 刪除資料夾全部索引(保留 folder 跟 files)。"""
+        """Delegates to RAGMaintenanceService — delete all of a folder's indexes (keeping the folder and files)."""
         return await self._maintenance.delete_folder_index(folder_id, token)
 
     async def get_indexed_files(
         self,
         folder_id: int,
     ) -> List[Dict[str, Any]]:
-        """委派給 RAGMaintenanceService — 列出已索引檔案。"""
+        """Delegates to RAGMaintenanceService — list indexed files."""
         return await self._maintenance.get_indexed_files(folder_id)
 
-## Lazy initialization of rag adapter
-# Don't instantiate at module level - config must be loaded first!
+# Lazy singleton: Config must be loaded before the adapter is built.
 _rag_adapter_instance = None
 
 def get_rag_adapter() -> RAGAdapter:
-    """Get or create the singleton RAGAdapter instance
-
-    Uses lazy initialization to ensure Config is loaded before instantiation.
-    """
+    """Get or lazily create the singleton RAGAdapter instance."""
     global _rag_adapter_instance
     if _rag_adapter_instance is None:
         _rag_adapter_instance = RAGAdapter()
@@ -339,6 +307,9 @@ def get_rag_adapter() -> RAGAdapter:
 
 
 def peek_rag_adapter() -> "RAGAdapter | None":
-    """已建才回,**不觸發**建構(admin 熱改用:adapter 還沒 lazy-init 時
-    只改 ConfigModel 即可 — 之後首次建構自然吃到新值,rebind 沒對象)。"""
+    """Return the instance only if already built; never triggers construction.
+
+    Used by admin hot-reload: if the adapter isn't built yet, the first
+    construction picks up the new ConfigModel, so there is nothing to rebind.
+    """
     return _rag_adapter_instance

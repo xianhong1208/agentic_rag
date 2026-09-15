@@ -1,7 +1,8 @@
 
-"""文件記錄數據庫模型
+"""File record database model.
 
-提供文件記錄的數據庫表定義和相關的數據庫操作，支持階層管理 (Folder -> File)。
+Provides the file-record table definition and related database operations,
+supporting hierarchical management (Folder -> File).
 """
 
 import hashlib
@@ -19,75 +20,72 @@ from db.db import Session as DBSession
 from .baseDB import BaseDB
 from src.log import get_db_logger
 
-# 獲取日誌實例
 log = get_db_logger()
 
 
 class ToolError(Exception):
-    """工具相關錯誤"""
+    """Tool-related error."""
     pass
 
 
 class FileDB(BaseDB):
-    """文件記錄數據庫操作類
-    
-    提供文件上傳、驗證、存儲等功能
+    """File-record database operations class.
+
+    Provides file upload, validation, and storage functionality.
     """
-    
-    # 常量定義
+
     MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
     ALLOWED_EXTENSIONS = {
-        # 純文字 (直讀;text_io.read_text_robust 自動處理 UTF-8/16/Big5 等編碼)
+        # Plain text (read directly; text_io.read_text_robust auto-handles UTF-8/16/Big5, etc.)
         'txt', 'text', 'json', 'csv',
         'yaml', 'yml', 'xml', 'conf', 'log',
-        # Office Open XML(含範本/巨集變體;走 Docling 結構化解析)
+        # Office Open XML (including template/macro variants; parsed structurally via Docling)
         'pdf', 'docx', 'dotx', 'docm', 'dotm',
-        'pptx', 'ppsx', 'pptm', 'potm', 'ppsm',  # potx 實測 docling 打不開,不收
+        'pptx', 'ppsx', 'pptm', 'potm', 'ppsm',  # potx excluded: docling cannot open it
         'xlsx', 'xlsm',
-        # 格式 v3(docling 2.124 官網全對標):OpenDocument(含範本)/ 電子書 /
-        # LaTeX / MIME 郵件 / 字幕;程式化對標測試見 test_upload_formats
-        'odt', 'ods', 'odp',  # 範本變體 ott/ots/otp 實測 docling 打不開,不收
+        # OpenDocument (including templates) / e-books / LaTeX / MIME email / subtitles;
+        # conformance tests live in test_upload_formats
+        'odt', 'ods', 'odp',  # template variants ott/ots/otp excluded: docling cannot open them
         'epub', 'tex', 'latex', 'eml', 'vtt', 'qmd', 'rmd',
-        # Legacy Office (docling 2.119+ 經 LibreOffice 轉檔解析。
-        # 2026-08 前曾因無解析器移除 'doc'(a64641d);現已有真解析器且品質
-        # 實測通過。⚠️ 部署前提:映像/機器裝 libreoffice-writer,缺了索引時
-        # 明確報錯,不會靜默亂碼)
+        # Legacy Office (docling 2.119+ parses these via LibreOffice conversion).
+        # Deployment prerequisite: libreoffice-writer must be installed on the
+        # image/machine; when missing, indexing fails explicitly rather than
+        # silently producing garbage.
         'doc', 'dot', 'xls', 'xlt', 'ppt', 'pot', 'pps',
-        # Outlook 郵件 (docling 2.119+,python-oxmsg 純 Python,零系統依賴)
+        # Outlook mail (docling 2.119+; python-oxmsg is pure Python, no system deps)
         'msg',
-        # 標記語言
+        # Markup languages
         'md', 'html', 'htm', 'xhtml', 'adoc', 'asciidoc', 'asc',
-        # 圖片 (Docling + RapidOcr)
+        # Images (Docling + RapidOcr)
         'png', 'jpg', 'jpeg', 'tiff', 'tif', 'bmp', 'webp',
-        # 音訊 (AsrProvider:本地 docling whisper 或雲端;對齊 docling 官方 6 種)
+        # Audio (AsrProvider: local docling whisper or cloud; aligned with docling's official 6 formats)
         'wav', 'mp3', 'm4a', 'aac', 'ogg', 'flac',
     }
-    
+
     @classmethod
     def get_orm_class(cls) -> type:
-        """獲取 ORM 類"""
+        """Get the ORM class."""
         return File
-    
+
     @classmethod
     def get_log(cls):
-        """獲取日誌實例"""
+        """Get the logger instance."""
         return log
 
     @classmethod
     def get_by_ids(cls, file_ids: List[str]) -> Dict[str, "File"]:
-        """批量獲取文件記錄,避免 N+1 查詢。
+        """Batch-fetch file records to avoid N+1 queries.
 
         Args:
-            file_ids: vector store metadata 來的 str list;內部轉成 UUID 過濾,
-                格式不合的 ID 會 skip + log warning。
+            file_ids: str list from vector store metadata; converted to UUIDs for
+                filtering. Malformed IDs are skipped with a logged warning.
 
         Returns:
-            ``{str(uuid): File}`` dict;沒命中的 file_id 不在 dict 內。
+            ``{str(uuid): File}`` dict; file_ids with no match are absent from the dict.
         """
         if not file_ids:
             return {}
 
-        # str → uuid.UUID，跳過格式不合法的 ID
         uuid_ids = []
         for fid in file_ids:
             try:
@@ -106,7 +104,7 @@ class FileDB(BaseDB):
                 .all()
             )
 
-        # key 用 str，讓 caller 可以直接用 metadata 中的 string file_id 查找
+        # Key by str so callers can look up directly with the string file_id from metadata
         return {str(row.id): row for row in rows}
 
 
@@ -125,7 +123,6 @@ class FileDB(BaseDB):
         """
         try:
             with DBSession() as session:
-                # Delete all files in the folder
                 deleted_count = session.query(cls.get_orm_class()).filter_by(folder_id=folder_id).delete(synchronize_session=False)
                 session.commit()
                 cls.get_log().info(f"Successfully deleted {deleted_count} files from folder {folder_id}")
@@ -136,30 +133,27 @@ class FileDB(BaseDB):
     
     @classmethod
     def _validate_file_content(cls, file_content: bytes, file_name: str) -> Dict[str, Any]:
-        """驗證文件內容
-        
+        """Validate file content.
+
         Args:
-            file_content: 文件二進制內容
-            file_name: 文件名
-            
+            file_content: Binary content of the file.
+            file_name: File name.
+
         Returns:
-            包含文件信息的字典
-            
+            A dict containing file information.
+
         Raises:
-            ToolError: 文件驗證失敗時抛出
+            ToolError: Raised when file validation fails.
         """
-        # 檢查文件大小
         file_size = len(file_content)
         if file_size > cls.MAX_FILE_SIZE:
             max_size_mb = cls.MAX_FILE_SIZE / (1024 * 1024)
-            raise ValueError(f"文件大小超過限制 ({max_size_mb:.1f}MB)")
+            raise ValueError(f"File size exceeds limit ({max_size_mb:.1f}MB)")
 
-        # 檢查文件擴展名
         ext = Path(file_name).suffix.lower().lstrip('.')
         if ext not in cls.ALLOWED_EXTENSIONS:
             raise ValueError(f"Not supported file type: {ext}")
-        
-        # 獲取 MIME 類型
+
         mime_type = mimetypes.guess_type(file_name)[0]
 
         # sha256 content hash for idempotent re-indexing. Computed once

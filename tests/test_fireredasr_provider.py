@@ -1,13 +1,15 @@
 
-"""BL-08 — FireRedAsrProvider 單元測試(不碰權重/GPU)。
+"""FireRedAsrProvider unit tests (no weights/GPU).
 
-守的工程約束:
-- 60s 硬上限:任何切段規劃結果每段 ≤ MAX_SEGMENT_SECONDS
-- 切點取靜音中點;窗內無靜音 → 硬切(絕不產出 >60s 段)
-- 輸出過 OpenCC s2twp(簡→繁台灣用語)
-- 權重不在 → available() False(document_loader 走 fallback,不炸)
+Engineering constraints under test:
+- 60s hard cap: every planned segment is ≤ MAX_SEGMENT_SECONDS.
+- Cut points are the midpoint of a silence; no silence in the window → hard cut
+  (never emit a >60s segment).
+- Output passes through OpenCC s2twp (Simplified → Traditional, Taiwan wording).
+- Weights missing → available() is False (document_loader falls back, no crash).
 
-模型推論(_transcribe_segments)mock 掉 — 真模型驗收走 evals(BL-02 素材)。
+Model inference (_transcribe_segments) is mocked — real-model acceptance runs
+in the evals.
 """
 
 import wave
@@ -23,8 +25,6 @@ from src.domain.rag.fireredasr_provider import (
 _FP = "src.domain.rag.fireredasr_provider"
 
 
-# ---- parse_silences ---------------------------------------------------------
-
 class TestParseSilences:
     def test_extracts_pairs(self):
         stderr = (
@@ -36,7 +36,7 @@ class TestParseSilences:
         assert parse_silences(stderr) == [(12.5, 13.1), (40.0, 40.8)]
 
     def test_trailing_unpaired_start_dropped(self):
-        # 檔案在靜音中結束:最後只有 start 沒 end → zip 丟棄,不炸
+        # File ends mid-silence: a trailing start with no end → dropped by zip, no crash
         stderr = "silence_start: 5.0\nsilence_end: 5.5\nsilence_start: 58.0\n"
         assert parse_silences(stderr) == [(5.0, 5.5)]
 
@@ -44,37 +44,33 @@ class TestParseSilences:
         assert parse_silences("no silence lines here") == []
 
 
-# ---- plan_segments(60s 硬上限的守門)--------------------------------------
-
 class TestPlanSegments:
     def test_short_audio_single_segment(self):
         assert plan_segments(30.0, [(10.0, 10.5)]) == [(0.0, 30.0)]
 
     def test_cuts_at_silence_midpoint(self):
-        # 120s,靜音 50-51s 與 100-101s → 切在 50.5 / 100.5
+        # 120s, silences at 50-51s and 100-101s → cut at 50.5 / 100.5
         segs = plan_segments(120.0, [(50.0, 51.0), (100.0, 101.0)])
         assert segs == [(0.0, 50.5), (50.5, 100.5), (100.5, 120.0)]
 
     def test_no_silence_hard_cut(self):
-        # 全程無靜音 → 硬切 55s(寧可切字也不餵 >60s)
+        # No silence throughout → hard cut at 55s (rather cut a word than feed >60s)
         segs = plan_segments(120.0, [])
         assert segs == [(0.0, 55.0), (55.0, 110.0), (110.0, 120.0)]
 
     def test_every_segment_within_hard_limit(self):
-        # 惡意分布的靜音(全擠在開頭)也不能產出超限段
+        # Adversarially distributed silences (all bunched at the start) must not produce an over-limit segment
         segs = plan_segments(300.0, [(1.0, 1.4), (2.0, 2.4)])
         assert all(e - s <= MAX_SEGMENT_SECONDS + 1e-9 for s, e in segs)
-        # 段間無縫且覆蓋全長
+        # Segments are seamless and cover the full length
         assert segs[0][0] == 0.0 and segs[-1][1] == 300.0
         assert all(segs[i][1] == segs[i + 1][0] for i in range(len(segs) - 1))
 
     def test_silence_beyond_window_ignored(self):
-        # 唯一靜音在 70s(> 55s 窗)→ 窗內無候選,硬切 55
+        # The only silence is at 70s (beyond the 55s window) → no candidate in the window, hard cut at 55
         segs = plan_segments(80.0, [(70.0, 70.5)])
         assert segs[0] == (0.0, 55.0)
 
-
-# ---- provider ---------------------------------------------------------------
 
 class TestFireRedAsrProvider:
     def test_available_false_without_weights(self):
@@ -82,8 +78,8 @@ class TestFireRedAsrProvider:
             assert FireRedAsrProvider().available() is False
 
     def test_transcribe_joins_segments_and_converts_to_traditional(self, tmp_path):
-        # 真 wav(2s 靜音 16k mono)走真 ffmpeg 前處理;只 mock 模型推論。
-        # 段落文字取簡體 — 斷言輸出已 s2twp 繁化(含台灣用語)。
+        # A real wav (2s silence, 16k mono) goes through real ffmpeg preprocessing; only model inference is mocked.
+        # Segment text is Simplified — assert the output has been converted to Traditional via s2twp (with Taiwan wording).
         src = tmp_path / "in.wav"
         with wave.open(str(src), "wb") as w:
             w.setnchannels(1)
@@ -98,7 +94,7 @@ class TestFireRedAsrProvider:
             r = FireRedAsrProvider().transcribe(
                 audio_path=str(src), file_name="in.wav")
         assert r.text == "這是軟體測試\n記憶體很大"
-        assert r.chunks is None  # AED 無標點無結構 → leaf_splitter 純文字路徑
+        assert r.chunks is None  # AED has no punctuation or structure → leaf_splitter plain-text path
 
     def test_transcribe_reports_progress(self, tmp_path):
         src = tmp_path / "in.wav"
@@ -119,28 +115,26 @@ class TestFireRedAsrProvider:
         assert seen == [("loading", 1, 1)]
 
 
-# ---- 權重解析 / 模型載入 / 推論編排(mock 權重層,不載真模型)-------------
-
 class TestModelPlumbing:
     def test_resolve_model_dir_requires_weight_file(self, tmp_path):
         import src.domain.rag.fireredasr_provider as fp
         with patch(f"{_FP}.resolve_assets_dir", create=True), \
              patch("src.domain.rag.docling_loader.resolve_assets_dir",
                    return_value=tmp_path):
-            assert fp._resolve_model_dir() is None  # 目錄不存在
+            assert fp._resolve_model_dir() is None  # directory does not exist
             d = tmp_path / "fireredasr" / "FireRedASR-AED-L"
             d.mkdir(parents=True)
-            assert fp._resolve_model_dir() is None  # 目錄在但缺 model.pth.tar
+            assert fp._resolve_model_dir() is None  # directory exists but model.pth.tar is missing
             (d / "model.pth.tar").write_bytes(b"x")
             assert fp._resolve_model_dir() == d
         with patch("src.domain.rag.docling_loader.resolve_assets_dir",
                    return_value=None):
-            assert fp._resolve_model_dir() is None  # assets 整個不在
+            assert fp._resolve_model_dir() is None  # assets missing entirely
 
     def test_load_model_singleton(self, tmp_path, monkeypatch):
-        # fireredasr 為 uv path dependency(vendor/fireredasr_src)— 正常 import
+        # fireredasr is a uv path dependency (vendor/fireredasr_src) — a normal import
         import src.domain.rag.fireredasr_provider as fp
-        monkeypatch.setattr(fp, "_model", None)  # 清 singleton(測後自動還原)
+        monkeypatch.setattr(fp, "_model", None)  # clear the singleton (restored automatically after the test)
         fake = object()
         with patch("fireredasr.models.fireredasr.FireRedAsr") as M, \
              patch("torch.cuda.is_available", return_value=False):
@@ -148,7 +142,7 @@ class TestModelPlumbing:
             m1 = fp._load_model(tmp_path)
             m2 = fp._load_model(tmp_path)
         assert m1 == (fake, False)
-        assert m2 is m1  # singleton:第二次不重載
+        assert m2 is m1  # singleton: the second call does not reload
         M.from_pretrained.assert_called_once_with("aed", str(tmp_path))
 
     def test_transcribe_segments_per_segment_calls(self, tmp_path, monkeypatch):
@@ -165,8 +159,8 @@ class TestModelPlumbing:
              patch(f"{_FP}._load_model", return_value=(fake_model, False)):
             out = FireRedAsrProvider()._transcribe_segments(
                 [tmp_path / "seg_0000.wav", tmp_path / "seg_0001.wav"])
-        assert out == ["第1段", "第2段"]  # strip 過
-        assert len(calls) == 2  # 逐段(不 batch)
+        assert out == ["第1段", "第2段"]  # stripped
+        assert len(calls) == 2  # per-segment (not batched)
         assert calls[0][2]["use_gpu"] is False
 
     def test_transcribe_segments_raises_without_weights(self):

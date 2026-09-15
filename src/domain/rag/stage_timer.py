@@ -1,21 +1,25 @@
 
-"""StageTimer — 單檔索引的階段耗時計(loading / contextualizing / embedding / writing)
+"""StageTimer — per-file indexing stage timer (loading / contextualizing / embedding / writing)
 
-回答「每個階段花了多久」:掛在 progress_cb 鏈上當觀察者 — 進度回報本來就
-會在每次 stage 切換時流過這裡,第一次看到新 stage 就把上一個 stage 的碼表
-關掉。不開 thread、不改變轉發語意(原樣 pass-through 給 inner cb)。
+Answers "how long did each stage take". It hooks into the progress_cb chain as an
+observer: progress reports already flow through here on every stage switch, so the
+first time a new stage is seen the previous stage's stopwatch is stopped. It starts
+no thread and does not change forwarding semantics (it passes through unchanged to the
+inner cb).
 
-產出去向:adapter 在單檔結束時呼叫 finish(),結果併入該檔的 file_timings
-entry(stage_ms 欄位)→ 隨 IndexJobs 持久化,GET /index/jobs 直接可查:
+Output path: the adapter calls finish() when a file completes; the result is merged
+into that file's file_timings entry (stage_ms field) → persisted with IndexJobs and
+directly queryable via GET /index/jobs:
 
     "file_timings": [{
-        "file_name": "大文件.pdf", "total_ms": 183200.5,
+        "file_name": "large-file.pdf", "total_ms": 183200.5,
         "stage_ms": {"loading": 92100.3, "contextualizing": 61400.8,
                      "embedding": 22300.1, "writing": 7400.2}, ...
     }]
 
-同一 stage 斷續出現(理論上不會,防禦性)時間會累加;keepalive 補發的
-心跳是「同 stage 重複回報」,不觸發切換,不影響計時。
+If the same stage reappears non-contiguously (defensive; not expected in theory) the
+time accumulates. Keepalive heartbeats are "repeated reports of the same stage", so
+they do not trigger a switch and do not affect timing.
 """
 
 from __future__ import annotations
@@ -25,11 +29,11 @@ from typing import Callable, Dict, Optional
 
 
 class StageTimer:
-    """progress_cb 觀察者:量測每個 stage 的 wall-clock 耗時。
+    """progress_cb observer: measures the wall-clock time of each stage.
 
     Usage:
         timer = StageTimer(inner=existing_cb)
-        ...把 timer 當 progress_cb 傳進 indexer...
+        ...pass timer as the progress_cb into the indexer...
         stage_ms = timer.finish()   # {"loading": 92100.3, ...}
     """
 
@@ -46,7 +50,8 @@ class StageTimer:
             self._current = stage
             self._started_at = now
         if self._inner is not None:
-            # 轉發失敗不影響計時,也不往上炸(與 _report_chunk_progress 同紀律)
+            # A forwarding failure must not affect timing or propagate up
+            # (same discipline as _report_chunk_progress)
             try:
                 self._inner(stage, done, total)
             except Exception:
@@ -59,7 +64,7 @@ class StageTimer:
             )
 
     def finish(self) -> Dict[str, float]:
-        """關掉進行中的碼表,回傳 {stage: 毫秒}。可重複呼叫(冪等)。"""
+        """Stop the running stopwatch and return {stage: milliseconds}. Idempotent (safe to call repeatedly)."""
         self._close(time.perf_counter())
         self._current = None
         self._started_at = None

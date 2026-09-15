@@ -1,13 +1,12 @@
 
-"""Whisper 音檔防禦 — anti-hallucination patch、幻覺過濾、前導靜音裁切。
+"""Whisper audio defense — anti-hallucination patch, hallucination filtering, leading-silence trimming.
 
-從 hierarchical_indexer.py 搬出(2026-07):這些是「讀檔」層的音訊前後處理,
-與索引邏輯無關。indexing(hierarchical_indexer)與 REST STT(media router)
-兩條路徑共用。
+These are read-file-layer audio pre/post-processing steps, independent of indexing logic, shared by
+both the indexing path (hierarchical_indexer) and REST STT (media router).
 
-模組 import 時即套用 whisper anti-hallucination monkey-patch
-(_enable_whisper_anti_hallucination_defaults,冪等)——必須早於
-Docling AudioPipeline 首次 load whisper model。
+The whisper anti-hallucination monkey-patch (_enable_whisper_anti_hallucination_defaults, idempotent)
+is applied at module import time — it must run before the Docling AudioPipeline first loads the
+whisper model.
 """
 
 from __future__ import annotations
@@ -22,34 +21,20 @@ from src.log import get_api_logger
 
 logger = get_api_logger()
 
-# ---------------------------------------------------------------------------
-# Whisper anti-hallucination defaults — monkey-patch whisper.load_model
-# ---------------------------------------------------------------------------
-# Docling 4.x's _NativeWhisperModel.transcribe calls model.transcribe(path,
-# verbose=..., word_timestamps=...) with no other knobs — Whisper's built-in
-# hallucination guards stay at their (overly permissive) defaults.
-#
-# Under AMD ROCm where flash/mem-efficient attention is experimental and numerical
-# drift pushes some segments across no_speech threshold, the decoder falls into
-# YouTube-outro / Buddhist-chant / song-credit hallucination loops on non-speech
-# audio. NVIDIA shows the same mechanism with smaller blast radius.
-#
-# We patch whisper.load_model so every loaded model's transcribe() carries our
-# tighter defaults:
-#   - condition_on_previous_text=False:   each 30s decodes alone → no cascade
-#   - no_speech_threshold=0.7:            > 0.6 default; more silence drop
-#
-# We DON'T hardcode language=zh — the trim below ensures Whisper sees real speech
-# in its detection window, so auto-detect is reliable. Hardcoding zh would break
-# non-Chinese audio someday.
-# Idempotent. Fires once at module import, before Docling lazily instantiates the
-# audio pipeline via get_converter().
-# ---------------------------------------------------------------------------
+# Whisper anti-hallucination defaults via monkey-patch of whisper.load_model.
+# Docling 4.x calls model.transcribe() without hallucination knobs, leaving
+# whisper's overly permissive defaults. On non-speech audio the decoder falls
+# into outro/repetition hallucination loops (worse under AMD ROCm's experimental
+# attention). We bake tighter defaults into every loaded model:
+#   - condition_on_previous_text=False: each 30s decodes alone, no cascade
+#   - no_speech_threshold=0.7: drop more silence than the 0.6 default
+# We don't hardcode language=zh — the leading-silence trim below gives whisper a
+# real speech window so auto-detect stays reliable across languages.
+# Idempotent; runs at import before Docling lazily builds the audio pipeline.
 
 
 def _enable_whisper_anti_hallucination_defaults() -> None:
-    """Make every whisper.load_model() return a model whose transcribe() has
-    anti-hallucination defaults baked in. Idempotent."""
+    """Bake anti-hallucination defaults into every whisper.load_model() result. Idempotent."""
     try:
         import whisper
     except ImportError:
@@ -88,16 +73,10 @@ def _enable_whisper_anti_hallucination_defaults() -> None:
 _enable_whisper_anti_hallucination_defaults()
 
 
-# ---------------------------------------------------------------------------
-# Audio pre-processing — trim leading silence before Whisper
-# ---------------------------------------------------------------------------
-# Why: Whisper auto-detects language on the first 30s mel spectrogram window.
-# If those 30s are silent (e.g. meeting recording where host hasn't arrived),
-# the encoder gets near-zero activations and language detection falls back to
-# the highest-prior training language (English) — poisoning the whole transcript.
-# Pre-trimming gives Whisper a real speech window for detection.
-# Validated on 65min Taiwan presidential office mp3: en (36% confidence) → zh (99.8%).
-# ---------------------------------------------------------------------------
+# Trim leading silence before Whisper. Whisper auto-detects language on the first
+# 30s mel window; if those seconds are silent, the encoder gets near-zero
+# activations and detection falls back to the highest-prior language (English),
+# poisoning the whole transcript. Pre-trimming gives it a real speech window.
 
 _AUDIO_TRIM_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus", ".webm"}
 _SILENCE_THRESHOLD_DB = -35.0
@@ -119,12 +98,10 @@ _TRIM_CODEC_ARGS: dict[str, list[str]] = {
 }
 
 
-# Whisper hallucination patterns — Chinese training data leakage from YouTube.
-# Triggered when Whisper sees non-speech audio (intro music, chimes, silence) and falls
-# back to high-prior token sequences. Validated on 2026-05-21 presidential meeting mp3:
-# 1 song-credit + 9x "明镜与点点" outro at the start (before "各位貴賓請就座").
-# Only applied to audio files (.wav/.mp3); these rarely appear in legitimate transcripts
-# but applying broadly could false-positive on quoted content in PDFs.
+# Whisper hallucination patterns — Chinese YouTube training-data leakage that
+# surfaces when Whisper sees non-speech audio (intro music, chimes, silence) and
+# falls back to high-prior token sequences. Audio-only; applying to PDFs could
+# false-positive on legitimately quoted content.
 _WHISPER_HALLUCINATION_PATTERNS = [
     # Song credits — "詞・作曲・編曲 李宗盛" pattern (Whisper thinks it's a music video intro)
     re.compile(r"[词詞][・·•\s]{0,3}作曲[・·•\s]{0,3}[编編]曲\s*[一-鿿]{0,15}"),
@@ -143,11 +120,9 @@ _WHISPER_HALLUCINATION_PATTERNS = [
 ]
 
 
-# Generic "same phrase repeats N+ times in a row" detector. Whisper repetition
-# hallucinations (e.g., "請回座 請回座 請回座 ..." with zero-duration timestamps when
-# the model gets stuck in a token loop) don't need an explicit pattern — they show up
-# as consecutive duplicates of a 3-30 char Chinese phrase separated by whitespace/CJK
-# punctuation. Validated on 2026-05-21 meeting mp3: "請回座" × 7 consecutive copies.
+# Generic "same phrase repeats N+ times in a row" detector for Whisper repetition
+# hallucinations (the model stuck in a token loop): consecutive duplicates of a
+# 3-30 char Chinese phrase separated by whitespace/CJK punctuation.
 _REPETITION_PATTERN = re.compile(
     r"([一-鿿]{3,30})"        # phrase: 3-30 Chinese chars
     r"(?:[\s,，。、!?！?]*\1){2,}"      # plus ≥ 2 more identical copies → total ≥ 3
@@ -155,13 +130,10 @@ _REPETITION_PATTERN = re.compile(
 
 
 def _strip_consecutive_repetitions(text: str) -> tuple[str, int]:
-    """把連續重複 3+ 次的同一段 3-30 字中文片段收成 1 份(Whisper repetition 幻覺處理)。
+    """Collapse a 3-30 char Chinese phrase repeated 3+ times in a row into one copy.
 
-    Args:
-        text: 原始文字。
-
-    Returns:
-        ``(cleaned, n_excess_copies_removed)`` ─ cleaned 為收斂後文字。"""
+    Returns ``(cleaned, n_excess_copies_removed)``.
+    """
     if not text:
         return text, 0
     removed = 0
@@ -179,37 +151,27 @@ def _strip_consecutive_repetitions(text: str) -> tuple[str, int]:
 
 
 def _filter_whisper_hallucinations(text: str) -> tuple[str, int]:
-    """雙層過濾 Whisper 幻覺:已知 regex pattern + 通用連續重複 detector。
-
-    Args:
-        text: 原始 Whisper 輸出。
-
-    Returns:
-        ``(cleaned, n_stripped)`` ─ n_stripped 為總共拿掉的 match 數量。"""
+    """Two-layer Whisper hallucination filter: known regex patterns plus a generic
+    consecutive-repetition detector. Returns ``(cleaned, n_stripped)``.
+    """
     if not text:
         return text, 0
     total = 0
-    # Layer 1: known patterns
     for pat in _WHISPER_HALLUCINATION_PATTERNS:
         text, n = pat.subn("", text)
         total += n
-    # Layer 2: generic repetition (catches '請回座 請回座 ...' without enumerating phrases)
+    # Generic repetition catches loops without enumerating every phrase
     text, n = _strip_consecutive_repetitions(text)
     total += n
     return text, total
 
 
 def _detect_leading_silence_end(src: str) -> float:
-    """用 ffmpeg silencedetect 偵測開頭靜音結束時間(秒)。
+    """Detect the end time (seconds) of leading silence via ffmpeg silencedetect,
+    or 0.0 if there is no significant leading silence.
 
-    只抓「真的靜音」;前奏音樂 / 鐘聲等非語音由下游 Whisper 輸出階段的
-    _strip_consecutive_repetitions 處理。
-
-    Args:
-        src: 音檔路徑。
-
-    Returns:
-        靜音結束時間(秒);沒明顯開頭靜音回 0.0。
+    Only catches true silence; intro music/chimes are handled downstream by
+    _strip_consecutive_repetitions on the Whisper output.
     """
     af = f"silencedetect=noise={_SILENCE_THRESHOLD_DB}dB:duration={_SILENCE_MIN_DURATION}"
     cmd = ["ffmpeg", "-hide_banner", "-i", src, "-vn", "-af", af, "-f", "null", "-"]
@@ -222,20 +184,11 @@ def _detect_leading_silence_end(src: str) -> float:
 
 
 def _trim_audio_leading_silence(input_path: str, file_name: str) -> Optional[str]:
-    """去掉音檔開頭靜音,回 temp 檔路徑(沒靜音時回 None)。
+    """Trim leading silence from an audio file, returning a temp file path (None if none).
 
-    走 silencedetect 抓 timestamp + `-ss` seek + re-encode(ffmpeg 4.x 的 silenceremove
-    對長檔不可靠)。**caller 用完務必 `unlink()`**。
-
-    Args:
-        input_path: 原音檔路徑。
-        file_name: 顯示用檔名(log + 副檔名推測)。
-
-    Returns:
-        temp 檔路徑(已 trim);沒靜音時 None。
-
-    Raises:
-        RuntimeError: ffmpeg 失敗。
+    Uses silencedetect + an `-ss` seek + re-encode because ffmpeg 4.x's silenceremove
+    is unreliable on long files. The caller must `unlink()` the result when done.
+    Raises RuntimeError on ffmpeg failure.
     """
     seek_ts = _detect_leading_silence_end(input_path)
     detector = "ffmpeg silencedetect"
@@ -248,7 +201,7 @@ def _trim_audio_leading_silence(input_path: str, file_name: str) -> Optional[str
     tmp.close()
     out_path = tmp.name
 
-    # Unknown suffix → -c:a copy(fastest, lossless,大部分容器 ffmpeg 可以 keyframe-align seek)
+    # Unknown suffix → -c:a copy (fastest, lossless; ffmpeg can keyframe-align seek for most containers)
     codec_args = _TRIM_CODEC_ARGS.get(suffix, ["-c:a", "copy"])
 
     cmd = [

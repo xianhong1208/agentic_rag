@@ -1,13 +1,16 @@
 
-"""排隊上傳的 job 身分回歸測試
+"""Regression tests for the job identity of a queued upload.
 
-背景(2026-08 同事實測):folder 忙碌時上傳,回應拿到的是「別人的
-job_id」,drain 後真正的 job 又換了新 id — 前端看起來就是「job 紀錄
-消失/被覆蓋」。刪除後立刻重傳同檔最容易重現(撞上前 job 收尾窗口)。
+Uploading while a folder was busy returned someone else's job_id in the
+response, and after the drain the real job took yet another new id — the
+frontend saw the "job record disappear / get overwritten". Deleting and
+immediately re-uploading the same file reproduces it most easily (hitting the
+previous job's wind-down window).
 
-修正後的契約:排隊的上傳**入佇列當下**就有自己的 PENDING job 紀錄,
-job_id 從回應 → 排隊 → RUNNING → 終態全程不變;排隊期間被取消的 job
-由 dequeue 自動跳過。
+Fixed contract: a queued upload has its own PENDING job record **the moment it
+enters the queue**, and its job_id stays fixed through response → queued →
+RUNNING → terminal; a job cancelled while queued is skipped automatically at
+dequeue.
 """
 
 import asyncio
@@ -19,7 +22,7 @@ from src.domain.rag.index_job_manager import IndexingJobManager, JobStatus
 
 
 class SlowAdapter:
-    """可控完成時機的 stub adapter。"""
+    """Stub adapter with controllable completion timing."""
 
     def __init__(self):
         self.release = asyncio.Event()
@@ -54,22 +57,22 @@ async def _wait_status(m, job_id, statuses, timeout=5.0):
 
 
 async def test_queued_upload_gets_own_stable_job_id(manager):
-    """排隊上傳立刻有自己的 job_id,且全生命週期不變(TC-job-queue-01)"""
+    """A queued upload immediately has its own job_id, unchanged for its whole lifecycle (TC-job-queue-01)."""
     ad = SlowAdapter()
     j1 = await manager.start_indexing_files(
         ad, file_ids=["f1"], folder_id=7, token="t", chunk_size=None, chunk_overlap=None)
 
-    # folder 忙碌中再上傳 → 必須拿到「自己的」新 job_id,不是 j1 的
+    # Upload again while the folder is busy → must get its "own" new job_id, not j1's
     j2 = await manager.start_indexing_files(
         ad, file_ids=["f2"], folder_id=7, token="t", chunk_size=None, chunk_overlap=None)
     assert j2["job_id"] != j1["job_id"], "排隊上傳不能回別人的 job_id(舊 bug)"
     assert j2["status"] == "pending" and j2["queued"] is True
 
-    # 排隊的 job 立刻出現在列表(前端看得到「排隊中」)
+    # The queued job appears in the list immediately (the frontend can see "queued")
     listed = {j["job_id"] for j in manager.list_jobs(folder_id=7)}
     assert j2["job_id"] in listed
 
-    # 前一個 job 完成 → 排隊 job 以「同一個 id」啟動並完成
+    # The previous job completes → the queued job starts and completes under "the same id"
     ad.release.set()
     await _wait_status(manager, j1["job_id"], {"succeeded"})
     await _wait_status(manager, j2["job_id"], {"running"})
@@ -79,10 +82,11 @@ async def test_queued_upload_gets_own_stable_job_id(manager):
 
 
 async def test_queued_job_started_at_reset_on_launch(manager):
-    """排隊 job 的 started_at 在真正啟動時重設,不含排隊等待(TC-job-queue-03)
+    """A queued job's started_at is reset at actual launch, excluding the queue wait (TC-job-queue-03).
 
-    舊怪癖:started_at 在 enqueue 當下就定,dequeue 啟動後不變 → 前端把
-    排隊等待也算進耗時。修正後 started_at = 真正開始執行的時刻。
+    Previously started_at was fixed at enqueue and unchanged after dequeue, so
+    the frontend counted the queue wait as elapsed time. Now started_at is the
+    moment execution actually begins.
     """
     ad = SlowAdapter()
     j1 = await manager.start_indexing_files(
@@ -91,13 +95,13 @@ async def test_queued_job_started_at_reset_on_launch(manager):
         ad, file_ids=["y"], folder_id=9, token="t", chunk_size=None, chunk_overlap=None)
     assert j2["queued"] is True
 
-    # 排隊當下的 started_at(= 入佇列時刻)
+    # started_at while queued (= the moment it entered the queue)
     queued_started_at = (await manager.get_status(j2["job_id"]))["started_at"]
 
-    # 讓排隊等待有可測量的間隔(ISO8601 UTC 字串可直接字典序比較)
+    # Give the queue wait a measurable interval (ISO8601 UTC strings compare lexicographically)
     await asyncio.sleep(0.05)
 
-    # j1 完成 → j2 dequeue 真正啟動
+    # j1 completes → j2 is dequeued and actually launches
     ad.release.set()
     await _wait_status(manager, j1["job_id"], {"succeeded"})
     await _wait_status(manager, j2["job_id"], {"running"})
@@ -111,12 +115,13 @@ async def test_queued_job_started_at_reset_on_launch(manager):
 
 
 async def test_stale_cleanup_reentry_does_not_drain_queue(manager):
-    """非持有者的遲到 cleanup 不得 drain 佇列 / 搶佔 folder lock(TC-job-queue-04)
+    """A late cleanup from a non-owner must not drain the queue / seize the folder lock (TC-job-queue-04).
 
-    情境:H4 watchdog 強制回收 job1 的 lock 並 dequeue job2 後,job1 那個
-    wedged thread 終於跑完、finally 第二次呼叫 _cleanup_job_slot(job1)。
-    此時 job1 已非 lock 持有者 —— 若 drain 段無所有權守衛,它會把佇列中的
-    job3 也啟動並搶佔 lock → job2 與 job3 並發同寫一張表。
+    Scenario: after the watchdog forcibly reclaims job1's lock and dequeues job2,
+    job1's wedged thread finally finishes and its finally block calls
+    _cleanup_job_slot(job1) a second time. job1 is no longer the lock owner — if
+    the drain section had no ownership guard, it would also launch queued job3
+    and seize the lock, so job2 and job3 would concurrently write the same table.
     """
     ad = SlowAdapter()
     j1 = await manager.start_indexing_files(
@@ -124,18 +129,18 @@ async def test_stale_cleanup_reentry_does_not_drain_queue(manager):
     j2 = await manager.start_indexing_files(
         ad, file_ids=["b"], folder_id=11, token="t", chunk_size=None, chunk_overlap=None)
     assert j2["queued"] is True
-    # 等 j1 真正開跑(create_task 後需出讓點,calls 才會記到 ["a"])
+    # Wait until j1 actually starts (a yield point after create_task is needed before calls records ["a"])
     await _wait_status(manager, j1["job_id"], {"running"})
 
-    # 模擬「已被 reclaim 的 job」遲到重入:呼叫者已不是 lock 持有者
+    # Simulate a late re-entry from an "already reclaimed job": the caller is no longer the lock owner
     manager._cleanup_job_slot("stale-ghost-job-id", 11)
 
-    # lock 仍屬 j1、j2 仍安靜排隊、沒有任何新 job 被啟動
+    # The lock still belongs to j1, j2 stays quietly queued, and no new job is launched
     assert manager._active_folders.get(11) == j1["job_id"], "非持有者不得動 folder lock"
     assert ad.calls == [["a"]], "非持有者的 cleanup 不得啟動排隊 job"
     assert (await manager.get_status(j2["job_id"]))["status"] == "pending"
 
-    # 守衛不得破壞正常鏈:j1 完成 → j2 照常以同 id dequeue 執行
+    # The guard must not break the normal chain: j1 completes → j2 is dequeued and runs under the same id as usual
     ad.release.set()
     await _wait_status(manager, j1["job_id"], {"succeeded"})
     await _wait_status(manager, j2["job_id"], {"running"})
@@ -144,7 +149,7 @@ async def test_stale_cleanup_reentry_does_not_drain_queue(manager):
 
 
 async def test_cancelled_queued_job_is_skipped_at_dequeue(manager):
-    """排隊期間被取消的 job,dequeue 自動跳過、輪到下一個(TC-job-queue-02)"""
+    """A job cancelled while queued is skipped automatically at dequeue, moving to the next (TC-job-queue-02)."""
     ad = SlowAdapter()
     j1 = await manager.start_indexing_files(
         ad, file_ids=["a"], folder_id=8, token="t", chunk_size=None, chunk_overlap=None)
@@ -153,17 +158,17 @@ async def test_cancelled_queued_job_is_skipped_at_dequeue(manager):
     j3 = await manager.start_indexing_files(
         ad, file_ids=["c"], folder_id=8, token="t", chunk_size=None, chunk_overlap=None)
 
-    # 排隊中取消 j2(對應「上傳後馬上刪檔」)
+    # Cancel j2 while queued (corresponds to "delete the file right after upload")
     assert await manager.cancel_job(j2["job_id"]) is True
     st2 = await manager.get_status(j2["job_id"])
     assert st2["status"] == "cancelled"
 
-    # j1 完成 → 跳過 j2,直接啟動 j3(同 id)
+    # j1 completes → skip j2 and launch j3 directly (same id)
     ad.release.set()
     await _wait_status(manager, j1["job_id"], {"succeeded"})
     await _wait_status(manager, j3["job_id"], {"running"})
     assert ad.calls[-1] == ["c"]
     ad.release.set()
     await _wait_status(manager, j3["job_id"], {"succeeded"})
-    # j2 維持 cancelled,沒有被 dequeue 復活
+    # j2 stays cancelled, not revived by dequeue
     assert (await manager.get_status(j2["job_id"]))["status"] == "cancelled"

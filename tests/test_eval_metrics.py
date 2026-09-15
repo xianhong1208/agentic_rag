@@ -1,8 +1,9 @@
 
-"""BL-01/02 — 評測指標純函式(evals/metrics.py)。
+"""Evaluation-metric pure functions (evals/metrics.py).
 
-CER(字元錯誤率)、簡體字比率(啟發式)、recall@k、MRR — 全部純邏輯,
-跑分腳本(scripts/run_rag_eval.py / run_asr_eval.py)共用。"""
+CER (character error rate), simplified-character ratio (heuristic), recall@k,
+and MRR — all pure logic, shared by the scoring scripts
+(scripts/run_rag_eval.py / run_asr_eval.py)."""
 
 import pytest
 
@@ -17,15 +18,15 @@ class TestCER:
         assert cer("甲乙丙", "子丑寅") == 1.0
 
     def test_single_substitution(self):
-        # 8 字參考,1 字替換 → 1/8
+        # 8-character reference, 1 character substituted → 1/8
         assert cer("今天開會討論預算", "今天開會討論預專") == pytest.approx(1 / 8)
 
     def test_insertion_and_deletion(self):
-        assert cer("開會", "開個會") == pytest.approx(1 / 2)   # 1 插入 / 參考長 2
-        assert cer("開個會", "開會") == pytest.approx(1 / 3)   # 1 刪除 / 參考長 3
+        assert cer("開會", "開個會") == pytest.approx(1 / 2)   # 1 insertion / reference length 2
+        assert cer("開個會", "開會") == pytest.approx(1 / 3)   # 1 deletion / reference length 3
 
     def test_whitespace_and_punct_normalized(self):
-        """預設 normalize:空白與標點不計入(ASR 輸出常無標點,不該因此罰分)。"""
+        """Default normalization: whitespace and punctuation are ignored (ASR output often lacks punctuation and should not be penalized for it)."""
         assert cer("今天,開會。", "今天開會") == 0.0
         assert cer("today meeting", "todaymeeting") == 0.0
 
@@ -54,7 +55,7 @@ class TestRetrievalMetrics:
         assert recall_at_k(retrieved=["a", "b", "c"], expected=["c"], k=2) == 0.0
 
     def test_recall_partial(self):
-        # 期望兩檔,k 內命中一檔 → 0.5
+        # Two expected files, one hit within k → 0.5
         assert recall_at_k(retrieved=["a", "x"], expected=["a", "b"], k=2) == 0.5
 
     def test_mrr_first_hit_position(self):

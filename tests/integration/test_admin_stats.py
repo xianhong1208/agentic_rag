@@ -1,7 +1,8 @@
 
-"""db/admin_stats 彙總查詢 — 真庫驗證(Control Center 資料面)。
+"""db/admin_stats aggregate queries -- real-DB verification (Control Center data plane).
 
-用 itest fixtures 造 folder/file/index/job,斷言四個彙總的數字對得上。
+Uses itest fixtures to create folder/file/index/job, then asserts the four
+aggregates report the correct numbers.
 """
 
 import uuid
@@ -11,7 +12,7 @@ import pytest
 
 @pytest.fixture()
 def seeded(itest_db, folder, file_row):
-    """folder + 1 檔案 + 1 筆 indexed FileIndex + 1 筆 failed job。"""
+    """folder + 1 file + 1 indexed FileIndex + 1 failed job."""
     from db.fileindexdb import FileIndexDB
     from db.indexjobdb import IndexJobDB
     FileIndexDB.upsert_indexed(

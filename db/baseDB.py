@@ -1,13 +1,14 @@
+"""Generic base class providing CRUD operations for ORM-backed tables."""
 
 from db.db import Session as DBSession
 from sqlalchemy.exc import IntegrityError
 
-# 需要在 log 中遮罩的敏感欄位
+# Sensitive fields to mask in logs
 SENSITIVE_FIELDS = {'user_token', 'token', 'password', 'secret'}
 
 
 def _mask_sensitive_data(data: dict) -> dict:
-    """遮罩敏感欄位，只顯示前 8 個字元"""
+    """Mask sensitive fields, keeping only the first 8 characters."""
     masked = {}
     for key, value in data.items():
         if key in SENSITIVE_FIELDS and isinstance(value, str) and len(value) > 8:
@@ -18,10 +19,9 @@ def _mask_sensitive_data(data: dict) -> dict:
 
 
 class BaseDB:
-    """
-    Base class for database operations providing CRUD functionalities.
-    """
-    
+    """Base class providing generic CRUD operations for a subclass's ORM table."""
+
+
     @classmethod
     def get_orm_class(cls):
         raise NotImplementedError("Subclasses must implement get_orm_class method")

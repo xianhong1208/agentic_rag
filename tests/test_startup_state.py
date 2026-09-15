@@ -1,11 +1,13 @@
 
-"""M15 前置回歸測試 — 啟動期能力載入失敗登記表。
+"""Regression tests — the startup-time capability-load failure registry.
 
-背景:app.py 載入 router/module 用 broad try/except,失敗只記 log → server 照常
-啟動且 /health 顯示 healthy,但該端點靜默 404(能力靜默流失,排查困難)。
-startup_state 把載入失敗登記起來,讓 /health/detailed 反映出「哪些能力掛了」。
+app.py loads routers/modules under a broad try/except; a failure was only
+logged, so the server still started and /health reported healthy while the
+affected endpoint silently 404'd (capabilities dropped silently, hard to
+diagnose). startup_state records load failures so /health/detailed can report
+which capabilities failed to load.
 
-純邏輯,零外部依賴。
+Pure logic, no external dependencies.
 """
 
 import pytest
@@ -24,12 +26,12 @@ def test_record_and_get():
     startup_state.record_load_failure("rag_indexing", ImportError("boom"))
     failures = startup_state.get_load_failures()
     assert "rag_indexing" in failures
-    # 存例外類型名(不外洩完整訊息;細節在 log)
+    # Store the exception type name (do not leak the full message; details go to the log)
     assert failures["rag_indexing"] == "ImportError"
 
 
 def test_get_returns_copy_not_internal():
-    """回傳應是副本,呼叫端改它不影響內部狀態。"""
+    """The return value should be a copy; the caller mutating it must not affect internal state."""
     startup_state.record_load_failure("m", ValueError("x"))
     got = startup_state.get_load_failures()
     got["injected"] = "y"
@@ -43,6 +45,6 @@ def test_clear():
 
 
 def test_string_error_accepted():
-    """也接受純字串原因(非例外物件)。"""
+    """A plain string reason (not an exception object) is also accepted."""
     startup_state.record_load_failure("m", "custom reason")
     assert startup_state.get_load_failures()["m"] == "custom reason"

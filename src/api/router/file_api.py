@@ -1,8 +1,8 @@
 
-"""文件操作 API 路由
+"""File operations API routes.
 
-提供文件上傳、下載、更新、刪除等 REST API 接口
-支援基於空間和資料夾的文件管理
+Provides REST API endpoints for file upload, download, update, and deletion.
+Supports space- and folder-based file management.
 """
 import traceback
 from urllib.parse import quote
@@ -30,22 +30,20 @@ from src.adapter.rag import get_rag_adapter
 from src.log import get_api_logger
 from db.file_with_index_db import FileWithIndexDB
 
-# 獲取日誌實例
 logger = get_api_logger()
 
 router = APIRouter(tags=["Files"], prefix="/folders", dependencies=[Depends(authenticate_request)])
 
-# Resource = File;Response = {file_info: FileResource, indexing: IndexingMetadata, message}
-# auto_index=True 時 indexing 區塊含 background job_id;否則 enabled=false
+# When auto_index=True the indexing block includes a background job_id; otherwise enabled=false
 @router.post(
     path="/{folder_id}/file",
     summary="Upload File",
     description="Upload a file to a specified folder",
     response_model=FileUploadResponse,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder 不存在"},
-        409: {"model": ErrorDetailResponse, "description": "同 folder 內檔名已存在"},
-        400: {"model": ErrorDetailResponse, "description": "驗證失敗(檔案過大、格式不支援等)"},
+        404: {"model": ErrorDetailResponse, "description": "folder not found"},
+        409: {"model": ErrorDetailResponse, "description": "a file with the same name already exists in the folder"},
+        400: {"model": ErrorDetailResponse, "description": "validation failed (file too large, unsupported format, etc.)"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -53,17 +51,17 @@ async def upload_file(
     folder_id: int,
     file: UploadFile = File(...),
     description: Optional[str] = Form(None),
-    tags: Optional[str] = Form(None),  # Accept comma-separated string, will convert to list
-    auto_index: bool = Form(True),  # ✅ NEW: Auto-indexing enabled by default
+    tags: Optional[str] = Form(None),
+    auto_index: bool = Form(True),
     user_token: str = Depends(extract_token),
 ):
     """
     Args:
-        folder_id: 資料夾 ID
-        file: 要上傳的文件
-        description: 文件描述 (可選)
-        tags: 文件標籤 (可選，逗號分隔的字符串，如 "tag1,tag2,tag3")
-        auto_index: 是否自動索引文件到向量存儲，默認為 True
+        folder_id: Folder ID
+        file: The file to upload
+        description: File description (optional)
+        tags: File tags (optional; comma-separated string, e.g. "tag1,tag2,tag3")
+        auto_index: Whether to automatically index the file into the vector store; defaults to True
     """
 
     logger.info(f"Starting file upload: {file.filename} to folder {folder_id}, auto_index={auto_index})")
@@ -75,12 +73,10 @@ async def upload_file(
             raise HTTPException(status_code=404, detail=f"folder {folder_id} not found")
         file_content = await file.read()
 
-        # Convert comma-separated tags string to list
         tags_list = None
         if tags:
             tags_list = [tag.strip() for tag in tags.split(',') if tag.strip()]
 
-        # Construct file data dictionary
         file_data = {
             'file_content': file_content,
             'file_name': file.filename,
@@ -88,7 +84,6 @@ async def upload_file(
             'tags': tags_list
         }
 
-        # Single file upload via adapter
         upload_result = await FileAdapter.upload_file(
             files_data=file_data,
             folder_id=folder_id,
@@ -97,20 +92,15 @@ async def upload_file(
 
         logger.info(f"File upload completed: {file.filename} to folder {folder_id}")
 
-        # ✅ NEW: Trigger auto-indexing if enabled
         indexing_metadata = None
         if auto_index:
             try:
-                # Extract file ID from upload result
-                # upload_result is [FileConfigData] for single file
                 if isinstance(upload_result, list):
-                    # Single file case: [FileConfigData]
                     uploaded_file_ids = [str(f.id) for f in upload_result]
                 else:
                     # This shouldn't happen for single file, but handle gracefully
                     uploaded_file_ids = []
 
-                # Trigger auto-indexing
                 if uploaded_file_ids:
                     indexing_metadata = await get_rag_adapter().trigger_auto_index(
                         file_ids=uploaded_file_ids,
@@ -127,9 +117,7 @@ async def upload_file(
                     "message": f"Warning: Auto-indexing failed: {str(e)}"
                 }
 
-        # ✅ NEW: Enhanced response with indexing metadata
         if isinstance(upload_result, list) and len(upload_result) > 0:
-            # Convert Pydantic model to dict for proper JSON serialization
             file_info = upload_result[0].model_dump() if hasattr(upload_result[0], 'model_dump') else upload_result[0]
             response = {
                 "file_info": file_info,
@@ -137,7 +125,6 @@ async def upload_file(
                 "message": "File uploaded successfully"
             }
         else:
-            # Convert Pydantic model to dict for proper JSON serialization
             file_info = upload_result.model_dump() if hasattr(upload_result, 'model_dump') else upload_result
             response = {
                 "file_info": file_info,
@@ -160,7 +147,6 @@ async def upload_file(
 
 
 
-# 回傳原檔案 binary stream(non-JSON);Content-Type 視檔案 mime_type
 @router.get(
     path="/{folder_id}/files/{file_id}/download",
     summary="Download File",
@@ -169,9 +155,9 @@ async def upload_file(
     responses={
         200: {
             "content": {"application/octet-stream": {}},
-            "description": "檔案內容 binary stream(Content-Type 依檔案 mime_type 而定)",
+            "description": "file content binary stream (Content-Type depends on the file's mime_type)",
         },
-        404: {"model": ErrorDetailResponse, "description": "folder / file 不存在"},
+        404: {"model": ErrorDetailResponse, "description": "folder / file not found"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -182,8 +168,8 @@ async def download_file(
 ):
     """
     Args:
-        folder_id: 資料夾 ID
-        file_id: 文件 ID (UUID)
+        folder_id: Folder ID
+        file_id: File ID (UUID)
     """
     try:
         result = await FolderAdapter.get_folder(id=folder_id, user_token=user_token)
@@ -213,7 +199,6 @@ async def download_file(
         ascii_filename = file_data.file_name.encode('ascii', 'ignore').decode('ascii') or 'download'
         encoded_filename = quote(file_data.file_name)
 
-        # Create streaming response
         def generate():
             yield file_data.file_content
 
@@ -248,15 +233,14 @@ async def download_file(
         raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
 
 
-# Resource = FileResource(更新後)
 @router.patch(
     "/{folder_id}/files/{file_id}",
     summary="Update file metadata",
     response_model=FileResource,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder / file 不存在"},
-        409: {"model": ErrorDetailResponse, "description": "改名後撞名"},
-        400: {"model": ErrorDetailResponse, "description": "參數錯"},
+        404: {"model": ErrorDetailResponse, "description": "folder / file not found"},
+        409: {"model": ErrorDetailResponse, "description": "rename collides with an existing name"},
+        400: {"model": ErrorDetailResponse, "description": "invalid parameters"},
     },
 )
 async def update_file(
@@ -265,7 +249,7 @@ async def update_file(
     requests: UpdateFileRequest,
     user_token: str = Depends(extract_token),
 ):
-    """更新指定文件的元數據"""
+    """Update the metadata of a specified file."""
     try:
         result = await FolderAdapter.get_folder(id=folder_id, user_token=user_token)
         if not result:
@@ -280,8 +264,8 @@ async def update_file(
         )
 
         logger.info(f"File metadata updated successfully: file_id={file_id}, folder_id={folder_id}")
-        # response_model=FileResource(single)→ 直接回 result[0],不要再 wrap
-        # `{"file_info": ...}`(那 shape 是 upload_file 的 FileUploadResponse 才有)。
+        # response_model=FileResource (single) -> return result[0] directly; do not wrap it in
+        # `{"file_info": ...}` (that shape belongs to upload_file's FileUploadResponse).
         return result[0]
 
     except ToolError as e:
@@ -308,13 +292,12 @@ async def update_file(
         raise HTTPException(status_code=500, detail=f"Update file metadata failed: {str(e)}")
 
 
-# Response = {success: bool, message: str}
 @router.delete(
     "/{folder_id}/files/{file_id}",
     summary="Delete file",
     response_model=FileDeletedResponse,
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder / file 不存在"},
+        404: {"model": ErrorDetailResponse, "description": "folder / file not found"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -323,13 +306,12 @@ async def delete_file(
     file_id: UUID,
     user_token: str = Depends(extract_token),
 ):
-    """刪除指定的文件"""
+    """Delete a specified file."""
     try:
         result = await FolderAdapter.get_folder(id=folder_id, user_token=user_token)
         if not result:
             raise HTTPException(status_code=404, detail=f"folder {folder_id} not found")
         
-        # 首先獲取文件信息以確認文件存在
         file_info_result = await FileAdapter.get_file(user_token=user_token, folder_id=folder_id, id=file_id)
 
         if not file_info_result:
@@ -338,7 +320,6 @@ async def delete_file(
 
         file_info = file_info_result[0]
 
-        # 調用合併後的刪除函數（單個文件）
         result = await FileAdapter.delete_file(
             file_ids=file_id,
             folder_id=file_info.folder_id,
@@ -372,36 +353,35 @@ async def delete_file(
         raise HTTPException(status_code=500, detail=f"Delete file failed: {str(e)}")
 
 
-# Batch upload — response shape 跟單檔不同:含 successful/failed/skipped lists
-# (adapter 內部已 return dict;這裡不強制 response_model 因為 nested batch 結構複雜)
+# Batch upload — the response shape differs from single-file: it includes successful/failed/skipped lists
+# (the adapter already returns a dict; no response_model is enforced here because the nested batch structure is complex)
 @router.post(
     "/{folder_id}/files",
     summary="Upload multiple files (batch)",
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder 不存在"},
-        409: {"model": ErrorDetailResponse, "description": "部分檔案同名衝突"},
+        404: {"model": ErrorDetailResponse, "description": "folder not found"},
+        409: {"model": ErrorDetailResponse, "description": "some files have name conflicts"},
         500: {"model": ErrorDetailResponse},
     },
 )
 async def upload_files(
     folder_id: int,
     files: List[UploadFile] = File(...),
-    auto_index: bool = Form(True),  # ✅ NEW: Auto-indexing enabled by default
+    auto_index: bool = Form(True),
     user_token: str = Depends(extract_token),
 ):
-    """批次上傳文件到指定資料夾
+    """Batch-upload files to a specified folder.
 
     Args:
-        folder_id: 資料夾 ID
-        files: 要上傳的文件列表        
-        auto_index: 是否自動索引文件到向量存儲，默認為 True
+        folder_id: Folder ID
+        files: The list of files to upload
+        auto_index: Whether to automatically index files into the vector store; defaults to True
     """
     try:
         result = await FolderAdapter.get_folder(id=folder_id, user_token=user_token)
         if not result:
             raise HTTPException(status_code=404, detail=f"folder {folder_id} not found")
 
-        # 準備文件數據列表
         files_data = []
         for file in files:
             file_content = await file.read()
@@ -414,7 +394,6 @@ async def upload_files(
 
         logger.info(f"Starting batch upload: {len(files)} files to folder {folder_id} (auto_index={auto_index})")
 
-        # 調用適配器函數（批次上傳）
         upload_result = await FileAdapter.upload_file(
             files_data=files_data,
             folder_id=folder_id,
@@ -423,22 +402,17 @@ async def upload_files(
 
         logger.info(f"Batch upload completed: folder={folder_id}")
 
-        # ✅ NEW: Trigger auto-indexing if enabled
         indexing_metadata = None
         if auto_index:
             try:
-                # Extract file IDs from upload result
-                # For batch uploads, upload_result is a dict with 'successful_uploads' list of dicts
                 uploaded_file_ids = []
                 if isinstance(upload_result, dict):
-                    # Batch upload case: successful_uploads contains dicts
                     if 'successful_uploads' in upload_result:
                         uploaded_file_ids = [str(f['id']) for f in upload_result['successful_uploads']]
                     elif 'files' in upload_result:
                         uploaded_file_ids = [str(f['id']) for f in upload_result['files']]
 
                 if uploaded_file_ids:
-                    # Trigger auto-indexing for newly uploaded files only
                     indexing_metadata = await get_rag_adapter().trigger_auto_index(
                         file_ids=uploaded_file_ids,
                         folder_id=folder_id,
@@ -447,7 +421,6 @@ async def upload_files(
                     )
                     logger.info(f"Auto-indexing triggered for {len(uploaded_file_ids)} uploaded files")
                 else:
-                    # No successfully uploaded files to index
                     indexing_metadata = {
                         "auto_index_enabled": False,
                         "message": "No files were successfully uploaded to index"
@@ -460,9 +433,8 @@ async def upload_files(
                     "message": f"Warning: Auto-indexing failed: {str(e)}"
                 }
 
-        # ✅ NEW: Enhanced response with indexing metadata
         response = {
-            **upload_result,  # Include all original fields (successful_uploads, failed_uploads, etc.)
+            **upload_result,
             "indexing": indexing_metadata if indexing_metadata else {"auto_index_enabled": False, "message": "Auto-indexing disabled"}
         }
 
@@ -496,50 +468,49 @@ async def upload_files(
         raise HTTPException(status_code=500, detail=f"Batch upload failed: {str(e)}")
 
 
-# Resource = List[FileResource](或單一,當帶 file_id/file_name 時)
-# include_index_status=True 時每筆會多帶 indexed_at / status / num_chunks(走 JOIN)
+# When include_index_status=True each entry also carries indexed_at / status / num_chunks (via JOIN)
 @router.get(
     "/{folder_id}/files",
     summary="List or get files",
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder / file 不存在"},
-        400: {"model": ErrorDetailResponse, "description": "參數錯"},
+        404: {"model": ErrorDetailResponse, "description": "folder / file not found"},
+        400: {"model": ErrorDetailResponse, "description": "invalid parameters"},
     },
 )
 async def list_files(
     folder_id: int,
-    file_id: Optional[UUID] = Query(None, description="文件 ID（若提供則返回單個文件資訊）"),
-    file_name: Optional[str] = Query(None, description="文件名稱（若提供則根據名稱查找文件）"),
-    search_tags: Optional[str] = Query(None, description="搜尋標籤（部分匹配）"),
-    mime_type_filter: Optional[str] = Query(None, description="MIME 類型過濾器（部分匹配）"),
-    include_index_status: bool = Query(True, description="包含文件索引狀態（使用 JOIN 優化）"),
+    file_id: Optional[UUID] = Query(None, description="file ID (if provided, returns info for the single file)"),
+    file_name: Optional[str] = Query(None, description="file name (if provided, looks up the file by name)"),
+    search_tags: Optional[str] = Query(None, description="search tags (partial match)"),
+    mime_type_filter: Optional[str] = Query(None, description="MIME type filter (partial match)"),
+    include_index_status: bool = Query(True, description="include file index status (JOIN-optimized)"),
     user_token: str = Depends(extract_token),
 ):
-    """列出資料夾內檔案,或依 file_id / file_name 取單筆。
+    """List files in a folder, or fetch a single one by file_id / file_name.
 
-    使用 JOIN query 一次抓回 file + index status,避開 N+1(對大 folder 10-100x 加速)。
-    若不需 index 資訊可設 include_index_status=False 再加快。
+    Uses a JOIN query to fetch file + index status in one shot, avoiding N+1 (10-100x faster on
+    large folders). If index info isn't needed, set include_index_status=False for extra speed.
 
     Args:
-        folder_id: 資料夾 id。
-        file_id: 給就回單筆;優先序最高。
-        file_name: 給就依名稱查;次優先。
-        search_tags: tag 部分比對。
-        mime_type_filter: MIME 部分比對。
-        include_index_status: True → 回傳含 indexed_at / status / num_chunks 等欄位。
-        user_token: 使用者 token(權限驗證)。
+        folder_id: Folder id.
+        file_id: If given, returns a single file; highest priority.
+        file_name: If given, looks up by name; second priority.
+        search_tags: Partial tag match.
+        mime_type_filter: Partial MIME match.
+        include_index_status: True -> return fields including indexed_at / status / num_chunks.
+        user_token: User token (permission check).
 
     Returns:
-        list 或 dict(視查詢參數而定);每筆含基本 File 欄位 + 可選 index 欄位。
+        A list or dict (depending on the query parameters); each entry has the basic File fields
+        plus optional index fields.
     """
     try:
         folder_list = await FolderAdapter.get_folder(id=folder_id, user_token=user_token)
         if not folder_list:
             raise HTTPException(status_code=404, detail=f"folder {folder_id} not found")
         
-        folder = folder_list[0]  # 取得第一個資料夾記錄
+        folder = folder_list[0]
 
-        # 如果提供 file_id，返回單個文件資訊
         if file_id is not None:
             logger.info(f"Fetching file info: file_id={file_id} in folder {folder_id}")
             result = await FileAdapter.get_file(user_token=user_token, folder_id=folder.id, id=file_id)
@@ -550,7 +521,6 @@ async def list_files(
             logger.info(f"File info retrieved successfully: file_id={file_id}, folder_id={folder_id}")
             return {"file_info": result[0]}
 
-        # 如果提供 file_name，根據名稱查找文件
         if file_name:
             logger.info(f"Fetching file info by name: file_name={file_name} in folder {folder_id}")
             result = await FileAdapter.get_file(user_token=user_token, folder_id=folder.id, file_name=file_name)
@@ -561,8 +531,6 @@ async def list_files(
             logger.info(f"File info retrieved successfully by name: file_name={file_name}, folder_id={folder_id}")
             return {"file_info": result[0]}
 
-        # 否則列出所有文件
-        # Use optimized JOIN query if index status is requested
         if include_index_status:
             files_with_index = FileWithIndexDB.get_files_with_index_status(folder.id)
 
@@ -570,7 +538,6 @@ async def list_files(
                 logger.info(f"No files found in folder: folder_id={folder_id}")
                 return {"files": [], "message": "No files found in folder"}
 
-            # Apply filters if provided
             filtered_files = files_with_index
             if search_tags:
                 # Search in JSONB array: check if any tag contains the search string
@@ -596,7 +563,6 @@ async def list_files(
                 logger.info(f"No files found in folder: folder_id={folder_id}")
                 return {"files": [], "message": "No files found in folder"}
 
-            # 過濾功能（如果需要的話）
             filtered_files = result
             if search_tags:
                 # Search in JSONB array: check if any tag contains the search string
@@ -635,13 +601,11 @@ async def list_files(
         raise HTTPException(status_code=500, detail=f"List files failed: {str(e)}")
 
 
-# Batch delete — body 帶 file_ids list 或 delete_all=true
-# Response 為 batch result dict(含 deleted_count / failed list)
 @router.delete(
     "/{folder_id}/files",
     summary="Delete multiple files (batch)",
     responses={
-        404: {"model": ErrorDetailResponse, "description": "folder 不存在"},
+        404: {"model": ErrorDetailResponse, "description": "folder not found"},
         500: {"model": ErrorDetailResponse},
     },
 )
@@ -650,15 +614,14 @@ async def delete_files(
     folder_id: int,
     user_token: str = Depends(extract_token),
 ):
-    """批次刪除指定資料夾中的文件"""
+    """Batch-delete files in a specified folder."""
     try:
         folder_list = await FolderAdapter.get_folder(id=folder_id, user_token=user_token)
         if not folder_list:
             raise HTTPException(status_code=404, detail=f"folder {folder_id} not found")
         
-        folder = folder_list[0]  # 取得第一個資料夾記錄
+        folder = folder_list[0]
 
-        # 調用合併後的刪除函數（批次刪除）
         result = await FileAdapter.delete_file(
             file_ids=requests.file_ids,
             folder_id=folder.id,

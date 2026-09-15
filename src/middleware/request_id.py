@@ -1,16 +1,15 @@
+"""Request ID middleware.
 
-"""Request ID 中間件
-
-為每個 HTTP 請求產生唯一 request_id，注入 contextvars。
-所有後續的 logger 呼叫（任何層）都會自動帶上這個 ID。
-用法：grep "rid=abc12345" logs/*/info_*.log → 串聯整條請求鏈路
+Generates a unique request_id per HTTP request and injects it into contextvars,
+so every subsequent logger call (at any layer) carries it for tracing a whole
+request chain.
 """
 
 from src.log import set_request_id, generate_request_id
 
 
 class RequestIdMiddleware:
-    """為每個 HTTP 請求產生唯一 request_id"""
+    """Generate a unique request_id for each HTTP request."""
 
     def __init__(self, app):
         self.app = app

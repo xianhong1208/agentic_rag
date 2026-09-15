@@ -1,14 +1,11 @@
 
-"""BL-05 — chunk 記錄化(引用溯源)單元測試。
+"""BL-05 -- unit tests for chunk records (citation provenance).
 
-_refine_chunks_for_token_budget 從回 List[str] 改回 List[dict]
-(``{"text", "headings", "page_no"}``),契約:
-- 過大塊拆分:每段繼承源塊 meta
-- 小塊合併:取 buffer 首塊 meta
-- 裸字串輸入(fallback 路徑):meta 為 None
-- leaf_splitter 把記錄的 headings/page_no 注入 leaf Document.metadata
-
-tokenizer 用 1 char = 1 token 的假物件,不碰 HuggingFace。
+_refine_chunks_for_token_budget returns List[dict] of {text, headings, page_no}.
+Contract: an oversized-chunk split has each segment inherit the source meta; a
+small-chunk merge takes the buffer's first chunk's meta; bare-string input
+yields None meta; leaf_splitter injects headings/page_no into leaf metadata.
+The fake tokenizer is 1 char = 1 token, never touching HuggingFace.
 """
 
 from types import SimpleNamespace
@@ -20,14 +17,14 @@ from src.domain.rag.docling_loader import (
 
 
 class LenTokenizer:
-    """1 字元 = 1 token(_count_tokens 走 encode(add_special_tokens=False))。"""
+    """1 char = 1 token (_count_tokens uses encode(add_special_tokens=False))."""
 
     def encode(self, text, add_special_tokens=False):
         return list(text)
 
 
 def _mk_chunk(text, headings=None, page_no=None):
-    """仿 docling HierarchicalChunker chunk 物件(meta.headings + doc_items.prov)。"""
+    """Mimic a docling HierarchicalChunker chunk object (meta.headings + doc_items.prov)."""
     prov = [SimpleNamespace(page_no=page_no)] if page_no is not None else []
     doc_items = [SimpleNamespace(prov=prov)]
     return SimpleNamespace(
@@ -39,8 +36,6 @@ def _mk_chunk(text, headings=None, page_no=None):
 TOK = LenTokenizer()
 
 
-# ---- _chunk_provenance ------------------------------------------------------
-
 class TestChunkProvenance:
     def test_bare_string_no_meta(self):
         assert _chunk_provenance("純字串") == {"headings": None, "page_no": None}
@@ -50,12 +45,12 @@ class TestChunkProvenance:
         assert _chunk_provenance(c) == {"headings": ["第一章", "1.1 節"], "page_no": 3}
 
     def test_missing_fields_defensive(self):
-        # meta 在但 headings 空、prov 空 → 全 None,不炸
+        # meta present but headings empty, prov empty -> all None, no crash
         c = _mk_chunk("x", headings=[], page_no=None)
         assert _chunk_provenance(c) == {"headings": None, "page_no": None}
 
     def test_page_no_from_first_prov_only(self):
-        # 多 doc_items:取第一個有 page_no 的
+        # Multiple doc_items: take the first one with a page_no
         c = SimpleNamespace(
             text="x",
             meta=SimpleNamespace(
@@ -70,11 +65,9 @@ class TestChunkProvenance:
         assert _chunk_provenance(c)["page_no"] == 7
 
 
-# ---- _refine_chunks_for_token_budget(記錄化契約)---------------------------
-
 class TestRefineRecords:
     def test_bare_strings_yield_none_meta(self):
-        # fallback 切分路徑餵裸字串 → 記錄 meta 為 None
+        # The fallback split path feeds bare strings -> record meta is None
         out = _refine_chunks_for_token_budget(["a" * 15], TOK, max_tokens=20)
         assert out == [{"text": "a" * 15, "headings": None, "page_no": None}]
 
@@ -84,7 +77,7 @@ class TestRefineRecords:
         assert out == [{"text": "b" * 15, "headings": ["H"], "page_no": 2}]
 
     def test_oversized_split_inherits_meta(self):
-        # 3 行 × 10 chars,budget 10 → 拆多段,每段都繼承源塊 meta
+        # 3 lines x 10 chars, budget 10 -> split into several segments, each inheriting the source chunk's meta
         text = "\n".join(["r" * 10] * 3)
         c = _mk_chunk(text, headings=["表格章"], page_no=5)
         out = _refine_chunks_for_token_budget([c], TOK, max_tokens=10)
@@ -95,7 +88,7 @@ class TestRefineRecords:
             assert len(rec["text"]) <= 10
 
     def test_merge_takes_first_chunk_meta(self):
-        # 兩小塊(各 3 tokens < threshold 10)合併 → 取首塊 meta
+        # Two small chunks (each 3 tokens < threshold 10) merge -> take the first chunk's meta
         c1 = _mk_chunk("aaa", headings=["首章"], page_no=1)
         c2 = _mk_chunk("bbb", headings=["次章"], page_no=9)
         out = _refine_chunks_for_token_budget([c1, c2], TOK, max_tokens=20)
@@ -105,8 +98,6 @@ class TestRefineRecords:
         out = _refine_chunks_for_token_budget(["   ", ""], TOK, max_tokens=20)
         assert out == []
 
-
-# ---- leaf_splitter 注入 leaf metadata ---------------------------------------
 
 class TestLeafSplitterProvenance:
     def _split(self, chunks):
@@ -129,10 +120,10 @@ class TestLeafSplitterProvenance:
         md = leaves[0].metadata
         assert md["headings"] == ["第一章"]
         assert md["page_no"] == 2
-        assert md["file_id"] == "f1"  # 文件級 metadata 仍在
+        assert md["file_id"] == "f1"  # document-level metadata is still present
 
     def test_none_provenance_not_injected(self):
-        # meta 為 None(音檔/裸字串)→ 不塞 key,不污染 node metadata
+        # meta is None (audio/bare string) -> do not insert the key, do not pollute node metadata
         leaves = self._split([
             {"text": "音檔轉錄段", "headings": None, "page_no": None},
             "裸字串段",

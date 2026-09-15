@@ -1,14 +1,10 @@
 
-"""Control Center 管理面 API — folder / file / index 的 CRUD 與操作。
+"""Control Center management API — CRUD and operations for folders / files / index.
 
-設計:**act-as-owner** — folder 綁定 user_token(多租戶),console 對某
-folder 的操作一律以「該 folder 的擁有者 token」呼叫既有 REST 端點函式
-(folder_api / file_api / rag_indexing),讓 job-cancel、軟刪、向量清理、
-儲存層等所有既有安全與清理邏輯零重複、單一真相。
-
-- 建 folder 需帶 owner_token(綁定擁有者;使用者之後用該 token 存取)
-- 無主 folder(user_token 空)→ 409,console 不代管(ACL fail-closed 語義)
-- auth 語義同 admin 模組其他端點(免認證,產品決策)
+Act-as-owner: a folder is bound to a user_token, and every console operation
+calls the existing REST endpoint functions with that owner token, so all
+security and cleanup logic stays single-source. An ownerless folder returns 409
+(ACL fail-closed). Endpoints are unauthenticated, matching the admin module.
 """
 
 from __future__ import annotations
@@ -25,8 +21,34 @@ logger = get_api_logger()
 router = APIRouter(tags=["Admin: Manage"])
 
 
+def _normalize_owner_key(owner_token: str) -> str:
+    """Normalize an admin-supplied owner token to the per-token ownership key.
+
+    The console's "Owner Token" field may hold either a full MCP Center token (a
+    JWT, ~900 chars) or a bare owner key already copied from an existing folder's
+    owner. Ownership is keyed on the JWT ``jti`` everywhere else (the Bearer path
+    runs ``extract_token`` -> ``owner_key_from_bearer``), so a JWT is reduced to its
+    ``jti`` here too; anything that is not a JWT is treated as an already-final owner
+    key. Without this, the raw token was stored verbatim and overflowed
+    ``user_token`` (varchar 256) — this admin path calls ``create_folder`` directly
+    as a function, so the ``extract_token`` dependency never runs.
+    """
+    import jwt
+
+    try:
+        claims = jwt.decode(
+            owner_token, options={"verify_signature": False, "verify_aud": False}
+        )
+        jti = claims.get("jti")
+        if jti:
+            return str(jti)
+    except Exception:
+        pass
+    return owner_token
+
+
 def _owner(folder_id: int):
-    """載入 folder 並回 (folder, owner_token);無主 folder 拒管。"""
+    """Load the folder and return (folder, owner_token); refuse to manage an ownerless folder."""
     from db.cached_folderdb import CachedFolderDB
     folder = CachedFolderDB.get_by_id(folder_id)
     if not folder:
@@ -37,13 +59,11 @@ def _owner(folder_id: int):
     return folder, folder.user_token
 
 
-# ── Folder CRUD ─────────────────────────────────────────────────────────────
-
 @router.post("/api/admin/manage/folders")
 async def admin_create_folder(
     body: dict = Body(..., example={"name": "docs", "description": "", "owner_token": "…"}),
 ):
-    """建 folder(owner_token 必填 — folder 綁定擁有者,使用者以該 token 存取)。"""
+    """Create a folder (owner_token required — the folder is bound to an owner who accesses it with that token)."""
     name = (body.get("name") or "").strip()
     owner_token = (body.get("owner_token") or "").strip()
     if not name:
@@ -54,13 +74,13 @@ async def admin_create_folder(
     from src.api.router.response import CreateFolderRequest
     return await create_folder(
         CreateFolderRequest(name=name, description=body.get("description")),
-        user_token=owner_token,
+        user_token=_normalize_owner_key(owner_token),
     )
 
 
 @router.patch("/api/admin/manage/folders/{folder_id}")
 async def admin_update_folder(folder_id: int, body: dict = Body(...)):
-    """改名/改描述(只 patch 有給的欄位)。"""
+    """Rename / change description (only patches the fields provided)."""
     _, token = _owner(folder_id)
     from src.api.router.folder_api import update_folder_api
     from src.api.router.response import UpdateFolderRequest
@@ -73,13 +93,11 @@ async def admin_update_folder(folder_id: int, body: dict = Body(...)):
 
 @router.delete("/api/admin/manage/folders/{folder_id}")
 async def admin_delete_folder(folder_id: int):
-    """刪 folder(沿用既有端點:先取消 in-flight job,再軟刪檔案與向量)。"""
+    """Delete a folder (reuses the existing endpoint: cancel in-flight jobs first, then soft-delete files and vectors)."""
     _, token = _owner(folder_id)
     from src.api.router.folder_api import delete_folder
     return await delete_folder(folder_id, user_token=token)
 
-
-# ── File CRUD ───────────────────────────────────────────────────────────────
 
 @router.post("/api/admin/manage/folders/{folder_id}/files")
 async def admin_upload_file(
@@ -88,7 +106,7 @@ async def admin_upload_file(
     description: Optional[str] = Form(None),
     auto_index: bool = Form(True),
 ):
-    """上傳檔案到 folder(auto_index=True 走既有背景索引流程)。"""
+    """Upload a file to the folder (auto_index=True runs the existing background indexing flow)."""
     _, token = _owner(folder_id)
     from src.api.router.file_api import upload_file
     return await upload_file(
@@ -106,27 +124,23 @@ async def admin_download_file(folder_id: int, file_id: UUID):
 
 @router.delete("/api/admin/manage/folders/{folder_id}/files/{file_id}")
 async def admin_delete_file(folder_id: int, file_id: UUID):
-    """刪檔案(既有端點會一併清該檔的向量與索引記錄)。"""
+    """Delete a file (the existing endpoint also clears the file's vectors and index records)."""
     _, token = _owner(folder_id)
     from src.api.router.file_api import delete_file
     return await delete_file(folder_id, file_id, user_token=token)
 
-
-# ── Index 操作 ──────────────────────────────────────────────────────────────
 
 @router.post("/api/admin/manage/folders/{folder_id}/index")
 async def admin_index_folder(
     folder_id: int,
     body: dict = Body(default={}, example={"skip_existing": True}),
 ):
-    """啟動整個 folder 的背景索引 job。
+    """Start a background indexing job for the whole folder.
 
-    - skip_existing=True(增量):只補沒有索引記錄的檔案
-    - skip_existing=False(全量重建):走 **reindex** 端點 — 先刪舊索引
-      記錄再重跑。⚠️ 不能用 index(skip_existing=False)充當重建:per-file
-      的 content_hash 短路會把內容沒變的檔案全部跳過(log 見
-      INDEX_SKIP_IDEMPOTENT),改了 Contextual Retrieval / embedding /
-      chunking 設定後的重建會完全無效。
+    skip_existing=True is incremental (only files without an index record).
+    skip_existing=False routes to the reindex endpoint (delete old records, then
+    rerun); a plain index cannot rebuild because the per-file content_hash
+    short-circuit skips unchanged files, so settings changes would have no effect.
     """
     folder, token = _owner(folder_id)
     from src.api.router.response import IndexRequest
@@ -142,7 +156,7 @@ async def admin_index_folder(
 
 @router.post("/api/admin/manage/folders/{folder_id}/files/{file_id}/retry")
 async def admin_retry_file(folder_id: int, file_id: UUID):
-    """重試單檔索引(force 旁路 content_hash 短路;失敗檔一鍵重跑)。"""
+    """Retry indexing a single file (force bypasses the content_hash short-circuit; one-click rerun for failed files)."""
     _, token = _owner(folder_id)
     from db.filedb import FileDB
     from src.domain.rag.dto import FileRequest
@@ -162,10 +176,11 @@ async def admin_retry_file(folder_id: int, file_id: UUID):
 
 @router.post("/api/admin/manage/folders/{folder_id}/query")
 async def admin_query_folder(folder_id: int, body: dict = Body(..., example={"query": "…"})):
-    """對 folder 跑一次檢索(查詢測試台;act-as-owner)。回命中 chunks + 分數。
+    """Run one retrieval against the folder (query test bench; act-as-owner). Returns matched chunks + scores.
 
-    trace=true:走檢索軌跡(拆 vector / BM25 / hybrid / rerank 名次),
-    並用軌跡的最終命中組成 results(不重跑一次一般查詢)。
+    trace=true: run the retrieval trace (breaking out vector / BM25 / hybrid /
+    rerank ranks) and build results from the trace's final hits (without rerunning
+    a normal query).
     """
     folder, token = _owner(folder_id)
     q = (body.get("query") or "").strip()
@@ -195,7 +210,7 @@ async def admin_query_folder(folder_id: int, body: dict = Body(..., example={"qu
         )
         scope = {"type": "http", "headers": [], "method": "POST", "path": "/", "query_string": b""}
         resp = await query_rag(_Req(scope), req, token=token)
-    # answer=true:檢索後接 CRAG 答案生成(相關性評分 → 只用相關段 → 附信心度)
+    # answer=true: follow retrieval with CRAG answer generation.
     if body.get("answer"):
         try:
             gen = _generate_answer(q, resp["data"].get("results", []))
@@ -209,11 +224,11 @@ async def admin_query_folder(folder_id: int, body: dict = Body(..., example={"qu
 
 
 def _generate_answer(query: str, results: list) -> dict:
-    """CRAG(Corrective RAG)風格答案生成 — 先評每段檢索是否相關,只用相關段
-    生成;全不相關 → 不硬答,回明確「找不到依據」。
+    """CRAG (Corrective RAG) answer generation: grade each retrieved chunk for
+    relevance, generate from the relevant ones only, and decline to answer when
+    none are relevant (avoids hallucinating on irrelevant content).
 
-    回 dict:{answer, confidence(high/medium/low/none), kept, dropped, note}。
-    比「有結果就硬生成」更誠實 —— 檢索到不相關內容時避免幻覺(接你的零結果分析)。
+    Returns {answer, confidence (high/medium/low/none), kept, dropped, note}.
     """
     if not results:
         return {"answer": None, "confidence": "none", "kept": 0, "dropped": 0,
@@ -227,7 +242,7 @@ def _generate_answer(query: str, results: list) -> dict:
     model = getattr(llm_cfg, "azure_deployment", None) or llm_cfg.model
     top = results[:6]
 
-    # ── CRAG 第 1 步:相關性評分(單次 LLM 呼叫,回 boolean 陣列)──
+    # CRAG step 1: relevance grading (single LLM call returning a boolean array)
     grades = [True] * len(top)
     try:
         gprompt = (
@@ -248,44 +263,46 @@ def _generate_answer(query: str, results: list) -> dict:
     kept = [r for r, g in zip(top, grades) if g]
     dropped = len(top) - len(kept)
 
-    # ── CRAG gate:全部不相關 → 不硬答 ──
+    # CRAG gate: all irrelevant -> don't force an answer
     if not kept:
         try:
             client.close()
         except Exception:
             pass
-        return {"answer": "根據目前索引的內容,找不到足夠依據回答這個問題。"
-                          "建議擴充相關文件,或換個問法。",
+        return {"answer": "The currently indexed content has no sufficient basis "
+                          "to answer this question. Consider adding relevant "
+                          "documents or rephrasing the question.",
                 "confidence": "low", "kept": 0, "dropped": dropped,
                 "note": "CRAG gate: no retrieved chunk graded relevant"}
 
-    # ── CRAG 第 2 步:只用相關段生成(引用以 [n] 標註)──
+    # CRAG step 2: generate from relevant chunks only (citations marked as [n])
     ctx = "\n\n".join(f"[{i+1}] {r['text'][:1200]}" for i, r in enumerate(kept))
     prompt = (
         "You are a helpful assistant. Answer the question using ONLY the context "
         "below. Cite sources inline as [n]. If the context lacks the answer, say so.\n\n"
         f"Context:\n{ctx}\n\nQuestion: {query}\n\nAnswer:")
-    # gpt-oss 等 reasoning 模型:reasoning token 會吃 max_tokens,額度太小 →
-    # content 回 None(finish_reason=length)→ 答案靜默變空(實測『主科目6502』
-    # 對 6 段 Excel context 在 800 就爆)。給足 2048。
+    # Reasoning models (e.g. gpt-oss): reasoning tokens consume max_tokens; too
+    # small a budget returns content None (finish_reason=length) and the answer
+    # silently becomes empty. Allow 2048.
     r = client.chat.completions.create(
         model=model, messages=[{"role": "user", "content": prompt}],
         max_tokens=2048, temperature=0.2)
     ans = r.choices[0].message.content
     finish = getattr(r.choices[0], "finish_reason", None)
     if not (ans or "").strip():
-        # 防呆:仍空(通常是 reasoning 又把額度用光)→ 不靜默回空,給明確訊息
+        # Still empty (usually reasoning exhausted the budget) -> return a clear message rather than silently empty.
         logger.warning(f"[CRAG] empty generation (finish={finish}) for query={query!r}")
         try:
             client.close()
         except Exception:
             pass
-        return {"answer": "已找到相關內容,但答案生成未完成(模型輸出被截斷)。"
-                          "請再試一次,或換更明確的問法。",
+        return {"answer": "Relevant content was found, but answer generation did "
+                          "not complete (model output was truncated). Please try "
+                          "again or use a more specific question.",
                 "confidence": "low", "kept": len(kept), "dropped": dropped,
                 "note": f"generation returned empty (finish={finish})"}
-    # gpt-oss 慣用 OpenAI 風格引註【n†Lx-Ly】/【n†來源】;UI 不渲染 → 正規化成
-    # 與結果卡一致的 [n](保留數字、丟掉來源/行號雜訊)
+    # gpt-oss emits OpenAI-style citations 【n†...】 that the UI can't render;
+    # normalize to [n] to match the result cards.
     ans = re.sub(r"【\s*(\d+)\s*†[^】]*】", r"[\1]", ans)
     try:
         client.close()
@@ -299,7 +316,7 @@ def _generate_answer(query: str, results: list) -> dict:
 
 @router.post("/api/admin/manage/folders/{folder_id}/jobs/{job_id}/cancel")
 async def admin_cancel_job(folder_id: int, job_id: str):
-    """取消執行中的索引 job。"""
+    """Cancel a running indexing job."""
     folder, token = _owner(folder_id)
     from src.api.router.rag_indexing import cancel_index_job
     return await cancel_index_job(folder_id, job_id, token=token, folder=folder)

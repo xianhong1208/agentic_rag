@@ -1,18 +1,18 @@
 
-"""Auto-Merging Retriever — 命中多 leaf 同 parent 自動 merge 回 parent
+"""Auto-Merging Retriever — merge multiple leaf hits under the same parent back into that parent.
 
-核心邏輯:
-1. 用 hybrid retrieval(vector + BM25)+ rerank 撈 top-k LEAF nodes
-   (查詢時用 metadata filter 限制 node_role=leaf,parent 不參與檢索)
-2. 統計命中 leaves 的 parent 分布
-3. 若某 parent 的 children 命中比例達到 merge_threshold 則升級回 parent
-4. 對沒被升級的 leaves,可選地展開鄰居(expand_context)
+Core logic:
+1. Retrieve top-k LEAF nodes via hybrid retrieval (vector + BM25) + rerank
+   (a metadata filter restricts retrieval to node_role=leaf; parents don't participate).
+2. Tally the parent distribution of the hit leaves.
+3. If a parent's ratio of hit children reaches merge_threshold, promote back to the parent.
+4. For leaves that weren't promoted, optionally expand their neighbors (expand_context).
 
-設計取捨:
-- 沒用 LlamaIndex 內建 AutoMergingRetriever,因為它依賴 docstore(in-memory),
-  而我們是 PGVector + JSONB metadata 路線。寫成自己的 50 行邏輯反而更清楚。
-- merge 後仍保留原始 leaf 的 score(用「該 parent 命中 children 的最高分」),
-  這樣 final ranking 還是有意義的。
+Design trade-offs:
+- Does not use LlamaIndex's built-in AutoMergingRetriever, which relies on an in-memory docstore,
+  whereas this uses the PGVector + JSONB metadata approach. A small bespoke implementation is clearer.
+- After merging, the original leaf score is preserved (using the highest score among the parent's
+  hit children), so the final ranking stays meaningful.
 """
 
 from __future__ import annotations
@@ -31,12 +31,12 @@ logger = get_api_logger()
 
 @dataclass
 class MergedResult:
-    """Auto-merge 後的單一結果
+    """A single result after auto-merge.
 
-    可能是:
-    - 原始 leaf(沒觸發 merge)
-    - 升級後的 parent(觸發 merge)
-    - leaf + 展開鄰居(expand_context=True)
+    May be:
+    - An original leaf (no merge triggered).
+    - A promoted parent (merge triggered).
+    - A leaf with expanded neighbors (expand_context=True).
     """
     text: str
     score: float
@@ -44,15 +44,15 @@ class MergedResult:
     file_name: str
     node_id: str
     node_role: str                    # leaf / parent / expanded
-    chunk_index_range: List[int]      # parent: [start, end];leaf: [i, i]
-    merged_from_leaves: List[str] = field(default_factory=list)  # parent merge 時記錄
-    # BL-05 引用溯源(來自 leaf node metadata;parent merge 取最高分命中 leaf 的)
+    chunk_index_range: List[int]      # parent: [start, end]; leaf: [i, i]
+    merged_from_leaves: List[str] = field(default_factory=list)  # recorded when a parent merge happens
+    # Citation provenance (from leaf node metadata; on a parent merge, taken from the highest-scoring hit leaf)
     page: Optional[int] = None
     headings: Optional[List[str]] = None
 
 
 class AutoMergingRetriever:
-    """命中後智慧合併的 retriever
+    """Retriever that intelligently merges hits after retrieval.
 
     Usage:
         retriever = AutoMergingRetriever(
@@ -61,7 +61,7 @@ class AutoMergingRetriever:
             merge_threshold=0.5,
             expand_context_neighbors=2,
         )
-        results = await retriever.aquery(query_text="問題", top_k=6, expand_context=True)
+        results = await retriever.aquery(query_text="question", top_k=6, expand_context=True)
     """
 
     def __init__(
@@ -97,22 +97,22 @@ class AutoMergingRetriever:
         similarity_cutoff: float = 0.4,
         expand_context: bool = True,
     ) -> List[MergedResult]:
-        """執行 hybrid retrieval + auto-merge(真異步 + 批次 DB 查詢)。
+        """Run hybrid retrieval + auto-merge (fully async + batched DB queries).
 
-        流程:hybrid retrieve 只撈 leaves → rerank → 統計 parent 命中 → 達閾值的 parent 取代 leaves;
-        沒 merge 的 leaves 可選展開鄰居。
+        Flow: hybrid retrieve leaves only → rerank → tally parent hits → parents at threshold
+        replace their leaves; un-merged leaves optionally expand their neighbors.
 
-        DB 互動全批次化(原 N+1 → 最多 3 次 round trip):
-        parent 計數 1 次、parent 內容 1 次、鄰居窗口 1 次,全走 async engine。
+        DB interaction is fully batched (at most 3 round trips): one for parent counts, one for
+        parent content, one for neighbor windows, all on the async engine.
 
         Args:
-            query_text: 查詢字串。
-            top_k: 回傳前 K 個結果(rerank 後)。
-            similarity_cutoff: 相似度閾值;reranker 啟用時無效。
-            expand_context: True → 為沒 merge 的 leaves 展開鄰居。
+            query_text: Query string.
+            top_k: Number of top results to return (after rerank).
+            similarity_cutoff: Similarity threshold; ignored when the reranker is enabled.
+            expand_context: True → expand neighbors for un-merged leaves.
 
         Returns:
-            List[MergedResult]。
+            List[MergedResult].
         """
         from src.domain.rag.chunk_lookup import ChunkLookup
 
@@ -129,12 +129,10 @@ class AutoMergingRetriever:
         )
 
         nodes = await retriever.aretrieve(query_text)
-        # 過濾:只取 leaf nodes(parent 也在同表,但不參與檢索 ranking)
-        # 之所以兩者同表卻能分開:索引時 parent 沒有 embedding,vector retrieval 不會選到;
-        # BM25 階段可能偶爾選到 parent,這裡顯式過濾保險。
-        # 向下相容:沒有 node_role 的 legacy chunks(舊版 flat 索引)視為 leaf,
-        # 讓使用者不必為了升級被迫重新索引(但這些 chunks 不會觸發 auto-merge,
-        # 因為沒有 parent_node_id)。
+        # Keep only leaf nodes. Parents share the table but have no embedding, so
+        # vector retrieval never picks them; BM25 may occasionally surface one, so
+        # filter explicitly. Legacy chunks without node_role are treated as leaves
+        # for backward compatibility (they never merge, having no parent_node_id).
         leaf_nodes = [
             n for n in nodes
             if n.node.metadata.get("node_role", "leaf") == "leaf"
@@ -151,7 +149,7 @@ class AutoMergingRetriever:
         if not leaf_nodes:
             return []
 
-        # ---------- Auto-merge 決策(parent 計數:N 次查詢 → 1 次批次)----------
+        # Auto-merge decision: tally parent counts in one batch
         parent_hits: Dict[str, List[NodeWithScore]] = defaultdict(list)
         for ln in leaf_nodes:
             pid = ln.node.metadata.get("parent_node_id")
@@ -175,12 +173,11 @@ class AutoMergingRetriever:
                     f"{len(hit_leaves)}/{total_children} children hit ({hit_ratio:.0%})"
                 )
 
-        # ---------- 批次預取(原本在迴圈內逐筆查,N+1 的主體)----------
-        # parent 內容:1 次批次
+        # Batch prefetch parent content
         parent_nodes_map = await ChunkLookup.afetch_nodes(
             self._vector_store, parents_to_merge
         )
-        # 鄰居窗口:先算出會走 expand 分支的 leaves(pid 沒被 merge、首見),1 次批次
+        # Neighbor windows: collect leaves taking the expand branch (parent not merged, first seen), then one batch
         window_by_leaf: Dict[str, dict] = {}
         if expand_context and self._expand_context_neighbors > 0:
             expand_targets = []
@@ -205,13 +202,12 @@ class AutoMergingRetriever:
                     for (leaf_id, _, _), w in zip(expand_targets, windows)
                 }
 
-        # ---------- 構建最終結果 ----------
         results: List[MergedResult] = []
         merged_parent_ids: set = set()
         used_leaf_ids: set = set()
 
         def _provenance(node) -> dict:
-            """leaf metadata 的 page_no/headings → MergedResult 引用欄位(BL-05)。"""
+            """Map leaf metadata page_no/headings → MergedResult citation fields."""
             md = node.metadata
             return {"page": md.get("page_no"), "headings": md.get("headings")}
 
@@ -246,8 +242,8 @@ class AutoMergingRetriever:
             used_leaf_ids.add(ln.node.id_)
 
             if expand_context and self._expand_context_neighbors > 0:
-                # 批次預取的窗口;缺 file_id/chunk_index 的 leaf 不在 map 裡,
-                # fallback 為原 leaf 內容(與舊逐筆版 _expand_neighbors 行為一致)
+                # Batch-prefetched window; a leaf missing file_id/chunk_index isn't in the map,
+                # so fall back to the original leaf content.
                 center = ln.node.metadata.get("chunk_index")
                 expanded = window_by_leaf.get(
                     ln.node.id_,
@@ -285,7 +281,3 @@ class AutoMergingRetriever:
             f"{len(results)} results ({len(merged_parent_ids)} merged to parent)"
         )
         return results
-
-    # 舊的逐筆 DB helpers(_get_parent_children_count / _fetch_parent /
-    # _expand_neighbors)已移除 — aquery 內改用 ChunkLookup 的批次 async 版,
-    # 一次 search 的 DB round trip 從 N+1 收斂為最多 3 次。

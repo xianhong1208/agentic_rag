@@ -1,46 +1,46 @@
-# 需求規格書範本 (Spec Template)
+# Spec Template
 
 >
-> 用法:複製本檔到 `docs/testing/specs/SPEC-<模組>.md`,填寫後作為測試案例的依據。
-> 每一條需求都應可被至少一個測試案例驗證。
+> Usage: copy this file to `docs/testing/specs/SPEC-<module>.md` and fill it in as the basis for test cases.
+> Every requirement should be verifiable by at least one test case.
 
 ---
 
-# SPEC-<模組>:<模組中文名稱>
+# SPEC-<module>: <module name>
 
-| 項目 | 內容 |
-|------|------|
-| 模組 | `<原始碼路徑,如 src/domain/rag/hierarchy.py>` |
-| 對應測試 | `<tests/test_xxx.py>` |
-| 版本 | `<定義此需求的版本>` |
-| 最後更新 | `<YYYY-MM-DD>` |
-
-## 1. 目的與範圍
-<這個模組負責什麼、不負責什麼。>
-
-## 2. 功能需求 (Functional Requirements)
-
-| 需求編號 | 需求描述 | 驗收準則(可觀察的行為) |
-|---------|---------|------------------------|
-| REQ-<模組>-01 | <這個函式 / 行為要做到什麼> | <給定什麼輸入 / 狀態,會得到什麼輸出 / 副作用> |
-| REQ-<模組>-02 | | |
-
-## 3. 非功能需求 (Non-Functional,如適用)
-<安全、效能、相容性等。例如「token 隔離不得跨界」「不得將機密寫入日誌」。>
-
-## 4. 邊界與例外 (Edge Cases & Errors)
-
-| 情境 | 預期行為 |
+| Item | Content |
 |------|---------|
-| <空值 / None / 空字串> | <拒絕 / 回預設 / 拋例外> |
-| <超過長度上限> | |
-| <非法格式輸入> | |
+| Module | `<source path, e.g. src/domain/rag/hierarchy.py>` |
+| Test | `<tests/test_xxx.py>` |
+| Version | `<version that defines this requirement>` |
+| Last updated | `<YYYY-MM-DD>` |
 
-## 5. 相依與假設 (Dependencies & Assumptions)
-<依賴哪些外部模組 / 環境變數 / 資料表;測試時哪些需 mock。>
+## 1. Purpose and Scope
+<What this module is responsible for, and what it is not.>
 
-## 6. 可追溯性矩陣 (Traceability)
+## 2. Functional Requirements
 
-| 需求 | 測試案例 | 測試腳本 |
-|------|---------|---------|
-| REQ-<模組>-01 | TC-<模組>-01 | `tests/test_xxx.py::test_yyy` |
+| Requirement | Description | Acceptance Criteria (observable behavior) |
+|-------------|-------------|-------------------------------------------|
+| REQ-<module>-01 | <what this function / behavior must accomplish> | <given what input / state, what output / side effect results> |
+| REQ-<module>-02 | | |
+
+## 3. Non-Functional Requirements (if applicable)
+<Security, performance, compatibility, etc. For example, "token isolation must not cross boundaries" or "secrets must not be written to logs".>
+
+## 4. Edge Cases and Errors
+
+| Scenario | Expected behavior |
+|----------|-------------------|
+| <null / None / empty string> | <reject / return default / raise> |
+| <exceeds length limit> | |
+| <malformed input> | |
+
+## 5. Dependencies and Assumptions
+<Which external modules / environment variables / tables it depends on; which need to be mocked during testing.>
+
+## 6. Traceability
+
+| Requirement | Test Case | Test Script |
+|-------------|-----------|-------------|
+| REQ-<module>-01 | TC-<module>-01 | `tests/test_xxx.py::test_yyy` |

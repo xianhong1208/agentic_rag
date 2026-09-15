@@ -1,14 +1,11 @@
 
-"""整合測試基座 — 真實 PostgreSQL(一次性庫,自建自毀)。
+"""Integration-test harness against a throwaway PostgreSQL DB.
 
-原則(對齊 docs/testing/ENVIRONMENTS.md):
-- 單元測試(tests/test_*.py)零外部依賴,這裡是**整合層**:需要真 DB。
-- **opt-in**:必須設 RAG_RUN_DB_ITESTS=1 才會跑,否則整組 skip。刻意不用
-  「探測到 DB 就跑」— 那會讓任何碰巧有同憑證 postgres 的機器(如 CI agent)
-  被擅自建庫/刪庫。跑法:RAG_RUN_DB_ITESTS=1 uv run --no-sync pytest tests/integration
-- 設了 env 但 DB 不可達 → 一樣 skip(不紅)。
-- 絕不碰現有庫:每次建全新 agentic_rag_itest,跑 alembic 全鏈建 schema
-  (順帶每輪都重驗 migration 鏈),測畢 DROP。
+Opt-in via RAG_RUN_DB_ITESTS=1 (else the group is skipped); a set env but an
+unreachable DB also skips rather than fails. Opt-in is deliberate so a machine
+that happens to have a matching postgres never gets databases created/dropped
+without consent. Each run creates a fresh agentic_rag_itest, applies the full
+alembic chain, and DROPs it when done, never touching an existing DB.
 """
 
 from __future__ import annotations
@@ -25,7 +22,7 @@ _TMP_CONFIG = _REPO / "config" / "_itest_config.yaml"
 
 
 def _base_url():
-    """從 config/config.yaml 取連線資訊(dbname 之外的部分)。"""
+    """Read connection info from config/config.yaml (everything except dbname)."""
     text = (_REPO / "config" / "config.yaml").read_text(encoding="utf-8")
     for line in text.splitlines():
         line = line.strip()
@@ -35,7 +32,7 @@ def _base_url():
 
 
 def _admin_conn():
-    """連 postgres 管理庫(短 timeout;失敗 → skip 整組整合測試)。"""
+    """Connect to the postgres admin DB (short timeout; on failure -> skip the whole integration group)."""
     import psycopg2
     u = _base_url()
     return psycopg2.connect(
@@ -69,8 +66,8 @@ if not _db_available():
 
 @pytest.fixture(scope="session")
 def itest_db():
-    """一次性整合測試庫:建庫 → alembic 全鏈 → yield → DROP。"""
-    # 1. 重建全新庫
+    """Throwaway integration DB: create -> full alembic chain -> yield -> DROP."""
+    # 1. Recreate a fresh DB
     conn = _admin_conn()
     conn.autocommit = True
     with conn.cursor() as cur:
@@ -78,7 +75,8 @@ def itest_db():
         cur.execute(f'CREATE DATABASE {_ITEST_DB}')
     conn.close()
 
-    # 1b. 裝 extension(pgvector 寫入 + jiebacfg hybrid search 需要)
+    # 1b. Install extensions (pgvector is required for writes; Chinese
+    # tokenization now uses Python CKIP, so pg_jieba is no longer needed)
     import psycopg2
     u = _base_url()
     econn = psycopg2.connect(
@@ -89,13 +87,10 @@ def itest_db():
     econn.autocommit = True
     with econn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        try:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_jieba")  # jiebacfg 全文檢索
-        except Exception:
-            pass  # 沒裝 pg_jieba 的實例:hybrid 相關測試自行 skip
     econn.close()
 
-    # 2. 臨時 config(config 路徑安全檢查要求在 repo 內)指向一次性庫
+    # 2. Temporary config (the config path safety check requires it to be
+    # inside the repo) pointing at the throwaway DB
     src = (_REPO / "config" / "config.yaml").read_text(encoding="utf-8")
     u = _base_url()
     old_db = u.database
@@ -104,18 +99,20 @@ def itest_db():
     from src.config.config_manager import Config
     Config.set_config(str(_TMP_CONFIG))
 
-    # 3. alembic 全鏈建 schema(每輪整合測試都重驗 migration 鏈)
+    # 3. Build the schema via the full alembic chain (revalidates the
+    # migration chain on every integration round)
     from db.migrate import DatabaseMigrator
     assert DatabaseMigrator().upgrade("head"), "alembic 全鏈套用失敗"
 
-    # 4. 綁 Session factory(get_engine 內部才做 Session.configure(bind=...);
-    #    migrator 用自己的 engine,不觸發這步)
+    # 4. Bind the Session factory (get_engine internally does
+    #    Session.configure(bind=...); the migrator uses its own engine and
+    #    does not trigger this step)
     from db.db import get_engine
     get_engine()
 
     yield _ITEST_DB
 
-    # 4. 清理:先斷 SQLAlchemy 連線池,才 DROP 得掉
+    # 4. Cleanup: dispose the SQLAlchemy connection pool first, otherwise the DROP fails
     try:
         import db.db as dbdb
         if getattr(dbdb, "_engine", None) is not None:
@@ -130,11 +127,11 @@ def itest_db():
     _TMP_CONFIG.unlink(missing_ok=True)
 
 
-# ---- 共用資料 fixture(FileIndex 有 FK:先 Folder 再 File)---------------------
+# ---- Shared data fixtures (FileIndex has an FK: Folder before File) ----------
 
 @pytest.fixture()
 def folder(itest_db):
-    """每案一個乾淨 folder(名稱唯一,避免案間互擾)。"""
+    """A clean folder per test (unique name, to avoid cross-test interference)."""
     import uuid as _uuid
     from db.folderdb import FolderDB
     return FolderDB.create(

@@ -1,302 +1,302 @@
-# TC-exceptions:Domain 例外階層與 HTTP 狀態映射 測試案例
+# TC-exceptions: Domain Exception Hierarchy and HTTP Status Mapping Test Cases
 
 
-| 項目 | 內容 |
-|------|------|
-| 對應規格 | [SPEC-exceptions](../specs/SPEC-exceptions.md) |
-| 測試層級 | 單元 |
-| 測試腳本 | `tests/test_exceptions.py` |
+| Item | Content |
+|------|---------|
+| Related spec | [SPEC-exceptions](../specs/SPEC-exceptions.md) |
+| Test level | Unit |
+| Test script | `tests/test_exceptions.py` |
 
-> 全部案例皆為純邏輯,無前置條件、無 mock。跑法:`cd agentic_rag && uv run pytest tests/test_exceptions.py -v`
+> All cases are pure logic, with no preconditions and no mocks. Run: `cd agentic_rag && uv run pytest tests/test_exceptions.py -v`
 
 ---
 
-## TC-exceptions-01:DomainException 屬性保存與 details 預設值
+## TC-exceptions-01: DomainException attribute storage and default details
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-01 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `DomainException(message="something broke", error_code="SOME_CODE")` |
-| **測試步驟** | 1. 建構例外<br>2. 讀取 message / error_code / details |
-| **預期結果** | `message == "something broke"`、`error_code == "SOME_CODE"`、`details == {}` |
-| **實作** | `tests/test_exceptions.py::test_domain_exception_attributes_and_default_details` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-01 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `DomainException(message="something broke", error_code="SOME_CODE")` |
+| **Test steps** | 1. Construct the exception<br>2. Read message / error_code / details |
+| **Expected result** | `message == "something broke"`, `error_code == "SOME_CODE"`, `details == {}` |
+| **Implementation** | `tests/test_exceptions.py::test_domain_exception_attributes_and_default_details` |
 
-## TC-exceptions-02:DomainException str() 與 Exception 繼承
+## TC-exceptions-02: DomainException str() and Exception inheritance
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-01 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `DomainException(message="msg here", error_code="X")` |
-| **測試步驟** | 1. 建構例外<br>2. 取 `str(exc)`<br>3. 檢查 isinstance |
-| **預期結果** | `str(exc) == "msg here"`;`isinstance(exc, Exception)` 為 True |
-| **實作** | `tests/test_exceptions.py::test_domain_exception_str_and_inheritance` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-01 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `DomainException(message="msg here", error_code="X")` |
+| **Test steps** | 1. Construct the exception<br>2. Get `str(exc)`<br>3. Check isinstance |
+| **Expected result** | `str(exc) == "msg here"`; `isinstance(exc, Exception)` is True |
+| **Implementation** | `tests/test_exceptions.py::test_domain_exception_str_and_inheritance` |
 
-## TC-exceptions-03:to_dict — 無 details
+## TC-exceptions-03: to_dict — without details
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-02 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `DomainException(message="m", error_code="CODE")` |
-| **測試步驟** | 1. 建構例外<br>2. 呼叫 `to_dict()` |
-| **預期結果** | 回傳恰為 `{"error": "CODE", "message": "m"}`(不含 details 鍵) |
-| **實作** | `tests/test_exceptions.py::test_to_dict_without_details` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-02 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `DomainException(message="m", error_code="CODE")` |
+| **Test steps** | 1. Construct the exception<br>2. Call `to_dict()` |
+| **Expected result** | Returns exactly `{"error": "CODE", "message": "m"}` (no details key) |
+| **Implementation** | `tests/test_exceptions.py::test_to_dict_without_details` |
 
-## TC-exceptions-04:to_dict — 有 details
+## TC-exceptions-04: to_dict — with details
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-02 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `DomainException(message="m", error_code="CODE", details={"k": "v"})` |
-| **測試步驟** | 1. 建構例外<br>2. 呼叫 `to_dict()` |
-| **預期結果** | 回傳 `{"error": "CODE", "message": "m", "details": {"k": "v"}}` |
-| **實作** | `tests/test_exceptions.py::test_to_dict_with_details` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-02 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `DomainException(message="m", error_code="CODE", details={"k": "v"})` |
+| **Test steps** | 1. Construct the exception<br>2. Call `to_dict()` |
+| **Expected result** | Returns `{"error": "CODE", "message": "m", "details": {"k": "v"}}` |
+| **Implementation** | `tests/test_exceptions.py::test_to_dict_with_details` |
 
-## TC-exceptions-05:ResourceNotFoundError 預設 message / code / details
+## TC-exceptions-05: ResourceNotFoundError default message / code / details
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-03 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `ResourceNotFoundError(resource_type="folder", identifier=42)` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查三屬性 |
-| **預期結果** | `message == "folder not found: 42"`、`error_code == "FOLDER_NOT_FOUND"`、`details == {"resource_type": "folder", "identifier": "42"}` |
-| **實作** | `tests/test_exceptions.py::test_resource_not_found_default_message_and_code` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-03 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `ResourceNotFoundError(resource_type="folder", identifier=42)` |
+| **Test steps** | 1. Construct the exception<br>2. Check the three attributes |
+| **Expected result** | `message == "folder not found: 42"`, `error_code == "FOLDER_NOT_FOUND"`, `details == {"resource_type": "folder", "identifier": "42"}` |
+| **Implementation** | `tests/test_exceptions.py::test_resource_not_found_default_message_and_code` |
 
-## TC-exceptions-06:ResourceNotFoundError 自訂 message
+## TC-exceptions-06: ResourceNotFoundError custom message
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-03 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `ResourceNotFoundError("file", "abc", message="custom words")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 message 與 code |
-| **預期結果** | `message == "custom words"`(覆蓋預設);`error_code == "FILE_NOT_FOUND"` |
-| **實作** | `tests/test_exceptions.py::test_resource_not_found_custom_message` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-03 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `ResourceNotFoundError("file", "abc", message="custom words")` |
+| **Test steps** | 1. Construct the exception<br>2. Check message and code |
+| **Expected result** | `message == "custom words"` (overrides the default); `error_code == "FILE_NOT_FOUND"` |
+| **Implementation** | `tests/test_exceptions.py::test_resource_not_found_custom_message` |
 
-## TC-exceptions-07:FolderNotFoundError 以 folder_id 建立
+## TC-exceptions-07: FolderNotFoundError constructed by folder_id
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-04 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `FolderNotFoundError(folder_id=7)` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 code 與 details |
-| **預期結果** | `error_code == "FOLDER_NOT_FOUND"`;`details["identifier"] == "7"` |
-| **實作** | `tests/test_exceptions.py::test_folder_not_found_by_id` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-04 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `FolderNotFoundError(folder_id=7)` |
+| **Test steps** | 1. Construct the exception<br>2. Check code and details |
+| **Expected result** | `error_code == "FOLDER_NOT_FOUND"`; `details["identifier"] == "7"` |
+| **Implementation** | `tests/test_exceptions.py::test_folder_not_found_by_id` |
 
-## TC-exceptions-08:FolderNotFoundError 以 folder_name 建立
+## TC-exceptions-08: FolderNotFoundError constructed by folder_name
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-04 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `FolderNotFoundError(folder_name="財報")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 identifier 與 message |
-| **預期結果** | `details["identifier"] == "財報"`;message 含 `"財報"` |
-| **實作** | `tests/test_exceptions.py::test_folder_not_found_by_name` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-04 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `FolderNotFoundError(folder_name="財報")` |
+| **Test steps** | 1. Construct the exception<br>2. Check identifier and message |
+| **Expected result** | `details["identifier"] == "財報"`; message contains `"財報"` |
+| **Implementation** | `tests/test_exceptions.py::test_folder_not_found_by_name` |
 
-## TC-exceptions-09:FileNotFoundError(domain 版)
+## TC-exceptions-09: FileNotFoundError (domain version)
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-05 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `FileNotFoundError(file_id="f-123")`(測試中以 `DomainFileNotFoundError` 別名匯入) |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 code 與 details |
-| **預期結果** | `error_code == "FILE_NOT_FOUND"`;`details == {"resource_type": "file", "identifier": "f-123"}` |
-| **實作** | `tests/test_exceptions.py::test_file_not_found` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-05 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `FileNotFoundError(file_id="f-123")` (imported in the test under the alias `DomainFileNotFoundError`) |
+| **Test steps** | 1. Construct the exception<br>2. Check code and details |
+| **Expected result** | `error_code == "FILE_NOT_FOUND"`; `details == {"resource_type": "file", "identifier": "f-123"}` |
+| **Implementation** | `tests/test_exceptions.py::test_file_not_found` |
 
-## TC-exceptions-10:FileIndexNotFoundError
+## TC-exceptions-10: FileIndexNotFoundError
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-06 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `FileIndexNotFoundError(file_id="f-9")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 code / message / identifier |
-| **預期結果** | `error_code == "FILE_INDEX_NOT_FOUND"`;`message == "File f-9 has not been indexed yet"`;`details["identifier"] == "f-9"` |
-| **實作** | `tests/test_exceptions.py::test_file_index_not_found` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-06 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `FileIndexNotFoundError(file_id="f-9")` |
+| **Test steps** | 1. Construct the exception<br>2. Check code / message / identifier |
+| **Expected result** | `error_code == "FILE_INDEX_NOT_FOUND"`; `message == "File f-9 has not been indexed yet"`; `details["identifier"] == "f-9"` |
+| **Implementation** | `tests/test_exceptions.py::test_file_index_not_found` |
 
-## TC-exceptions-11:UnauthorizedAccessError — 無 reason
+## TC-exceptions-11: UnauthorizedAccessError — without reason
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-07 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `UnauthorizedAccessError(resource_type="folder", resource_id=5)` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 code / message / details |
-| **預期結果** | `error_code == "UNAUTHORIZED_ACCESS"`;`message == "Not authorized to access folder: 5"`;`details == {"resource_type": "folder", "resource_id": "5"}` |
-| **實作** | `tests/test_exceptions.py::test_unauthorized_without_reason` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-07 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `UnauthorizedAccessError(resource_type="folder", resource_id=5)` |
+| **Test steps** | 1. Construct the exception<br>2. Check code / message / details |
+| **Expected result** | `error_code == "UNAUTHORIZED_ACCESS"`; `message == "Not authorized to access folder: 5"`; `details == {"resource_type": "folder", "resource_id": "5"}` |
+| **Implementation** | `tests/test_exceptions.py::test_unauthorized_without_reason` |
 
-## TC-exceptions-12:UnauthorizedAccessError — 有 reason
+## TC-exceptions-12: UnauthorizedAccessError — with reason
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-07 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `UnauthorizedAccessError("file", "x", reason="not owner")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 message |
-| **預期結果** | `message == "Not authorized to access file: x - not owner"` |
-| **實作** | `tests/test_exceptions.py::test_unauthorized_with_reason` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-07 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `UnauthorizedAccessError("file", "x", reason="not owner")` |
+| **Test steps** | 1. Construct the exception<br>2. Check message |
+| **Expected result** | `message == "Not authorized to access file: x - not owner"` |
+| **Implementation** | `tests/test_exceptions.py::test_unauthorized_with_reason` |
 
-## TC-exceptions-13:InvalidTokenError — 預設與自訂 reason
+## TC-exceptions-13: InvalidTokenError — default and custom reason
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-08 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `InvalidTokenError()` 與 `InvalidTokenError(reason="token revoked")` |
-| **測試步驟** | 1. 分別建構<br>2. 檢查 code 與 message |
-| **預期結果** | code 均為 `INVALID_TOKEN`;預設 message `"Invalid or expired token"`;自訂時為 `"token revoked"` |
-| **實作** | `tests/test_exceptions.py::test_invalid_token_default_and_custom_reason` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-08 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `InvalidTokenError()` and `InvalidTokenError(reason="token revoked")` |
+| **Test steps** | 1. Construct each<br>2. Check code and message |
+| **Expected result** | code is `INVALID_TOKEN` for both; default message `"Invalid or expired token"`; when custom, `"token revoked"` |
+| **Implementation** | `tests/test_exceptions.py::test_invalid_token_default_and_custom_reason` |
 
-## TC-exceptions-14:ValidationError — 有 value
+## TC-exceptions-14: ValidationError — with value
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-09 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `ValidationError(field="top_k", message="must be positive", value=-3)` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 code / message / details |
-| **預期結果** | `error_code == "VALIDATION_ERROR"`;`message == "Validation failed for top_k: must be positive"`;`details == {"field": "top_k", "invalid_value": "-3"}` |
-| **實作** | `tests/test_exceptions.py::test_validation_error_with_value` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-09 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `ValidationError(field="top_k", message="must be positive", value=-3)` |
+| **Test steps** | 1. Construct the exception<br>2. Check code / message / details |
+| **Expected result** | `error_code == "VALIDATION_ERROR"`; `message == "Validation failed for top_k: must be positive"`; `details == {"field": "top_k", "invalid_value": "-3"}` |
+| **Implementation** | `tests/test_exceptions.py::test_validation_error_with_value` |
 
-## TC-exceptions-15:ValidationError — 無 value
+## TC-exceptions-15: ValidationError — without value
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-09 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `ValidationError(field="query", message="empty")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 details |
-| **預期結果** | `details == {"field": "query"}`;不含 `invalid_value` 鍵 |
-| **實作** | `tests/test_exceptions.py::test_validation_error_without_value` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-09 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `ValidationError(field="query", message="empty")` |
+| **Test steps** | 1. Construct the exception<br>2. Check details |
+| **Expected result** | `details == {"field": "query"}`; no `invalid_value` key |
+| **Implementation** | `tests/test_exceptions.py::test_validation_error_without_value` |
 
-## TC-exceptions-16:ConflictError — 有 resource
+## TC-exceptions-16: ConflictError — with resource
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-10 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `ConflictError(message="already indexing", resource="file f-1")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 code 與 details |
-| **預期結果** | `error_code == "CONFLICT"`;`details == {"resource": "file f-1"}` |
-| **實作** | `tests/test_exceptions.py::test_conflict_with_resource` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-10 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `ConflictError(message="already indexing", resource="file f-1")` |
+| **Test steps** | 1. Construct the exception<br>2. Check code and details |
+| **Expected result** | `error_code == "CONFLICT"`; `details == {"resource": "file f-1"}` |
+| **Implementation** | `tests/test_exceptions.py::test_conflict_with_resource` |
 
-## TC-exceptions-17:ConflictError — 無 resource
+## TC-exceptions-17: ConflictError — without resource
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-10 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `ConflictError(message="state conflict")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 details |
-| **預期結果** | `details == {}` |
-| **實作** | `tests/test_exceptions.py::test_conflict_without_resource` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-10 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `ConflictError(message="state conflict")` |
+| **Test steps** | 1. Construct the exception<br>2. Check details |
+| **Expected result** | `details == {}` |
+| **Implementation** | `tests/test_exceptions.py::test_conflict_without_resource` |
 
-## TC-exceptions-18:RAGOperationError — error_code 組合規則
+## TC-exceptions-18: RAGOperationError — error_code composition rule
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-11 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `RAGOperationError(operation="indexing", reason="disk full")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 code / message / details |
-| **預期結果** | `error_code == "RAG_INDEXING_ERROR"`;`message == "RAG indexing failed: disk full"`;`details == {}` |
-| **實作** | `tests/test_exceptions.py::test_rag_operation_error_code_from_operation` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-11 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `RAGOperationError(operation="indexing", reason="disk full")` |
+| **Test steps** | 1. Construct the exception<br>2. Check code / message / details |
+| **Expected result** | `error_code == "RAG_INDEXING_ERROR"`; `message == "RAG indexing failed: disk full"`; `details == {}` |
+| **Implementation** | `tests/test_exceptions.py::test_rag_operation_error_code_from_operation` |
 
-## TC-exceptions-19:FileIndexingError
+## TC-exceptions-19: FileIndexingError
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-11 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `FileIndexingError(file_id="f-7", reason="parse failed")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 code / details / message |
-| **預期結果** | `error_code == "RAG_INDEXING_ERROR"`;`details == {"file_id": "f-7"}`;message 含 `"parse failed"` |
-| **實作** | `tests/test_exceptions.py::test_file_indexing_error` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-11 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `FileIndexingError(file_id="f-7", reason="parse failed")` |
+| **Test steps** | 1. Construct the exception<br>2. Check code / details / message |
+| **Expected result** | `error_code == "RAG_INDEXING_ERROR"`; `details == {"file_id": "f-7"}`; message contains `"parse failed"` |
+| **Implementation** | `tests/test_exceptions.py::test_file_indexing_error` |
 
-## TC-exceptions-20:QueryExecutionError — 有 folder_id
+## TC-exceptions-20: QueryExecutionError — with folder_id
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-11 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `QueryExecutionError(query="財報重點", reason="timeout", folder_id=3)` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 code 與 details |
-| **預期結果** | `error_code == "RAG_QUERY_ERROR"`;`details == {"query": "財報重點", "folder_id": 3}` |
-| **實作** | `tests/test_exceptions.py::test_query_execution_error_with_folder` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-11 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `QueryExecutionError(query="財報重點", reason="timeout", folder_id=3)` |
+| **Test steps** | 1. Construct the exception<br>2. Check code and details |
+| **Expected result** | `error_code == "RAG_QUERY_ERROR"`; `details == {"query": "財報重點", "folder_id": 3}` |
+| **Implementation** | `tests/test_exceptions.py::test_query_execution_error_with_folder` |
 
-## TC-exceptions-21:QueryExecutionError — 無 folder_id
+## TC-exceptions-21: QueryExecutionError — without folder_id
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-11 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `QueryExecutionError(query="q", reason="r")` |
-| **測試步驟** | 1. 建構例外<br>2. 檢查 details |
-| **預期結果** | `details == {"query": "q"}`;不含 `folder_id` 鍵 |
-| **實作** | `tests/test_exceptions.py::test_query_execution_error_without_folder` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-11 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `QueryExecutionError(query="q", reason="r")` |
+| **Test steps** | 1. Construct the exception<br>2. Check details |
+| **Expected result** | `details == {"query": "q"}`; no `folder_id` key |
+| **Implementation** | `tests/test_exceptions.py::test_query_execution_error_without_folder` |
 
-## TC-exceptions-22:get_http_status_for_exception — 已知 code 映射(參數化 9 組)
+## TC-exceptions-22: get_http_status_for_exception — known code mapping (9 parametrized cases)
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-12 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | ValidationError / InvalidTokenError / UnauthorizedAccessError / FolderNotFoundError / FileNotFoundError / FileIndexNotFoundError / ConflictError / FileIndexingError / QueryExecutionError 各一實例 |
-| **測試步驟** | 1. 依序建構九種例外<br>2. 各自傳入 `get_http_status_for_exception()` |
-| **預期結果** | 依序回 400 / 401 / 403 / 404 / 404 / 404 / 409 / 500 / 500 |
-| **實作** | `tests/test_exceptions.py::test_http_status_mapping`(pytest.mark.parametrize 9 組) |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-12 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | One instance each of ValidationError / InvalidTokenError / UnauthorizedAccessError / FolderNotFoundError / FileNotFoundError / FileIndexNotFoundError / ConflictError / FileIndexingError / QueryExecutionError |
+| **Test steps** | 1. Construct the nine exceptions in order<br>2. Pass each to `get_http_status_for_exception()` |
+| **Expected result** | Returns 400 / 401 / 403 / 404 / 404 / 404 / 409 / 500 / 500 respectively |
+| **Implementation** | `tests/test_exceptions.py::test_http_status_mapping` (pytest.mark.parametrize, 9 cases) |
 
-## TC-exceptions-23:get_http_status_for_exception — 未知 code 預設 500
+## TC-exceptions-23: get_http_status_for_exception — unknown code defaults to 500
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-12 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `DomainException("m", "TOTALLY_UNKNOWN")` 與 `RAGOperationError("embedding", "r")`(產生未列表的 `RAG_EMBEDDING_ERROR`) |
-| **測試步驟** | 1. 建構兩個未知 code 例外<br>2. 傳入映射函式 |
-| **預期結果** | 兩者皆回 500 |
-| **實作** | `tests/test_exceptions.py::test_http_status_unknown_code_defaults_to_500` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-12 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `DomainException("m", "TOTALLY_UNKNOWN")` and `RAGOperationError("embedding", "r")` (which produces the unlisted `RAG_EMBEDDING_ERROR`) |
+| **Test steps** | 1. Construct the two unknown-code exceptions<br>2. Pass them to the mapping function |
+| **Expected result** | Both return 500 |
+| **Implementation** | `tests/test_exceptions.py::test_http_status_unknown_code_defaults_to_500` |
 
-## TC-exceptions-24:全家族繼承 DomainException
+## TC-exceptions-24: the whole family inherits DomainException
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-exceptions-13 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 模組內 11 個具名例外各一實例 |
-| **測試步驟** | 1. 建構全部具名例外<br>2. 逐一檢查 isinstance |
-| **預期結果** | 每個實例 `isinstance(exc, DomainException)` 均為 True |
-| **實作** | `tests/test_exceptions.py::test_all_exceptions_inherit_domain_exception` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-exceptions-13 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | One instance each of the 11 named exceptions in the module |
+| **Test steps** | 1. Construct all named exceptions<br>2. Check isinstance one by one |
+| **Expected result** | For every instance, `isinstance(exc, DomainException)` is True |
+| **Implementation** | `tests/test_exceptions.py::test_all_exceptions_inherit_domain_exception` |
 
-> 撰寫原則:一個案例只驗證一件事;正常路徑與例外路徑分開;預期結果必須是**可觀察、可判定**的。
+> Authoring principles: each case verifies exactly one thing; keep the happy path and the exception path separate; expected results must be **observable and determinable**.

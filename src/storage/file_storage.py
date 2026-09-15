@@ -1,8 +1,6 @@
+"""File storage management on the local filesystem.
 
-"""文件存儲管理模組
-
-提供文件在文件系統中的存儲、讀取和刪除功能。
-文件存儲結構：storage/{folder_name}/{filename}
+Storage layout: storage/{user_token}/{folder_name}/{file_id}
 """
 
 import os
@@ -16,20 +14,13 @@ logger = get_api_logger()
 
 
 def _resolve_storage_root() -> Path:
-    """決定 storage 根目錄。
+    """Resolve the storage root directory.
 
-    順序:
-      1. `MIRAG_STORAGE_ROOT` env var — 顯式 override(escape hatch)
-      2. `resolve_base_dir()` — 跟 config / assets 同套 onefile-aware 邏輯
-
-    為什麼用 resolve_base_dir 而不是 cwd / __file__:
-      - Nuitka --onefile 的 __file__ 落在 /tmp/onefile_*,storage 跟著 ephemeral
-      - cwd 在 systemd / 異常啟動可能是 / 或不可預期
-      - resolve_base_dir 同時考慮 NUITKA_ONEFILE_PARENT、/proc/self/exe、
-        sys.executable、/app convention、dev_root 多層 fallback,任一場景都穩
-
-    全部部署場景跑得起來,**MIRAG_STORAGE_ROOT 完全不必設**。env var 純作
-    異常 escape hatch 留著。
+    Order: the MIRAG_STORAGE_ROOT env var (explicit override), else
+    resolve_base_dir() (the same onefile-aware logic used for config/assets).
+    resolve_base_dir is preferred over cwd / __file__ because under Nuitka
+    --onefile __file__ points at an ephemeral /tmp path, and cwd is unpredictable
+    under systemd. Every deployment works without setting the env var.
     """
     env_root = os.getenv("MIRAG_STORAGE_ROOT")
     if env_root:
@@ -40,22 +31,16 @@ def _resolve_storage_root() -> Path:
 _PROJECT_ROOT = _resolve_storage_root()
 logger.info(f"[INIT] Storage root resolved: {_PROJECT_ROOT}")
 
-# Folder/token name 安全字元 — 字母 / 數字 / dash / underscore / dot / space / 中文
-# 防止 ../etc/passwd 之類 path traversal 攻擊
+# Safe characters for folder/token names: letters / digits / dash / underscore /
+# dot / space / CJK. Guards against path traversal such as ../etc/passwd.
 _SAFE_NAME_PATTERN = re.compile(r'^[\w\-. 一-鿿]+$')
 
 
 def _validate_safe_name(name: str, kind: str = "name") -> None:
-    """驗證名稱安全(防 path traversal)。
+    """Validate a name to prevent path traversal.
 
-    規則:非空 + 只含 alphanumeric / _ / - / . / space / CJK + 不開頭 ``.`` + 不含 ``..``。
-
-    Args:
-        name: 要驗的 token / folder / file 名稱。
-        kind: log 用的名稱類別("token" / "folder" / "file")。
-
-    Raises:
-        ValueError: 違規。
+    Must be non-empty, contain only allowed characters, not start with ``.``,
+    and not contain ``..``. Raises ValueError on violation.
     """
     if not name or not isinstance(name, str):
         raise ValueError(f"{kind} cannot be empty")
@@ -68,46 +53,33 @@ def _validate_safe_name(name: str, kind: str = "name") -> None:
 
 
 class FileStorage:
-    """文件存儲管理類"""
+    """File storage management class."""
 
-    # 存儲根目錄,固定 project root 下的 storage/
-    # 不再 Path.cwd() — 啟動 cwd 變動會讓 storage 跑掉
+    # Fixed at storage/ under the project root, not Path.cwd(): a shifting
+    # startup cwd would otherwise relocate storage.
     STORAGE_ROOT = _PROJECT_ROOT / "storage"
     STORAGE_FILE_ROOT = _PROJECT_ROOT
     
     @classmethod
     def _ensure_storage_root(cls):
-        """確保存儲根目錄存在"""
+        """Ensure the storage root directory exists."""
         cls.STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def resolve_path(cls, file_path: str) -> Path:
-        """把 DB 存的相對路徑(`storage/...` 開頭)解析成 STORAGE_FILE_ROOT 下的絕對路徑。
+        """Resolve a DB-stored relative path (``storage/...``) to an absolute path.
 
-        消費端(HierarchicalIndexer 等)直接 ``open()`` 會踩 cwd 雷;
-        走此 helper 確保跟 save_file 對得上。已絕對路徑時 Path 行為會丟棄左側,保險。
-
-        Args:
-            file_path: DB 內存的相對(或絕對)路徑字串。
-
-        Returns:
-            ``Path`` 絕對路徑。
+        Keeps direct-``open()`` consumers (e.g. HierarchicalIndexer) consistent
+        with save_file regardless of cwd. An already-absolute input is returned
+        as-is (Path discards the left side), which is safe.
         """
         return cls.STORAGE_FILE_ROOT / file_path
     
     @classmethod
     def _get_folder_storage_path(cls, user_token: str, folder_name: str) -> Path:
-        """獲取資料夾的存儲路徑
+        """Return the storage path for a folder, creating it.
 
-        Args:
-            user_token: 用戶令牌
-            folder_name: 資料夾名稱
-
-        Returns:
-            資料夾存儲路徑
-
-        Raises:
-            ValueError: 如果 user_token 或 folder_name 含 path traversal 字元
+        Raises ValueError if user_token or folder_name fails safe-name validation.
         """
         _validate_safe_name(user_token, "user_token")
         _validate_safe_name(folder_name, "folder_name")
@@ -118,29 +90,17 @@ class FileStorage:
     
     @classmethod
     def save_file(cls, user_token: str, folder_name: str, file_id: str, file_content: bytes) -> str:
-        """保存文件到文件系統
+        """Save a file and return its path relative to the project root.
 
-        Args:
-            user_token: 用戶令牌
-            folder_name: 資料夾名稱
-            file_id: 文件ID (UUID)
-            file_content: 文件二進制內容
-
-        Returns:
-            相對於項目根目錄的文件路徑
-
-        Raises:
-            IOError: 文件保存失敗時拋出
+        Raises IOError if saving fails.
         """
         try:
             folder_path = cls._get_folder_storage_path(user_token, folder_name)
             file_path = folder_path / file_id
 
-            # 寫入文件
             with open(file_path, 'wb') as f:
                 f.write(file_content)
 
-            # 返回相對路徑
             relative_path = f"storage/{user_token}/{folder_name}/{file_id}"
             logger.info(f"File saved successfully: {relative_path}")
             return relative_path
@@ -151,26 +111,16 @@ class FileStorage:
     
     @classmethod
     def read_file(cls, file_path: str) -> bytes:
-        """從文件系統讀取文件
-        
-        Args:
-            file_path: 文件路徑（相對於項目根目錄）
-            
-        Returns:
-            文件二進制內容
-            
-        Raises:
-            FileNotFoundError: 文件不存在時拋出
-            IOError: 文件讀取失敗時拋出
+        """Read a file (path relative to the project root).
+
+        Raises FileNotFoundError if missing, IOError on other failures.
         """
         try:
-            # 構建完整路徑
             full_path = cls.STORAGE_FILE_ROOT / file_path
-            
+
             if not full_path.exists():
                 raise FileNotFoundError(f"File not found: {file_path}")
-            
-            # 讀取文件
+
             with open(full_path, 'rb') as f:
                 content = f.read()
             
@@ -186,23 +136,14 @@ class FileStorage:
     
     @classmethod
     def delete_file(cls, file_path: str) -> bool:
-        """從文件系統刪除文件
-        
-        Args:
-            file_path: 文件路徑（相對於項目根目錄）
-            
-        Returns:
-            是否刪除成功
-        """
+        """Delete a file (path relative to the project root); return whether it succeeded."""
         try:
-            # 構建完整路徑
             full_path = cls.STORAGE_FILE_ROOT / file_path
-            
+
             if not full_path.exists():
                 logger.warning(f"File not found for deletion: {file_path}")
                 return False
-            
-            # 刪除文件
+
             full_path.unlink()
             logger.info(f"File deleted successfully: {file_path}")
             return True
@@ -213,15 +154,7 @@ class FileStorage:
     
     @classmethod
     def delete_folder(cls, user_token: str, folder_name: str) -> bool:
-        """刪除整個資料夾
-        
-        Args:
-            user_token: 用戶令牌
-            folder_name: 資料夾名稱
-            
-        Returns:
-            是否刪除成功
-        """
+        """Delete an entire folder; return whether it succeeded."""
         try:
             _validate_safe_name(user_token, "user_token")
             _validate_safe_name(folder_name, "folder_name")
@@ -242,16 +175,7 @@ class FileStorage:
 
     @classmethod
     def rename_folder(cls, user_token: str, old_folder_name: str, new_folder_name: str) -> bool:
-        """重新命名資料夾
-        
-        Args:
-            user_token: 用戶令牌
-            old_folder_name: 舊的資料夾名稱
-            new_folder_name: 新的資料夾名稱
-            
-        Returns:
-            是否重新命名成功
-        """
+        """Rename a folder; return whether it succeeded."""
         try:
             _validate_safe_name(user_token, "user_token")
             _validate_safe_name(old_folder_name, "old_folder_name")

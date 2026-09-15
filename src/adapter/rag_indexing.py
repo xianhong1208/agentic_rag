@@ -1,13 +1,6 @@
+"""RAG indexing service: single-file, folder, file-id subset, and auto-index.
 
-"""RAG indexing service — 單檔 / 資料夾 / 指定檔案清單 / 自動索引。
-
-從 RAGAdapter 拆出的四個方法:
-- `index_document(file_record, token)` — 單檔索引(內部用 HierarchicalIndexer)
-- `index_folder(folder_id, token, skip_existing)` — 整個資料夾迭代呼叫 index_document
-- `index_files(file_ids, folder_id, token)` — 指定子集索引(auto-index 上傳用)
-- `trigger_auto_index(file_ids, folder_id, token, auto_index)` — 非同步觸發 background job
-
-共用 RAGContext 提供的 indexer / indexing_service / vector_store_manager。
+Shares the indexer / indexing_service / vector_store_manager provided by RAGContext.
 """
 
 from __future__ import annotations
@@ -23,7 +16,7 @@ from src.api.router.response import (
     IndexDocumentResponse,
     IndexFolderResponse,
 )
-from src.config.model import IndexingConfig  # M10: timeout default 單一來源
+from src.config.model import IndexingConfig  # single source for the timeout default
 from src.domain.exceptions import (
     DomainException,
     FileIndexingError,
@@ -40,48 +33,44 @@ if TYPE_CHECKING:
 
 logger = get_adapter_logger()
 
-# mid-stage abort probe 的 DB 存在性檢查節流間隔(秒)。
-# manager 的 in-memory flag(刪檔主動通知)不節流 — 每個檢查點都看;
-# DB probe 只是兜底(直接動 DB 刪檔等 manager 通知不到的情況)。
+# Throttle interval (seconds) for the DB existence check in the mid-stage abort probe.
+# The manager's in-memory abort flag is checked at every checkpoint; this DB probe is
+# only a backstop for deletions the manager cannot notify about (e.g. a direct DB delete).
 _ABORT_PROBE_INTERVAL_SECONDS = 10.0
 
-# Keepalive tick 間隔(秒)。必須遠小於 index_job_manager._HEARTBEAT_STALE_SECONDS
-# (600s),否則補的心跳趕不上 watchdog 判死。
-#
-# 為什麼需要這東西:watchdog 600s 沒心跳就翻 FAILED + cancel task,而 per-file
-# 預算現在放到 10 天(_PER_FILE_TIMEOUT_DEFAULT)—— 落在心跳盲區的慢檔會在
-# per-file timeout 到期前老早就被 watchdog 誤殺。keepalive 補心跳把這關兜住。
-# 已知盲區:semaphore 等待、docling/OCR 解析、context-gen 每 10 chunk 的節流
-# 間隙、單批 embedding、pgvector 寫入。與其逐一去包,不如包住整個單檔生命週期。
-#
-# 這裡不需要自己設「放棄策略」:真正 hang 住的檔案由 _with_timeout 的
-# wait_for(per_file_timeout) 兜底,keepalive 只負責不讓「慢」被誤判成「死」。
+# Keepalive tick interval (seconds). Must stay far below the watchdog's stale threshold
+# (index_job_manager._HEARTBEAT_STALE_SECONDS, 600s): the watchdog fails and cancels a
+# job after 600s without a heartbeat, but the per-file budget is up to 10 days, so a slow
+# file in a heartbeat blind spot (semaphore wait, docling/OCR, context-gen throttle,
+# embedding batch, pgvector write) would be killed prematurely. Injected heartbeats keep
+# "slow" from being mistaken for "dead"; a genuinely hung file is still caught by
+# _with_timeout's wait_for(per_file_timeout).
 _KEEPALIVE_INTERVAL_SECONDS = 60.0
 
 
-# 索引同時上限;env RAG_INDEXING_CONCURRENCY > config.rag.indexing.max_concurrent_jobs > 4
+# Max concurrent indexing; env RAG_INDEXING_CONCURRENCY > config.rag.indexing.max_concurrent_jobs > 4
 _INDEXING_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
-# Per-file timeout default. Same env > config > default resolution.
-# M10: 直接引用 IndexingConfig 的欄位 default,不再各處各寫一份 864000 字面值。
+# Per-file timeout default (env > config > this). Reference the IndexingConfig field
+# default directly instead of repeating the literal 864000.
 _PER_FILE_TIMEOUT_DEFAULT = IndexingConfig.model_fields["per_file_timeout_seconds"].default
 
 
 async def _run_db(fn, *args, **kwargs):
-    """M1: 把阻塞的同步 DB helper 丟到 worker thread 跑,不佔 event loop。
+    """Run a blocking synchronous DB helper on a worker thread so it doesn't hold the event loop.
 
-    索引 async 路徑原本直接呼叫同步 SQLAlchemy helper(baseDB 每次
-    `with Session()`),query 期間卡住 loop → 高並發時 API/SSE/cancel/query 一起頓。
-    baseDB 是 session-per-call(每次新建/關閉),丟到 thread 執行 thread-safe。
+    baseDB is session-per-call (a fresh session created and closed each time), so
+    running it on a thread is thread-safe.
 
-    ⚠️ 不要在 `except asyncio.CancelledError:` 區塊內用 —— cancel 期間 await 會再次
-    拋 CancelledError。那些路徑(mark_index_failed on cancel)維持同步呼叫。
+    Warning: do not use inside an `except asyncio.CancelledError:` block — awaiting
+    during cancellation re-raises CancelledError. Those paths (mark_index_failed on
+    cancel) stay synchronous.
     """
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 def _resolve_indexing_concurrency() -> int:
-    """env var > config > default 4(見 IndexingConfig.max_concurrent_jobs 註解)。"""
+    """Resolve max concurrent indexing jobs: env var > config > default 4."""
     env_val = os.getenv("RAG_INDEXING_CONCURRENCY")
     if env_val:
         try:
@@ -101,13 +90,10 @@ def _resolve_indexing_concurrency() -> int:
 
 
 def _resolve_per_file_timeout() -> int:
-    """解析單檔 indexing timeout 秒數。
+    """Resolve the per-file indexing timeout in seconds.
 
-    優先序:env RAG_PER_FILE_TIMEOUT_SECONDS > config.rag.indexing.per_file_timeout_seconds
-    > _PER_FILE_TIMEOUT_DEFAULT(864000s / 10 天)。
-
-    Returns:
-        上限秒數;0 或負值 = 不設上限(緊急 bypass 用)。
+    Priority: env RAG_PER_FILE_TIMEOUT_SECONDS > config.rag.indexing.per_file_timeout_seconds
+    > _PER_FILE_TIMEOUT_DEFAULT (864000s / 10 days). 0 or negative means no limit.
     """
     env_val = os.getenv("RAG_PER_FILE_TIMEOUT_SECONDS")
     if env_val:
@@ -126,7 +112,7 @@ def _resolve_per_file_timeout() -> int:
 
 
 def _get_indexing_semaphore() -> asyncio.Semaphore:
-    """Lazy-init 因為 Semaphore 要在 event loop 起來後才能建。"""
+    """Lazy-init because a Semaphore must be created after the event loop is running."""
     global _INDEXING_SEMAPHORE
     if _INDEXING_SEMAPHORE is None:
         limit = _resolve_indexing_concurrency()
@@ -139,19 +125,11 @@ def _make_timing_entry(
     file_id, file_name: str, status: str, t0: float, stages: Dict[str, float],
     chunks: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """組一筆 IndexJobState.file_timings entry。
+    """Assemble one IndexJobState.file_timings entry.
 
-    Args:
-        file_id: 檔案 UUID。
-        file_name: 顯示用檔名。
-        status: success / failed / timeout / skipped。
-        t0: per-file try block 進入時的 perf_counter()。
-        stages: load_ms / index_ms 等已完成 stage 的耗時;沒跑完的留空 → entry 內 None。
-        chunks: 此檔切出的 leaf chunk 數(成功才有;skipped/failed 為 None)。
-            持久化的 chunk 紀錄——job 結束後仍可稽核「每檔切了幾塊」。
-
-    Returns:
-        {file_id, file_name, status, total_ms, load_ms, index_ms, chunks} dict。
+    status is one of success / failed / timeout / skipped; t0 is the perf_counter()
+    taken when the per-file try block was entered. Stages that did not run are absent
+    (None). chunks is the leaf-chunk count, present only on success.
     """
     return {
         "file_id": str(file_id),
@@ -160,26 +138,17 @@ def _make_timing_entry(
         "total_ms": round((time.perf_counter() - t0) * 1000, 1),
         "load_ms": stages.get("load_ms"),
         "index_ms": stages.get("index_ms"),
-        # 階段耗時明細(StageTimer):{"loading": ms, "contextualizing": ms,
-        # "embedding": ms, "writing": ms} — 回答「每個階段花了多久」
+        # Per-stage wall-clock from StageTimer: {loading, contextualizing, embedding, writing}
         "stage_ms": stages.get("stage_ms"),
         "chunks": chunks,
     }
 
 
 async def _with_timeout(coro, timeout_seconds: int, filename: str):
-    """在硬時間預算下跑 per-file indexing coroutine。
+    """Run a per-file indexing coroutine under a hard time budget.
 
-    Args:
-        coro: 要 await 的 coroutine(通常是 self.index_document(...))。
-        timeout_seconds: 上限秒數;<=0 不設限。
-        filename: 純錯誤訊息標籤,timeout 時帶在 TimeoutError 內。
-
-    Returns:
-        coro 的 return 值。
-
-    Raises:
-        TimeoutError: 超時,帶 filename + 秒數。
+    timeout_seconds <= 0 means no limit. filename is used only in the error message.
+    Raises TimeoutError on timeout, carrying the filename and second count.
     """
     if timeout_seconds and timeout_seconds > 0:
         try:
@@ -192,51 +161,35 @@ async def _with_timeout(coro, timeout_seconds: int, filename: str):
 
 
 def _keepalive_stage_label(stage: str, elapsed_seconds: float) -> str:
-    """決定 keepalive 補發心跳時,回報給 job state / SSE 的 stage 標籤。
+    """Stage label reported to the job state / SSE when the keepalive injects a heartbeat.
 
-    **原樣回傳,不要在這裡加 elapsed。** 這條規則是查過下游才定的:
-
-    micore-portal 的 ``IndexingStatusBadge.tsx`` 拿 stage 去查一張中文對照表
-    ``STAGE_LABEL = {loading: '解析文件', contextualizing: '上下文生成',
-    embedding: '向量化', writing: '寫入'}``,寫法是
-    ``STAGE_LABEL[stage] ?? stage``。加了 elapsed 會讓 key 查不到 —— 有
-    fallback 所以不會爆,但 badge 會從「解析文件」退化成英文原字串
-    ``loading (8m20s)``,而且偏偏發生在解析很久、使用者最需要看懂的時候。
-
-    elapsed 要曝光的話請放 ``message`` / ``last_message``:那兩個欄位本來就是
-    自由文字,也已經在 SSE 契約裡,不受對照表約束。
-
-    Args:
-        stage: 最後一次真實進度回報的 stage。
-        elapsed_seconds: 距離最後一次真實進度已經過了幾秒(目前僅供未來擴充,
-            不影響回傳值 —— 見上方為什麼不能編碼進 stage)。
-
-    Returns:
-        要回報的 stage 標籤(即傳入的 stage 本身)。
+    Returns the stage unchanged. Do not append elapsed: the frontend badge looks the
+    stage up in a localized label map keyed by the exact stage string, so any suffix
+    misses the key and degrades the badge to the raw English stage. Surface elapsed via
+    the free-text message / last_message fields instead. elapsed_seconds is unused for now.
     """
     return stage
 
 
 class _ProgressKeepalive:
-    """把 ``_progress_cb`` 包成「至少每 interval 秒發一次心跳」的版本。
+    """Wrap ``_progress_cb`` so it emits a heartbeat at least every interval seconds.
 
-    自己就是一個 callable,签名與原本的 ``_progress_cb(stage, done, total)``
-    相同,可以直接頂替傳進 indexer;差別是它會記住最後一次進度,並在背景
-    task 裡於閒置超過 interval 時原地補發,藉此刷新 job 的 last_updated_at。
-
-    真實進度會重置閒置計時,所以正常跑的檔案不會有任何額外的 tick。
+    Has the same signature as ``_progress_cb(stage, done, total)`` and can be passed to
+    the indexer in its place. It remembers the last progress and, from a background task,
+    re-emits it after being idle longer than the interval, refreshing last_updated_at.
+    Real progress resets the idle timer, so a normally-progressing file gets no extra ticks.
     """
 
     def __init__(self, progress_cb, interval: float = _KEEPALIVE_INTERVAL_SECONDS):
         self._cb = progress_cb
         self._interval = interval
-        # 尚未進入任何 stage 前就先有值 — semaphore 等待期間補的心跳用得到
+        # Seed a value before any stage, for heartbeats injected while waiting on the semaphore
         self._last_args = ("queued", None, None)
         self._last_emit = time.monotonic()
         self._task: Optional[asyncio.Task] = None
 
     def __call__(self, stage: str, done: Optional[int], total: Optional[int]) -> None:
-        """Drop-in replacement for ``_progress_cb`` — 記下最後進度再轉發。"""
+        """Record the last progress, then forward it."""
         self._last_args = (stage, done, total)
         self._emit(stage, done, total)
 
@@ -247,7 +200,7 @@ class _ProgressKeepalive:
         try:
             self._cb(stage, done, total)
         except Exception:
-            pass  # 進度回報失敗不影響 indexing(與既有 call site 一致)
+            pass  # a progress-report failure must not affect indexing
 
     async def _loop(self) -> None:
         while True:
@@ -275,26 +228,17 @@ class _ProgressKeepalive:
 
 
 class RAGIndexingService:
-    """處理單檔 / 資料夾 / 子集 indexing 跟 auto-index trigger 的 service。"""
+    """Service handling single-file / folder / subset indexing and the auto-index trigger."""
 
     def __init__(self, ctx: "RAGContext"):
         self._ctx = ctx
 
-    # ------------------------------------------------------------------
-    # File-existence gates (#24)
-    # ------------------------------------------------------------------
-
     def _file_still_exists(self, file_id) -> bool:
-        """檢查 file_id 還在不在 Files table(mid-job existence gate)。
+        """Check whether file_id is still in the Files table (mid-job existence gate).
 
-        當使用者在背景索引途中刪檔,讓我們提前 abort,免得繼續燒 Docling/embed,
-        最後又因 FK violation 才炸。Fail-open:probe 自己失敗時不 abort。
-
-        Args:
-            file_id: 檔案 UUID。
-
-        Returns:
-            True = 還在;False = 已刪。Probe 出錯時也回 True(fail-open)。
+        Lets a job abort early when the user deletes a file mid-indexing, rather than
+        burning Docling/embed and then hitting an FK violation. Fail-open: returns True
+        (still present) on probe error, so a probe failure never aborts a valid job.
         """
         try:
             records = self._ctx.indexing_service.get_files_by_ids([str(file_id)])
@@ -307,15 +251,13 @@ class RAGIndexingService:
         return str(file_id) in records
 
     def _make_should_abort(self, file_id) -> "Callable[[], bool]":
-        """建立單檔的 mid-stage abort probe(gate 之外的 stage 內檢查點用)。
+        """Build a per-file mid-stage abort probe for in-stage checkpoints beyond the gates.
 
-        兩層訊號,回傳 True 即該檔中止:
-        ① IndexingJobManager 的 per-file abort flag — 刪檔主動通知,in-memory
-           查詢零成本,每個檢查點都看(消費即清除)。
-        ② `_file_still_exists` DB probe — 兜底,每 _ABORT_PROBE_INTERVAL_SECONDS
-           節流一次,涵蓋 manager 通知不到的刪法。
-        保證不 raise(indexer 端不再包 try);判定過一次 abort 後結果黏住,
-        後續呼叫直接回 True 不再打 DB。
+        Two signal layers (True means abort): (1) IndexingJobManager's in-memory per-file
+        abort flag, checked at every checkpoint and cleared on consume; (2) the
+        _file_still_exists DB probe, throttled to once per _ABORT_PROBE_INTERVAL_SECONDS,
+        as a backstop for deletions the manager cannot notify about. Never raises, and once
+        an abort is decided it sticks (later calls return True without hitting the DB).
         """
         fid = str(file_id)
         state = {"aborted": False, "last_probe": time.monotonic()}
@@ -330,20 +272,16 @@ class RAGIndexingService:
                     manager.clear_file_abort(fid)
                     state["aborted"] = True
                     return True
-            except Exception as e:  # pragma: no cover - 防禦性
+            except Exception as e:  # pragma: no cover - defensive
                 logger.debug(f"[ABORT_PROBE] fid={fid} | manager flag check failed: {e}")
             now = time.monotonic()
             if now - state["last_probe"] >= _ABORT_PROBE_INTERVAL_SECONDS:
                 state["last_probe"] = now
-                if not self._file_still_exists(fid):  # probe 自身 fail-open
+                if not self._file_still_exists(fid):  # the probe itself is fail-open
                     state["aborted"] = True
             return state["aborted"]
 
         return _should_abort
-
-    # ------------------------------------------------------------------
-    # Single-document indexing
-    # ------------------------------------------------------------------
 
     async def index_document(
         self,
@@ -356,29 +294,21 @@ class RAGIndexingService:
         _timings_out: Optional[Dict[str, float]] = None,
         _progress_cb=None,
     ) -> IndexDocumentResponse:
-        """將文件索引到向量存儲。
+        """Index a document into the vector store.
 
-        Args:
-            file_record: File information
-            token: Client API token
-            chunk_size: Chunk size (characters). 為 None 用 config 預設值
-            chunk_overlap: Chunk overlap size. 為 None 用 config 預設值
-            force: True = 跳過 content_hash 冪等短路,強制重跑整條管線 —
-                設定變更(contextual retrieval / embedding / chunking)後
-                單檔重建用。寫入前的 stale-chunk purge 保證不留舊向量。
-            _timings_out: T1.4 internal — if provided, populated with
-                ``{"load_ms": float, "index_ms": float}`` for per-file audit.
-            _progress_cb: chunk 級進度回呼 ``(stage, done, total)``,由背景 job
-                的 IndexProgressTracker.on_chunk_progress 供給;None 靜默。
+        chunk_size / chunk_overlap default to the config values when None. force=True
+        skips the content_hash idempotency short-circuit and re-runs the whole pipeline
+        (used to rebuild a single file after a config change); the stale-chunk purge
+        before writing guarantees no old vectors remain. _timings_out and _progress_cb
+        are internal hooks for per-file audit and background-job progress reporting.
 
-        Raises:
-            FileIndexingError: indexing 失敗
+        Raises FileIndexingError on failure.
         """
         file_id = file_record.id
         ctx = self._ctx
 
-        # progress_cb 為 None 代表沒有背景 job 在追這次索引(同步單檔 API),
-        # 沒有 job state 要保活,就不必多開一條 keepalive task。
+        # _progress_cb is None for the synchronous single-file API: no background job to
+        # keep alive, so skip the extra keepalive task.
         if _progress_cb is None:
             async with _get_indexing_semaphore():
                 return await self._index_document_locked(
@@ -391,17 +321,15 @@ class RAGIndexingService:
                     _progress_cb=None,
                 )
 
-        # keepalive 包在 semaphore **外面**:等 semaphore 也是心跳盲區
-        # (semaphore 跨 job 共用,別的 job 佔著時本 job 完全不動),
-        # 包在裡面的話等待期間照樣會被 watchdog 誤判。
+        # The keepalive wraps outside the semaphore because waiting on the shared
+        # semaphore is itself a heartbeat blind spot; wrapping inside would let the
+        # watchdog misjudge that wait.
         async with _ProgressKeepalive(_progress_cb) as keepalive:
-            # StageTimer 掛最外層觀察每個 stage 的 wall-clock 耗時
-            # (loading/contextualizing/embedding/writing);keepalive 補發的
-            # 同 stage 心跳不觸發切換,不影響計時。結果進 file_timings.stage_ms
+            # StageTimer sits outermost to record each stage's wall-clock time; same-stage
+            # keepalive heartbeats don't trigger a switch. Result goes to file_timings.stage_ms.
             from src.domain.rag.stage_timer import StageTimer
             timer = StageTimer(inner=keepalive)
             try:
-                # 限制同時跑的 indexing 任務數 — 上傳 N 個檔案不會一起搶 GPU/OCR session
                 async with _get_indexing_semaphore():
                     return await self._index_document_locked(
                         file_record=file_record,
@@ -414,7 +342,7 @@ class RAGIndexingService:
                         _progress_cb=timer,
                     )
             finally:
-                # 成功/失敗/timeout 都要收斂計時 — 失敗檔的階段耗時對排錯更重要
+                # Finalize timing on success, failure, and timeout alike.
                 if _timings_out is not None:
                     stage_ms = timer.finish()
                     if stage_ms:
@@ -431,15 +359,14 @@ class RAGIndexingService:
         _timings_out: Optional[Dict[str, float]] = None,
         _progress_cb=None,
     ) -> IndexDocumentResponse:
-        """Index core — caller (index_document) 持有 semaphore 才能進。"""
+        """Index core; the caller (index_document) must hold the semaphore to enter."""
         file_id = file_record.id
         ctx = self._ctx
-        # Pre-bind folder_id so the except handler can pass it to
-        # mark_index_failed even if a validation error fires before it is parsed.
+        # Pre-bind folder_id so the except handler can pass it to mark_index_failed even
+        # if a validation error fires before it is parsed.
         folder_id: Optional[int] = None
 
         try:
-            # ---- Validate file_record ----
             if not file_record:
                 raise ValueError("file_record cannot be None")
             if not file_record.file_path:
@@ -447,7 +374,6 @@ class RAGIndexingService:
             if not file_record.file_name:
                 raise ValueError("file_name cannot be empty")
 
-            # ---- folder_id 整型驗證 ----
             try:
                 raw_folder_id = (
                     folder_id_override
@@ -465,7 +391,7 @@ class RAGIndexingService:
                     f"(type: {type(raw_folder_id).__name__}). Error: {ve}"
                 )
 
-            # Gate 1: file 中途被刪 → 提前 abort,省下 Docling/embed/ctx-gen
+            # Gate 1: file deleted mid-way -> abort early, saving Docling/embed/ctx-gen.
             if not await _run_db(self._file_still_exists, file_id):
                 log_warn(
                     logger, "INDEX_ABORT",
@@ -474,8 +400,8 @@ class RAGIndexingService:
                 )
                 raise RAGFileNotFoundError(file_id=str(file_id))
 
-            # idempotency: content_hash 沒變直接 return,不重跑 embed
-            # (force=True 旁路 — 單檔強制重建的唯一途徑,H4)
+            # Idempotency: unchanged content_hash reuses the existing index without
+            # re-embedding. force=True bypasses this (the only single-file rebuild path).
             current_hash = getattr(file_record, "content_hash", None)
             if current_hash and not force:
                 existing_idx = await _run_db(ctx.indexing_service.get_index_for_file, file_id)
@@ -504,11 +430,9 @@ class RAGIndexingService:
                         message="Skipped: content_hash unchanged from prior index",
                     )
 
-            # ---- chunk size 參數 ----
-            # Hierarchical chunking — chunk size 在 ctx 階段已從 hierarchy_sizes 取出固定。
-            # 這裡保留參數簽名向下相容(IndexJobManager 會傳 chunk_size/chunk_overlap),
-            # 但實際以 ctx.leaf_chunk_size / ctx.chunk_overlap 為準。
-            # 若呼叫方明確傳入,記錄到 DB 時會使用其值(僅用於審計,不影響實際分塊)。
+            # Chunk sizes are already fixed from hierarchy_sizes in ctx; the parameters are
+            # kept only for backward compatibility (IndexJobManager still passes them) and
+            # recorded for audit, but ctx.leaf_chunk_size / ctx.chunk_overlap actually apply.
             try:
                 if chunk_size is None or chunk_size == "":
                     chunk_size = ctx.leaf_chunk_size
@@ -524,15 +448,13 @@ class RAGIndexingService:
                     f"chunk_overlap={chunk_overlap}. Error: {ve}"
                 )
 
-            # ---- Get vector store(driven by folder ownership)----
             folder = await _run_db(ctx.indexing_service.get_folder, folder_id, token)
             vector_store = ctx.get_vector_store(folder_id, token, folder=folder)
             vector_store_table = f"data_{folder_id}_{folder.vector_table_uuid}"
 
-            # ---- 換模防護 ----
-            # 此 folder 既有成功索引若出自別的 embedding model,拒絕混寫:
-            # 維度相同時(如 bge-m3 → e5 都是 1024)insert 不會炸,但兩個
-            # 向量空間互不相容,檢索會靜默劣化成接近隨機。唯一正解是 reindex。
+            # Model-switch guard: refuse to mix embedding spaces in one folder. When
+            # dimensions match (e.g. bge-m3 and e5 are both 1024) the insert won't error,
+            # but the spaces are incompatible and retrieval silently degrades. Fix is a reindex.
             from db.fileindexdb import FileIndexDB
             prior_models = await _run_db(FileIndexDB.get_indexed_models_for_folder, folder_id)
             stale_models = [m for m in prior_models if m != ctx.model_name]
@@ -555,29 +477,27 @@ class RAGIndexingService:
                 ),
             )
 
-            # ---- Load document ----
-            # Docling parsing + RapidOCR 是 sync CPU-bound,直接 call 會卡住整個
-            # event loop(實測 11MB 圖文 PDF 走 OCR ~32s)。丟 thread pool 讓
-            # 上傳 / 查詢 request 在 indexing 進行中還能繼續服務。
+            # Docling parsing + RapidOCR is synchronous CPU-bound work that would stall the
+            # event loop (~32s for an 11MB image-heavy PDF), so offload it to a thread pool
+            # to keep serving upload/query requests during indexing.
             logger.debug(
                 f"[INDEX_LOAD] fid={folder_id} file={file_id} | "
                 f"path={file_record.file_path} name={file_record.file_name}"
             )
-            # 大檔的 docling/OCR 可到數百秒,是 chunk 進度的最大盲區——
-            # 先報 loading stage,讓 job 狀態在解析期間不會呆在無 stage 狀態
+            # Report the loading stage first: docling/OCR is the biggest chunk-progress blind
+            # spot, so the job status must not sit with no stage during parsing.
             if _progress_cb:
                 try:
                     _progress_cb("loading", None, None)
                 except Exception:
-                    pass  # 進度回報失敗不影響 indexing
+                    pass  # a progress-report failure must not affect indexing
             load_t0 = time.perf_counter()
             document = await asyncio.to_thread(
                 ctx.indexer.load_document_from_file,
                 file_path=file_record.file_path,
                 file_id=str(file_id),
                 file_name=file_record.file_name,
-                # 頁級解析進度(PDF/OCR):badge 顯示「解析文件 done/total」
-                # + ETA;keepalive 包裝過的 cb,順便刷心跳
+                # Page-level parse progress (PDF/OCR); the keepalive-wrapped cb also refreshes the heartbeat.
                 progress_cb=_progress_cb,
                 metadata={
                     "folder_id": folder_id,
@@ -593,8 +513,7 @@ class RAGIndexingService:
                 f"text_len={len(document.text) if document.text else 0}"
             )
 
-            # ---- Gate 2 (#24): re-check after Docling load, before the
-            # expensive context-gen + embedding stages. ----
+            # Gate 2: re-check after Docling load, before the expensive context-gen + embedding stages.
             if not await _run_db(self._file_still_exists, file_id):
                 log_warn(
                     logger, "INDEX_ABORT",
@@ -603,7 +522,7 @@ class RAGIndexingService:
                 )
                 raise RAGFileNotFoundError(file_id=str(file_id))
 
-            # ---- Index hierarchically — 回傳 {"leaves": N, "parents": M} ----
+            # Index hierarchically; returns {"leaves": N, "parents": M}.
             idx_t0 = time.perf_counter()
             try:
                 index_stats = await ctx.indexer.index_document(
@@ -613,8 +532,7 @@ class RAGIndexingService:
                     should_abort=self._make_should_abort(file_id),
                 )
             except IndexingAbortedError as abort_exc:
-                # stage 內檢查點(contextualizing / embedding / writing)發現
-                # 檔案途中被刪 — 走與 gate 相同的 abort 路徑
+                # An in-stage checkpoint found the file deleted mid-way: same abort path as the gates.
                 log_warn(
                     logger, "INDEX_ABORT",
                     folder_id=folder_id, file_id=file_id, token=token,
@@ -632,13 +550,13 @@ class RAGIndexingService:
                 msg=f"{num_leaves} leaves + {num_parents} parents",
             )
 
-            # ---- Gate 3 (#24): last chance — if the file is gone now, the
-            # FileIndex FK insert below would blow up anyway. Abort cleanly. ----
+            # Gate 3: last chance. If the file is gone now, the FileIndex FK insert below
+            # would fail anyway, so abort cleanly.
             if not await _run_db(self._file_still_exists, file_id):
-                # H2 修:此刻向量**已經寫進表了**(index_document 內含 add)。
-                # 只 raise 不清 → 孤兒 chunks 永留(無 FileIndex、無 File row,
-                # delete_chunks_by_file 再也不會被叫到),已刪檔內容持續被檢索
-                # 命中。abort 前清掉剛寫入的 chunks。
+                # Vectors are already written to the table at this point (index_document
+                # includes the add). Aborting without cleanup would leave orphan chunks
+                # forever (no FileIndex, no File row) that keep surfacing in retrieval, so
+                # purge the freshly-written chunks first.
                 try:
                     from src.domain.rag.vector_store_manager import VectorStoreManager
                     removed = await _run_db(
@@ -660,8 +578,8 @@ class RAGIndexingService:
                 )
                 raise RAGFileNotFoundError(file_id=str(file_id))
 
-            # ---- Record index metadata ----
-            # chunk_size 寫入 leaf size,num_chunks 記錄 leaves(實際被檢索的單位)
+            # Record index metadata: chunk_size is the leaf size, num_chunks the leaf count
+            # (the unit actually retrieved).
             index_record = await _run_db(
                 ctx.indexing_service.record_index_success,
                 file_id=file_id,
@@ -672,10 +590,9 @@ class RAGIndexingService:
                 chunk_overlap=ctx.chunk_overlap,
                 embedding_model=ctx.model_name,
                 num_chunks=num_leaves,
-                content_hash=getattr(file_record, "content_hash", None),  # D3
+                content_hash=getattr(file_record, "content_hash", None),
             )
 
-            # ---- Invalidate caches ----
             await _run_db(ctx.indexing_service.invalidate_folder_caches, folder_id)
             ctx.invalidate_query_engine_cache(folder_id)
 
@@ -696,7 +613,7 @@ class RAGIndexingService:
                 folder_id=folder_id, file_id=file_id, token=token,
             )
             try:
-                # 傳 folder_id + 真實 model/size → 失敗 row 反映真實 config,而非 column 預設
+                # Pass the real folder_id/model/size so the failed row reflects the actual config, not column defaults.
                 ctx.indexing_service.mark_index_failed(
                     file_id,
                     str(e),
@@ -709,10 +626,6 @@ class RAGIndexingService:
                 pass
             raise FileIndexingError(file_id=str(file_id), reason=str(e))
 
-    # ------------------------------------------------------------------
-    # Folder-wide indexing
-    # ------------------------------------------------------------------
-
     async def index_folder(
         self,
         folder_id: int,
@@ -722,7 +635,7 @@ class RAGIndexingService:
         skip_existing: bool = True,
         progress_tracker: Optional["IndexProgressTracker"] = None,
     ) -> IndexFolderResponse:
-        """將資料夾中所有文件索引到向量存儲。"""
+        """Index all documents in a folder into the vector store."""
         ctx = self._ctx
 
         try:
@@ -778,8 +691,8 @@ class RAGIndexingService:
                 try:
                     if skip_existing:
                         existing_index = await _run_db(ctx.indexing_service.get_index_for_file, file_id)
-                        # H3 修:只有 status=indexed 才算「已索引」— failed/deleted
-                        # 的 row 不能擋重試,否則失敗檔用 /index 永遠救不回
+                        # Only status=indexed counts as already indexed; failed/deleted rows
+                        # must not block a retry, or a failed file could never be recovered via /index.
                         if existing_index and getattr(existing_index, "status", None) == "indexed":
                             log_warn(
                                 logger, "INDEX_SKIP",
@@ -862,12 +775,12 @@ class RAGIndexingService:
                         logger, "INDEX_FILE_FAIL", e,
                         folder_id=folder_id, file_id=file_id, token=token,
                     )
-                    # 持久化 failed 記錄 — 前端才顯示得出「失敗」tag。
-                    # ⚠️ timeout 走 asyncio.wait_for 的 cancel,注入的是
-                    # CancelledError(BaseException,非 Exception),index_document
-                    # 內層的 except Exception 接不到 → 它的 mark_index_failed 不會跑,
-                    # 逾時檔就完全沒有 FileIndex 記錄 → 前端無 tag。這裡兜底補寫。
-                    # 非逾時失敗 index_document 已寫過,upsert 重寫同一筆無害。
+                    # Backstop write of the failed record. A timeout cancels via
+                    # asyncio.wait_for with a CancelledError (a BaseException), which
+                    # index_document's inner except Exception cannot catch, so its own
+                    # mark_index_failed never runs and the timed-out file would get no
+                    # record and no frontend tag. For non-timeout failures index_document
+                    # already wrote it, and re-upserting the same row is harmless.
                     try:
                         ctx.indexing_service.mark_index_failed(
                             file_id,
@@ -878,8 +791,8 @@ class RAGIndexingService:
                             chunk_overlap=ctx.chunk_overlap,
                         )
                     except Exception as _mf_err:
-                        # M3: 兜底補寫失敗別靜默 —— DB 斷線/衝突會讓前端缺 tag
-                        # 且無跡可循,與這段「確保失敗被記錄」的目的矛盾。
+                        # Don't swallow a failed backstop write: a DB disconnect/conflict
+                        # would leave the frontend without a tag and no trace.
                         logger.warning(
                             f"mark_index_failed fallback also failed for "
                             f"file {file_id}: {_mf_err}"
@@ -895,10 +808,10 @@ class RAGIndexingService:
                         ))
 
                 except asyncio.CancelledError:
-                    # M2: job 級逾時/cancel 經 wait_for 注入 CancelledError(BaseException,
-                    # 上面的 except Exception 接不到)。in-flight 檔會既非 indexed 也非
-                    # failed 而在前端憑空消失。補寫 failed 記錄後 re-raise 保留取消語義。
-                    # mark_index_failed 是 sync,cancel 期間呼叫安全。
+                    # A job-level cancel/timeout injects CancelledError (a BaseException the
+                    # except Exception above can't catch); the in-flight file would be neither
+                    # indexed nor failed and vanish from the frontend. Write a failed record,
+                    # then re-raise. mark_index_failed is synchronous, so it is safe during cancel.
                     try:
                         ctx.indexing_service.mark_index_failed(
                             file_id,
@@ -948,10 +861,6 @@ class RAGIndexingService:
                 progress_tracker.mark_failed(str(e))
             raise ValueError(f"Failed to index folder: {str(e)}")
 
-    # ------------------------------------------------------------------
-    # Subset indexing (auto-index after upload)
-    # ------------------------------------------------------------------
-
     async def index_files(
         self,
         file_ids: List[str],
@@ -961,21 +870,11 @@ class RAGIndexingService:
         chunk_overlap: Optional[int] = None,
         progress_tracker: Optional["IndexProgressTracker"] = None,
     ) -> IndexFolderResponse:
-        """索引指定的 file_id 子集(供上傳後 auto-index)。
+        """Index a specified subset of file_ids (for auto-index after upload).
 
-        跟 index_folder 類似但只處理 file_ids 內的;**不 skip 已索引**,因為呼叫端是
-        為了重做或補做剛 upload 的檔案。
-
-        Args:
-            file_ids: 要索引的 UUID 字串 list。
-            folder_id: 所屬 folder id。
-            token: 使用者 token(權限驗證)。
-            chunk_size: 覆寫 chunk size;None = 用 ctx.leaf_chunk_size。
-            chunk_overlap: 覆寫 chunk overlap;None = 用 ctx.chunk_overlap。
-            progress_tracker: 背景 job 進度回報用;None = 同步呼叫。
-
-        Returns:
-            IndexFolderResponse(每檔 success/failed 細節 + 統計)。
+        Like index_folder but only processes the files in file_ids, and does not skip
+        already-indexed files, because the caller wants to redo or complete the files
+        just uploaded. Returns an IndexFolderResponse with per-file detail and stats.
         """
         ctx = self._ctx
 
@@ -1086,12 +985,12 @@ class RAGIndexingService:
                         logger, "INDEX_FILE_FAIL", e,
                         folder_id=folder_id, file_id=file_id, token=token,
                     )
-                    # 持久化 failed 記錄 — 前端才顯示得出「失敗」tag。
-                    # ⚠️ timeout 走 asyncio.wait_for 的 cancel,注入的是
-                    # CancelledError(BaseException,非 Exception),index_document
-                    # 內層的 except Exception 接不到 → 它的 mark_index_failed 不會跑,
-                    # 逾時檔就完全沒有 FileIndex 記錄 → 前端無 tag。這裡兜底補寫。
-                    # 非逾時失敗 index_document 已寫過,upsert 重寫同一筆無害。
+                    # Backstop write of the failed record. A timeout cancels via
+                    # asyncio.wait_for with a CancelledError (a BaseException), which
+                    # index_document's inner except Exception cannot catch, so its own
+                    # mark_index_failed never runs and the timed-out file would get no
+                    # record and no frontend tag. For non-timeout failures index_document
+                    # already wrote it, and re-upserting the same row is harmless.
                     try:
                         ctx.indexing_service.mark_index_failed(
                             file_id,
@@ -1102,8 +1001,8 @@ class RAGIndexingService:
                             chunk_overlap=ctx.chunk_overlap,
                         )
                     except Exception as _mf_err:
-                        # M3: 兜底補寫失敗別靜默 —— DB 斷線/衝突會讓前端缺 tag
-                        # 且無跡可循,與這段「確保失敗被記錄」的目的矛盾。
+                        # Don't swallow a failed backstop write: a DB disconnect/conflict
+                        # would leave the frontend without a tag and no trace.
                         logger.warning(
                             f"mark_index_failed fallback also failed for "
                             f"file {file_id}: {_mf_err}"
@@ -1119,10 +1018,10 @@ class RAGIndexingService:
                         ))
 
                 except asyncio.CancelledError:
-                    # M2: job 級逾時/cancel 經 wait_for 注入 CancelledError(BaseException,
-                    # 上面的 except Exception 接不到)。in-flight 檔會既非 indexed 也非
-                    # failed 而在前端憑空消失。補寫 failed 記錄後 re-raise 保留取消語義。
-                    # mark_index_failed 是 sync,cancel 期間呼叫安全。
+                    # A job-level cancel/timeout injects CancelledError (a BaseException the
+                    # except Exception above can't catch); the in-flight file would be neither
+                    # indexed nor failed and vanish from the frontend. Write a failed record,
+                    # then re-raise. mark_index_failed is synchronous, so it is safe during cancel.
                     try:
                         ctx.indexing_service.mark_index_failed(
                             file_id,
@@ -1172,10 +1071,6 @@ class RAGIndexingService:
                 progress_tracker.mark_failed(error_msg)
             raise ValueError(error_msg)
 
-    # ------------------------------------------------------------------
-    # Auto-index trigger (background job)
-    # ------------------------------------------------------------------
-
     async def trigger_auto_index(
         self,
         file_ids: List[str],
@@ -1183,17 +1078,10 @@ class RAGIndexingService:
         token: str,
         auto_index: bool = True,
     ) -> Dict[str, Any]:
-        """上傳成功後觸發背景 auto-index job。
+        """Trigger the background auto-index job after a successful upload.
 
-        Args:
-            file_ids: 剛上傳的檔案 UUID list。
-            folder_id: 所屬 folder。
-            token: 使用者 token。
-            auto_index: False 或 file_ids 為空 → 直接 return 不啟動。
-
-        Returns:
-            IndexingMetadata-shape dict:
-            ``{auto_index_enabled, job_id?, status?, total_files?, message}``。
+        auto_index=False or empty file_ids returns immediately without starting. Returns
+        an IndexingMetadata-shaped dict {auto_index_enabled, job_id?, status?, total_files?, message}.
         """
         try:
             from src.domain.rag.index_job_manager import IndexingJobManager
@@ -1207,13 +1095,12 @@ class RAGIndexingService:
                     ),
                 }
 
-            # 用 ctx 自身的 leaf size / overlap(於 RAGContext.from_config 設定)
             chunk_size = self._ctx.leaf_chunk_size
             chunk_overlap = self._ctx.chunk_overlap
 
             job_manager = IndexingJobManager.get_instance()
-            # IndexingJobManager 透過 adapter 介面呼叫 .index_files(),this service
-            # exposes that method directly,所以可以把自己當 adapter 傳進去。
+            # This service exposes index_files directly, so it can act as the adapter the
+            # job manager calls back into.
             job_state = await job_manager.start_indexing_files(
                 self,
                 file_ids=file_ids,

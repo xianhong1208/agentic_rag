@@ -1,20 +1,21 @@
 
-"""ASR Provider — 音檔轉錄來源抽象(BL-07)。
+"""ASR Provider — abstraction over audio-transcription sources.
 
-音檔轉錄從「寫死 docling whisper」改為可替換的 provider(config `rag.asr`
-選擇),H6 的注入模式:DocumentLoader 收注入的 provider,不自己挑實作。
+Audio transcription moves from a hardcoded docling whisper to a swappable provider (selected via
+config `rag.asr`), using an injection pattern: DocumentLoader receives an injected provider rather
+than picking an implementation itself.
 
-實作:
-- DoclingWhisperAsrProvider:封裝 docling_convert_once(本地 whisper turbo,
-  預設;零行為變化)。回傳含 docling chunker 預切的 chunks。
-- OpenAICompatibleAsrProvider:POST {base_url}/audio/transcriptions
-  (multipart)— OpenAI / Groq / 自架 vLLM whisper / faster-whisper-server
-  皆相容此介面。無預切 chunks(交回 leaf_splitter 的純文字路徑)。
-- FireRedAsrProvider(BL-08,fireredasr_provider.py):本地 FireRedASR-AED-L
-  (silencedetect 切段 ≤55s / 16k 重採樣 / OpenCC s2twp 簡→繁)。
+Implementations:
+- DoclingWhisperAsrProvider: wraps docling_convert_once (local whisper turbo, default; no behavior
+  change). Returns chunks pre-split by the docling chunker.
+- OpenAICompatibleAsrProvider: POST {base_url}/audio/transcriptions (multipart) — OpenAI / Groq /
+  self-hosted vLLM whisper / faster-whisper-server all conform to this interface. No pre-split
+  chunks (falls back to leaf_splitter's plain-text path).
+- FireRedAsrProvider (fireredasr_provider.py): local FireRedASR-AED-L (silencedetect segmentation
+  ≤55s / 16k resampling / OpenCC s2twp Simplified→Traditional).
 
-模型無關的前後處理(前導靜音裁切、幻覺過濾)不在 provider 內 —
-留在 document_loader 的 audio 分流層(audio_defense)。
+Model-agnostic pre/post-processing (leading-silence trimming, hallucination filtering) does not live
+inside a provider — it stays in document_loader's audio dispatch layer (audio_defense).
 """
 
 from __future__ import annotations
@@ -34,10 +35,10 @@ logger = get_api_logger()
 
 
 class DoclingWhisperAsrProvider(AsrProvider):
-    """本地 docling whisper(預設)— 封裝 docling_convert_once,零行為變化。"""
+    """Local docling whisper (default) — wraps docling_convert_once, no behavior change."""
 
     def available(self) -> bool:
-        # 沿用舊 auto-discover 語義:assets/whisper_models/*.pt 在才可服務
+        # Keeps the legacy auto-discover semantics: serviceable only if assets/whisper_models/*.pt exists
         from src.domain.rag.docling_loader import _resolve_whisper_path
         return _resolve_whisper_path() is not None
 
@@ -46,21 +47,21 @@ class DoclingWhisperAsrProvider(AsrProvider):
         max_tokens: Optional[int] = None, tokenizer: Optional[str] = None,
         progress_cb: Optional[Callable] = None,
     ) -> AsrResult:
-        # max_tokens=None 直傳會蓋掉 convert_once 的預設 512 → refine 內
-        # None//2 TypeError(evals 草稿腳本踩到;生產路徑恆有值沒事)
+        # Passing max_tokens=None through would override convert_once's default of 512 and cause a
+        # None//2 TypeError inside refine; the production path always supplies a value.
         full_text, chunk_records = docling_convert_once(
             file_path=audio_path, file_name=file_name,
             max_tokens=max_tokens if max_tokens is not None else 512,
             tokenizer=tokenizer,
             progress_cb=progress_cb,
         )
-        # BL-05 後 convert_once 回 chunk 記錄;音檔無 heading/頁碼,取純文字
+        # convert_once returns chunk records; audio has no heading/page number, so take plain text
         chunks = [r["text"] if isinstance(r, dict) else r for r in chunk_records]
         return AsrResult(text=full_text, chunks=chunks)
 
 
 class OpenAICompatibleAsrProvider(AsrProvider):
-    """雲端/自架 HTTP ASR:POST {base_url}/audio/transcriptions(multipart)。"""
+    """Cloud/self-hosted HTTP ASR: POST {base_url}/audio/transcriptions (multipart)."""
 
     def __init__(
         self, *, base_url: str, api_key: Optional[str] = None,
@@ -94,12 +95,12 @@ class OpenAICompatibleAsrProvider(AsrProvider):
 
 
 def create_asr_provider(asr_cfg: "Optional[AsrConfig]") -> AsrProvider:
-    """工廠:依 config `rag.asr.provider` 建 provider。
+    """Factory: build a provider based on config `rag.asr.provider`.
 
-    - None(config 未設)→ 預設 docling-whisper(向下相容)
-    - openai-compatible 缺 base_url → 立刻 ValueError(啟動期就炸,
-      不留到第一次轉錄才發現)
-    - 未知 provider → ValueError 列出可用值
+    - None (config unset) → default docling-whisper (backward compatible)
+    - openai-compatible missing base_url → immediate ValueError (fails at startup rather than
+      surfacing only on the first transcription)
+    - unknown provider → ValueError listing the available values
     """
     if asr_cfg is None:
         return DoclingWhisperAsrProvider()
@@ -110,8 +111,8 @@ def create_asr_provider(asr_cfg: "Optional[AsrConfig]") -> AsrProvider:
     if provider == "openai-compatible":
         if not asr_cfg.base_url:
             raise ValueError(
-                "rag.asr.provider=openai-compatible 需要 base_url"
-                "(如 http://host:8000/v1)"
+                "rag.asr.provider=openai-compatible requires base_url"
+                " (e.g. http://host:8000/v1)"
             )
         return OpenAICompatibleAsrProvider(
             base_url=asr_cfg.base_url,
@@ -119,10 +120,10 @@ def create_asr_provider(asr_cfg: "Optional[AsrConfig]") -> AsrProvider:
             model=asr_cfg.model,
         )
     if provider == "fireredasr":
-        # lazy import:FireRedASR 鏈(torch/kaldi)只在選用時載
+        # lazy import: the FireRedASR chain (torch/kaldi) is loaded only when selected
         from src.domain.rag.fireredasr_provider import FireRedAsrProvider
         return FireRedAsrProvider()
     raise ValueError(
-        f"未知的 rag.asr.provider: {provider!r} — "
-        "可用:docling-whisper / openai-compatible / fireredasr"
+        f"Unknown rag.asr.provider: {provider!r} — "
+        "available: docling-whisper / openai-compatible / fireredasr"
     )

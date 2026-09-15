@@ -31,17 +31,15 @@ class IndexingService:
     def __init__(self, cache_service: Optional[CacheService] = None):
         self._cache = cache_service or CacheService.get_instance()
 
-    # ---------------------------------------------------------------------
     # Folder helpers
-    # ---------------------------------------------------------------------
     def get_folder(self, folder_id: int, token: str):
         """Return folder after validating ownership."""
         folder = CachedFolderDB.get_by_id(folder_id)
         if not folder:
             raise FolderNotFoundError(folder_id=folder_id)
 
-        # fail-closed:user_token 為 NULL/空的無主 folder 一律拒絕,
-        # 與 api/dependencies/auth.py 的檢查一致
+        # fail-closed: reject any ownerless folder whose user_token is NULL/empty,
+        # consistent with the check in api/dependencies/auth.py
         if folder.user_token != token:
             raise UnauthorizedAccessError(
                 resource_type="folder",
@@ -67,9 +65,7 @@ class IndexingService:
         self._cache.delete(CacheKeys.files_in_folder(folder_id))
         self._cache.clear_pattern(f"query:{folder_id}:*")
 
-    # ---------------------------------------------------------------------
     # File helpers
-    # ---------------------------------------------------------------------
     def list_files(self, folder_id: int) -> List[FileRequest]:
         """Return all files for a folder as FileRequest models."""
         files = FileDB.get(folder_id=folder_id)
@@ -89,9 +85,7 @@ class IndexingService:
         }
         return FileRequest(**payload)
 
-    # ---------------------------------------------------------------------
     # File index helpers
-    # ---------------------------------------------------------------------
     def get_index_for_file(self, file_id):
         return FileIndexDB.get_by_file(file_id)
 
@@ -111,21 +105,10 @@ class IndexingService:
         num_chunks: int,
         content_hash: Optional[str] = None,
     ):
-        """記錄索引成功(upsert,處理已存在 row 的 reindex)。
+        """Record a successful index (upsert, handling reindex of an existing row).
 
-        Args:
-            file_id: 檔案 UUID。
-            folder_id: 所屬 folder id。
-            index_id: LlamaIndex doc id(`file_{uuid}`)。
-            vector_store_table: 對應的 pgvector table 名。
-            chunk_size: 實際使用的 leaf chunk size。
-            chunk_overlap: 實際使用的 chunk overlap。
-            embedding_model: 實際使用的 embedding model name。
-            num_chunks: 寫入的 leaf chunk 數。
-            content_hash: 索引當下的 File.content_hash;讓下次 reindex 能 short-circuit。
-
-        Returns:
-            更新後 / 新建的 FileIndex 物件。
+        content_hash is File.content_hash at index time; it lets the next reindex
+        short-circuit.
         """
         return FileIndexDB.upsert_indexed(
             file_id=file_id,
@@ -148,15 +131,10 @@ class IndexingService:
         chunk_size: Optional[int] = None,
         chunk_overlap: Optional[int] = None,
     ):
-        """記錄索引失敗(供 RAGIndexingService 例外處理 path 呼叫)。
+        """Record an index failure (from the exception-handling path).
 
-        Args:
-            file_id: 檔案 UUID。
-            reason: 寫進 FileIndex.error_message 的訊息。
-            folder_id: 沒 row 時建新 row 必須給(否則只 log warning)。
-            embedding_model: 失敗 row 寫的 model name(避免 column legacy 預設誤導)。
-            chunk_size: 失敗 row 寫的 chunk size。
-            chunk_overlap: 失敗 row 寫的 chunk overlap。
+        folder_id is required to create a new row when none exists; otherwise this
+        only logs a warning.
         """
         FileIndexDB.mark_failed(
             file_id,

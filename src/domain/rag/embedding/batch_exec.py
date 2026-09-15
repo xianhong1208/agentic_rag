@@ -1,7 +1,7 @@
 
-"""Embedding 批次執行 — retry/backoff(M14 自 hierarchical_indexer 拆出,逐字搬移)。
+"""Embedding batch execution — retry/backoff.
 
-短暫錯誤(連線/5xx/rate-limit/timeout)用 1→2→4s backoff 重試;永久錯誤直接 raise。
+Transient errors (connection/5xx/rate-limit/timeout) retry with 1→2→4s backoff; permanent errors raise immediately.
 """
 
 from __future__ import annotations
@@ -27,16 +27,9 @@ _EMBED_RETRYABLE_PATTERNS = (
 
 
 def _is_retryable_embedding_error(exc: BaseException) -> bool:
-    """判斷 exception 是否值得 retry(用 class name + message pattern match)。
-
-    embedding client 可能是 httpx / requests / urllib3 / llama_index wrapper,
-    isinstance() 抓不準;改用字串 pattern 涵蓋常見 transient 錯誤,免硬綁特定 HTTP 函式庫。
-
-    Args:
-        exc: 從 embed 呼叫拋出來的 exception。
-
-    Returns:
-        True = transient(可 retry);False = 永久錯(立刻 propagate)。
+    """Return True if the exception looks transient (retryable), matching class name
+    and message against known patterns. The embedding client may be httpx / requests /
+    urllib3 / a llama_index wrapper, so isinstance() is unreliable.
     """
     name = type(exc).__name__.lower()
     msg = str(exc).lower()
@@ -47,37 +40,23 @@ async def _embed_batch_with_retry(
     embed_model, batch_texts, file_name: str,
     batch_start: int, batch_end: int, n_leaves: int,
 ):
-    """跑 get_text_embedding_batch,transient 錯誤自動 exponential backoff retry。
+    """Run get_text_embedding_batch, retrying transient errors with exponential backoff.
 
-    永久錯誤(_is_retryable_embedding_error 不接受的)立刻 re-raise。
-    重試之間用 async sleep,不阻塞 event loop。
-
-    Args:
-        embed_model: 已配置好的 LlamaIndex 的 embed model。
-        batch_texts: 此批要 embed 的文字 list。
-        file_name: log 用的檔名 tag。
-        batch_start: 此批在所有 leaves 中的起始 index。
-        batch_end: 結束 index(exclusive)。
-        n_leaves: 整檔總 leaf 數,log 用。
-
-    Returns:
-        每筆 text 對應的 embedding vector list。
-
-    Raises:
-        最後一次嘗試的 exception(retry 次數用完或不可重試)。
+    Permanent errors re-raise immediately. Retries use async sleep so the event loop
+    isn't blocked. Raises the final attempt's exception when exhausted or non-retryable.
     """
     last_exc: Optional[BaseException] = None
     for attempt in range(_EMBED_RETRY_ATTEMPTS + 1):
         try:
-            # sync HTTP call — 丟 thread pool,別卡 event loop(一批 50 chunks
-            # 對 vLLM 可到數秒,卡住的話 API/SSE/cancel 全部凍結,heartbeat
-            # 斷更會讓 watchdog 誤判 job 死亡)
+            # Offload the sync HTTP call to a thread so it doesn't block the event loop:
+            # a 50-chunk batch can take seconds against vLLM, and a stalled heartbeat
+            # would make the watchdog wrongly declare the job dead.
             result = await asyncio.to_thread(
                 embed_model.get_text_embedding_batch, batch_texts
             )
-            # M3 修:provider 少回(部分失敗但 HTTP 200 / 回應截斷)時,呼叫端
-            # zip 會靜默丟尾端 → NULL embedding 入庫、那些 chunk 永遠檢索不到。
-            # 長度必須嚴格相等,不符立即報錯(可重試類)。
+            # A short result (partial failure behind HTTP 200) would let the caller's zip
+            # silently drop the tail → NULL embeddings stored, those chunks unretrievable.
+            # Require an exact length match; a mismatch raises (and is retryable).
             if len(result) != len(batch_texts):
                 raise ValueError(
                     f"Embedding batch size mismatch for {file_name}: sent "
@@ -88,10 +67,8 @@ async def _embed_batch_with_retry(
         except Exception as exc:
             last_exc = exc
             if not _is_retryable_embedding_error(exc):
-                # Permanent error — no point retrying. Surface immediately.
                 raise
             if attempt >= _EMBED_RETRY_ATTEMPTS:
-                # Exhausted retry budget — surface the last error.
                 raise
             delay = _EMBED_RETRY_BASE_DELAY * (2 ** attempt)
             logger.warning(

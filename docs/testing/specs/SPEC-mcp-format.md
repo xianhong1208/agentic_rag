@@ -1,76 +1,73 @@
-# SPEC-mcp-format:MCP 工具 log 摘要格式化
+# SPEC-mcp-format: MCP Tool Log Summary Formatting
 
 
-| 項目 | 內容 |
-|------|------|
-| 模組 | `src/fastmcp_tools/agentic_tools.py`(僅格式化純函式) |
-| 對應測試 | `tests/test_mcp_format_helpers.py` |
-| 版本 | feat/rag-robustness |
-| 最後更新 | 2026-07-09 |
-
-## 1. 目的與範圍
-
-`agentic_tools.py` 在每次 MCP tool 呼叫結束時輸出一個多行「摘要方框」log。
-本規格只涵蓋其中**與 DB / FastMCP 無關的格式化純函式**:
-
-- `_truncate(s, max_len)`:超長字串截斷加省略號。
-- `_visual_width(s)`:估算終端機視覺寬度(CJK / 全形 / emoji = 2 columns)。
-- `_center_line(text, width=_BOX_WIDTH)`:依視覺寬度置中(僅補左側)。
-- `_format_search_body(response)`:search mode 的方框內容
-  (Query / Results / Roles 分佈 / Files 分佈 / Scores 統計 / Hint)。
-
-不在範圍:MCP tool 註冊、`handle_search` 等業務函式(依賴 FastMCP + DB,屬整合測試)。
-`_format_summary_box` / `_format_list_body` / `_format_read_body` 依賴 log wiring 的組合層,
-本輪未納入(可後續擴充)。
-
-## 2. 功能需求 (Functional Requirements)
-
-| 需求編號 | 需求描述 | 驗收準則(可觀察的行為) |
-|---------|---------|------------------------|
-| REQ-mcp-format-01 | `_truncate(None)` 安全 | 輸入 `None` 回空字串 |
-| REQ-mcp-format-02 | 未超長不動 | `len(s) <= max_len` 時原樣回傳(含剛好等長) |
-| REQ-mcp-format-03 | 超長截斷 | 回傳 `s[:max_len-1] + "…"`,總長恰為 `max_len` |
-| REQ-mcp-format-04 | 非字串輸入容忍 | 先 `str()` 轉換再套用截斷規則 |
-| REQ-mcp-format-05 | ASCII 寬度 = 1 | 每個 ASCII 字元計 1 column |
-| REQ-mcp-format-06 | CJK / 全形寬度 = 2 | East Asian Width 為 W / F 的字元計 2 columns |
-| REQ-mcp-format-07 | emoji 寬度 = 2 | `0x1F000-0x1FFFF`、`0x2600-0x27FF` 範圍計 2 columns |
-| REQ-mcp-format-08 | 逐字元加總 | 混合字串為各字元寬度總和;空字串為 0 |
-| REQ-mcp-format-09 | 置中補左側 | 前導空格數 = `(width - 視覺寬) // 2`,不補右側 |
-| REQ-mcp-format-10 | 置中考慮 CJK 寬度 | 中文以視覺寬 2/字計算 padding |
-| REQ-mcp-format-11 | 過寬原樣回傳 | 視覺寬 >= width 時不加 padding |
-| REQ-mcp-format-12 | 預設寬度 | 未指定 width 時用 `_BOX_WIDTH`(90) |
-| REQ-mcp-format-13 | 空 response 最小輸出 | 只有 Query(空字串)與 Results(0)兩行,無 Roles / Files / Scores / Hint |
-| REQ-mcp-format-14 | 完整 search body | 輸出 roles 分佈(parent 含 `+N merged`)、files 分佈、scores min/max/avg(三位小數)、hint |
-| REQ-mcp-format-15 | 檔案分佈摘要 | 超過 3 個檔案只列 top 3,其餘以 `+N more` 表示 |
-| REQ-mcp-format-16 | 長欄位截斷 | query / hint 以 70 字元截斷加省略號 |
-
-## 3. 非功能需求
-
-- 純函式,不得觸發 DB / 網路 / FastMCP。
-- 模組頂層 import 較重(llama_index 系),但**不建立任何連線**,單元測試可直接 import
-  (已於 2026-07-09 實測確認 import 安全)。
-
-## 4. 邊界與例外 (Edge Cases & Errors)
-
-| 情境 | 預期行為 |
+| Item | Content |
 |------|---------|
-| `_truncate(None, n)` | 回 `""` |
-| `_truncate(12345, n)` | 依 `str(12345)` 處理 |
+| Module | `src/fastmcp_tools/agentic_tools.py` (formatting pure functions only) |
+| Test | `tests/test_mcp_format_helpers.py` |
+| Version | feat/rag-robustness |
+| Last updated | 2026-07-09 |
+
+## 1. Purpose and Scope
+
+At the end of every MCP tool call, `agentic_tools.py` emits a multi-line "summary box" log.
+This spec covers only the **formatting pure functions that are independent of the DB and FastMCP**:
+
+- `_truncate(s, max_len)`: truncates an overlong string and appends an ellipsis.
+- `_visual_width(s)`: estimates terminal visual width (CJK / full-width / emoji = 2 columns).
+- `_center_line(text, width=_BOX_WIDTH)`: centers by visual width (left-padding only).
+- `_format_search_body(response)`: box content for search mode
+  (Query / Results / Roles distribution / Files distribution / Scores statistics / Hint).
+
+Out of scope: MCP tool registration and business functions such as `handle_search` (which depend on FastMCP + DB and belong to integration testing).
+`_format_summary_box` / `_format_list_body` / `_format_read_body` depend on the log-wiring composition layer and are not included in this round (a possible future extension).
+
+## 2. Functional Requirements
+
+| Requirement | Description | Acceptance Criteria (observable behavior) |
+|-------------|-------------|-------------------------------------------|
+| REQ-mcp-format-01 | `_truncate(None)` is safe | `None` input returns an empty string |
+| REQ-mcp-format-02 | No change when within length | Returned as-is when `len(s) <= max_len` (including exact length) |
+| REQ-mcp-format-03 | Overlong truncation | Returns `s[:max_len-1] + "…"`, total length exactly `max_len` |
+| REQ-mcp-format-04 | Tolerates non-string input | Applies truncation rules after coercing with `str()` |
+| REQ-mcp-format-05 | ASCII width = 1 | Each ASCII character counts as 1 column |
+| REQ-mcp-format-06 | CJK / full-width width = 2 | Characters whose East Asian Width is W / F count as 2 columns |
+| REQ-mcp-format-07 | Emoji width = 2 | Characters in ranges `0x1F000-0x1FFFF` and `0x2600-0x27FF` count as 2 columns |
+| REQ-mcp-format-08 | Per-character sum | A mixed string is the sum of each character's width; an empty string is 0 |
+| REQ-mcp-format-09 | Center with left padding | Leading spaces = `(width - visual_width) // 2`; no right padding |
+| REQ-mcp-format-10 | Centering accounts for CJK width | Chinese padding is computed as 2 columns per character |
+| REQ-mcp-format-11 | Overwide returned as-is | No padding added when visual width >= width |
+| REQ-mcp-format-12 | Default width | Uses `_BOX_WIDTH` (90) when width is not specified |
+| REQ-mcp-format-13 | Minimal output for empty response | Only two lines, Query (empty string) and Results (0); no Roles / Files / Scores / Hint |
+| REQ-mcp-format-14 | Full search body | Outputs roles distribution (parent includes `+N merged`), files distribution, scores min/max/avg (three decimal places), and hint |
+| REQ-mcp-format-15 | File distribution summary | Lists only the top 3 files when there are more than 3; the rest shown as `+N more` |
+| REQ-mcp-format-16 | Long field truncation | Truncates query / hint at 70 characters with an ellipsis |
+
+## 3. Non-Functional Requirements
+
+- Pure functions; must not trigger DB / network / FastMCP.
+- Module-level imports are heavy (llama_index family), but **no connections are established**, so unit tests can import directly (import safety confirmed by test on 2026-07-09).
+
+## 4. Edge Cases and Errors
+
+| Scenario | Expected behavior |
+|----------|-------------------|
+| `_truncate(None, n)` | Returns `""` |
+| `_truncate(12345, n)` | Processed as `str(12345)` |
 | `_visual_width("")` | 0 |
-| `_center_line` 文字比 width 寬 | 原樣回傳 |
-| `_format_search_body({})` | 兩行基本輸出,不拋錯 |
-| response["results"] 為 `None` | 視為空 list(`or []`) |
+| `_center_line` text wider than width | Returned as-is |
+| `_format_search_body({})` | Two-line basic output, no exception |
+| response["results"] is `None` | Treated as an empty list (`or []`) |
 
-## 5. 相依與假設 (Dependencies & Assumptions)
+## 5. Dependencies and Assumptions
 
-- `_visual_width` 依賴標準庫 `unicodedata`。
-- import `src.fastmcp_tools.agentic_tools` 會連帶 import FileDB / rag adapter 等模組
-  (僅定義,不連線);若未來頂層 import 加入連線行為,本測試檔須改為延遲 import 或跳過。
+- `_visual_width` depends on the standard-library `unicodedata`.
+- Importing `src.fastmcp_tools.agentic_tools` transitively imports modules such as FileDB and the RAG adapter (definitions only, no connections). If module-level imports ever add connection behavior, this test file must switch to lazy imports or be skipped.
 
-## 6. 可追溯性矩陣 (Traceability)
+## 6. Traceability
 
-| 需求 | 測試案例 | 測試腳本 |
-|------|---------|---------|
+| Requirement | Test Case | Test Script |
+|-------------|-----------|-------------|
 | REQ-mcp-format-01 | TC-mcp-format-01 | `tests/test_mcp_format_helpers.py::test_truncate_none_returns_empty_string` |
 | REQ-mcp-format-02 | TC-mcp-format-02 | `::test_truncate_short_and_exact_length_unchanged` |
 | REQ-mcp-format-03 | TC-mcp-format-03 | `::test_truncate_long_string_appends_ellipsis` |
@@ -88,4 +85,4 @@
 | REQ-mcp-format-15 | TC-mcp-format-15 | `::test_format_search_body_more_than_three_files_summarized` |
 | REQ-mcp-format-16 | TC-mcp-format-16 | `::test_format_search_body_long_query_truncated` |
 
-(測試腳本欄位省略共同前綴 `tests/test_mcp_format_helpers.py`。)
+(The test-script column omits the common prefix `tests/test_mcp_format_helpers.py`.)

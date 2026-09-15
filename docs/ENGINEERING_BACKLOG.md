@@ -1,194 +1,195 @@
-# Engineering Backlog — Pipeline 欠缺盤點與工作底冊
+# Engineering Backlog — Pipeline Gap Analysis and Work Ledger
 
 
-**定位**:對標業界 production RAG 服務,對整條 pipeline(文件解析 → ASR → chunking →
-embedding → 檢索查詢 → 性能/平台)做的欠缺盤點。每項有編號(BL-xx)、現狀證據
-(對得到程式碼)、欠缺、做法、**驗收標準**、依賴 —— 可追溯、可勾銷。
-狀態欄隨進度更新;完成項移入文末「已完成」。盤點基準日:2026-09-02。
+**Purpose**: Benchmarked against production-grade RAG services, this is a gap analysis of the entire pipeline (document parsing → ASR → chunking →
+embedding → retrieval/query → performance/platform). Each item has an ID (BL-xx), current-state evidence
+(traceable to code), the gap, the approach, **acceptance criteria**, and dependencies — traceable and checkable off.
+The Status column is updated as work progresses; completed items move to the "Completed" section at the end. Baseline date: 2026-09-02.
 
-## 執行順序(總表)
+## Execution Order (Overview)
 
-| 波次 | 項目 | 理由 |
+| Wave | Items | Rationale |
 |---|---|---|
-| **進行中**(feat/asr-provider) | BL-06 ASR config 化、BL-07 AsrProvider 介面、BL-21 import 環守門 | ASR 換裝的地基 |
-| **第 1 波(P0)** | BL-01 RAG 評測網、BL-02 ASR 評測集 | **所有模型/調參決策的前提** — 沒有它,換 FireRedASR / A/B embedding / 調 ef_search 全都無法驗收 |
-| **第 2 波** | BL-08 FireRedASR、BL-05 metadata 富化、BL-12 embedding A/B、BL-14 ef_search、BL-16 metrics、BL-18 佇列持久化 | P1,各自獨立可並行 |
-| **第 3 波(P2)** | 其餘 | 有網、有量測後的優化與實驗 |
+| **In progress** (feat/asr-provider) | BL-06 ASR config, BL-07 AsrProvider interface, BL-21 import-cycle guard | Foundation for swapping ASR |
+| **Wave 1 (P0)** | BL-01 RAG eval harness, BL-02 ASR eval set | **Prerequisite for all model/tuning decisions** — without it, swapping in FireRedASR, A/B embedding, or tuning ef_search cannot be validated |
+| **Wave 2** | BL-08 FireRedASR, BL-05 metadata enrichment, BL-12 embedding A/B, BL-14 ef_search, BL-16 metrics, BL-18 queue persistence | P1, each independent and parallelizable |
+| **Wave 3 (P2)** | Remainder | Optimizations and experiments once the harness and measurements are in place |
 
 ---
 
-## H. 質量評測(橫切 — 最優先)
+## H. Quality Evaluation (Cross-cutting — Highest Priority)
 
-### BL-01 [P0·框架已就緒] RAG 檢索評測網(golden QA set + 跑分腳本)
-- **2026-09-02 框架交付**:evals/ 結構 + scripts/run_rag_eval.py(索引→逐 QA→
-  recall@5/10 + MRR→基線 JSON)+ 指標純函式單測 13 案。**待素材**:documents/
-  文件集 + golden_qa.yaml 條目(見 evals/README.md)。
-- **現狀**:檢索品質零量化。調 `merge_threshold`/`top_k`/`hybrid_alpha`、換 embedding
-  全靠人工感覺;ROADMAP 掛「品質回歸問答集」已久未動。
-- **欠缺**:業界標配的 golden set + 指標回歸(recall@k / MRR / faithfulness 抽樣)。
-- **做法**:`evals/` 目錄:代表性文件集(PDF/xlsx/掃描件/音檔)+ 30-50 條 QA
-  (問題、預期命中 file/chunk、參考答案)+ 一支跑分腳本(對 staging 庫索引後跑
-  query,產出指標 JSON,與 repo 內基線比對)。
-- **驗收**:一條命令出分;基線 JSON 進 repo;任何檢索面改動的 MR 附跑分 diff。
-- **依賴**:staging DB(有)+ embedding 服務。
+### BL-01 [P0 · framework ready] RAG retrieval eval harness (golden QA set + scoring script)
+- **2026-09-02 framework delivered**: `evals/` structure + `scripts/run_rag_eval.py` (index → per-QA →
+  recall@5/10 + MRR → baseline JSON) + 13 unit tests for the pure metric functions. **Pending assets**: `documents/`
+  document set + `golden_qa.yaml` entries (see `evals/README.md`).
+- **Current state**: Retrieval quality is unquantified. Tuning `merge_threshold`/`top_k`/`hybrid_alpha` or swapping
+  embeddings relies on human intuition; the ROADMAP item "quality regression QA set" has been outstanding for a while.
+- **Gap**: The industry-standard golden set + metric regression (recall@k / MRR / faithfulness sampling).
+- **Approach**: An `evals/` directory: a representative document set (PDF/xlsx/scanned/audio) + 30-50 QA entries
+  (question, expected file/chunk hit, reference answer) + a scoring script (index against the staging DB, run
+  queries, produce a metrics JSON, and diff against the in-repo baseline).
+- **Acceptance**: A single command produces scores; the baseline JSON is committed; any MR touching retrieval attaches a scoring diff.
+- **Dependencies**: staging DB (available) + embedding service.
 
-### BL-02 [P0·框架已就緒] ASR 評測集(golden transcripts)
-- **2026-09-02 框架交付**:scripts/run_asr_eval.py(任一 AsrProvider → CER /
-  簡體率 / 幻覺數 → 基線 JSON,--provider 覆蓋、--baseline 比較)。
-  **待素材**:3-5 段音檔 + 人工校對繁中全文。
-- **現狀**:換 ASR 模型無驗收依據。
-- **做法**:3-5 段代表音檔(會議/簡報/含前導靜音)+ 人工校對繁中 transcript;
-  指標:CER、繁中輸出率、幻覺片段數(沿用 audio_defense 的 pattern 統計)。
-- **驗收**:腳本對任一 AsrProvider 跑出 CER 表;whisper turbo 基線入 repo。
-- **依賴**:無。**BL-08 的前置。**
+### BL-02 [P0 · framework ready] ASR eval set (golden transcripts)
+- **2026-09-02 framework delivered**: `scripts/run_asr_eval.py` (any AsrProvider → CER /
+  simplified-Chinese rate / hallucination count → baseline JSON, with `--provider` override and `--baseline` comparison).
+  **Pending assets**: 3-5 audio clips + manually corrected Traditional-Chinese transcripts.
+- **Current state**: No acceptance basis for swapping ASR models.
+- **Approach**: 3-5 representative audio clips (meeting/presentation/with leading silence) + manually corrected Traditional-Chinese transcripts;
+  metrics: CER, Traditional-Chinese output rate, hallucination-segment count (reusing the `audio_defense` pattern statistics).
+- **Acceptance**: The script produces a CER table for any AsrProvider; the whisper-turbo baseline is committed.
+- **Dependencies**: None. **Prerequisite for BL-08.**
 
-## A. 文件解析(docling)
+## A. Document Parsing (docling)
 
-### BL-05 [✅ 2026-09-02] Chunk metadata 富化 — 章節/頁碼進 metadata
-- **交付**:`docling_convert_once` 回 chunk 記錄 `{text, headings, page_no}`
-  (拆分繼承源塊 meta、合併取首塊、裸字串 None)→ leaf_splitter 注入 leaf
-  metadata → PGVector node → `mode=search` 與 REST query 結果帶 `page`/
-  `headings`(有才帶,舊索引資料零遷移)。embedding 用裸 text,溯源欄位
-  不污染向量。
-- **驗收已過**:單測 13 案(refine 記錄化契約/leaf 注入)+ 整合 2 案
-  (真 docling md→headings、PDF→page_no,釘 docling meta schema);
-  舊資料相容(欄位缺時 response 不出現該 key)。
-- **註**:僅**新索引**的資料帶頁碼;既有 folder 重建索引後才有。
+### BL-05 [✅ 2026-09-02] Chunk metadata enrichment — section/page number into metadata
+- **Delivered**: `docling_convert_once` returns chunk records `{text, headings, page_no}`
+  (splits inherit the source block's meta, merges take the first block's, bare strings get None) → `leaf_splitter` injects leaf
+  metadata → PGVector node → `mode=search` and REST query results carry `page`/
+  `headings` (only when present; zero migration for existing indexes). Embedding uses the bare text, so the
+  provenance fields do not pollute the vector.
+- **Acceptance passed**: 13 unit tests (refine-record contract / leaf injection) + 2 integration tests
+  (real docling md → headings, PDF → page_no, pinning the docling meta schema);
+  backward compatible with old data (the response omits the key when the field is absent).
+- **Note**: Only **newly indexed** data carries page numbers; existing folders get them only after re-indexing.
 
-### BL-03 [P1] 解析質量抽樣基準(隨 BL-01 附帶)
-- OCR 錯字率無量測(`ocr_model_scale` tiny/small/medium 的取捨無數據)。
-  golden set 內放 2-3 份掃描件的人工校對文本,跑分腳本一併出 OCR CER。
+### BL-03 [P1] Parsing-quality sampling baseline (bundled with BL-01)
+- OCR error rate is unmeasured (the tiny/small/medium tradeoff for `ocr_model_scale` has no data).
+  Include 2-3 scanned documents with manually corrected text in the golden set, and have the scoring script also produce OCR CER.
 
-### BL-04 [P2] 圖片語義(VLM caption 實驗)
-- 圖片現在只有 OCR 文字;docling VLM pipeline(GraniteDocling)可產圖片描述。
-  GPU 成本高,評測網就緒後做小規模實驗再決定。
+### BL-04 [P2] Image semantics (VLM caption experiment)
+- Images currently carry only OCR text; the docling VLM pipeline (GraniteDocling) can produce image descriptions.
+  GPU cost is high; defer to a small-scale experiment once the eval harness is ready.
 
-## B. ASR(feat/asr-provider 分支進行中)
+## B. ASR (feat/asr-provider branch in progress)
 
-### BL-06 [P0·進行中] ASR config 化
-- **現狀**:audio pipeline 純 auto-discover(`docling_loader:586`「無 config 開關」);
-  裁切/幻覺過濾無開關。
-- **做法**:`rag.asr` 段:`enabled / provider / model_path / trim_leading_silence /
-  filter_hallucinations / segment_seconds / to_traditional`(後兩項為 FireRedASR 預留)。
+### BL-06 [P0 · in progress] ASR config
+- **Current state**: The audio pipeline is pure auto-discovery (`docling_loader:586` "no config switch");
+  no switches for trimming or hallucination filtering.
+- **Approach**: A `rag.asr` section: `enabled / provider / model_path / trim_leading_silence /
+  filter_hallucinations / segment_seconds / to_traditional` (the last two reserved for FireRedASR).
 
-### BL-07 [P0·進行中] AsrProvider 介面 + docling default
-- `document_loader` 的 audio 分流走注入的 provider(H6 同模式);
-  `DoclingWhisperAsrProvider` 封裝現行為 = 零行為變化。`audio_defense`
-  (裁切/過濾)留在 provider 外層,模型無關。
+### BL-07 [P0 · in progress] AsrProvider interface + docling default
+- The `document_loader` audio path routes through the injected provider (same pattern as H6);
+  `DoclingWhisperAsrProvider` wraps the current behavior = zero behavior change. `audio_defense`
+  (trim/filter) stays outside the provider, model-agnostic.
 
-### BL-08 [✅ 2026-09-03 已驗收並切為生產 provider] FireRedASRProvider
-- **已交付**:`fireredasr_provider.py` — ① 60s 硬上限:ffmpeg silencedetect
-  找靜音、貪婪切 ≤55s 段(切點取靜音中點;無靜音硬切 — silero-vad 會把
-  torchaudio 拖進 base resolution 與 GPU group 切換衝突,棄用);② ffmpeg
-  16kHz mono 重採樣;③ OpenCC s2twp 簡→繁(台灣用語);④ AED 無標點 →
-  chunks=None 走 leaf_splitter 純文字路徑。工廠 `provider: "fireredasr"`
-  已接;lazy singleton 載模型。程式碼 vendor 自官方 repo
-  (`vendor/fireredasr_src/`,Apache-2.0;PyPI 的 fireredasr 是第三方 fork)。
-- **驗收已過(2026-09-03,CV22 zh-TW test 200 段人工驗證句)**:
-  avg CER **6.11% vs whisper turbo 35.92%**(簡繁灌水扣除後仍 ~29%,差近
-  5 倍)、簡體率 0%、CPU 快 1.8 倍;基線 evals/baselines/asr_*_2026-09-03.json。
-  config 已切 `rag.asr.provider: "fireredasr"`。
-- **殘留**:①部署機要帶 assets/fireredasr/FireRedASR-AED-L/ 權重(~4.7GB,
-  不進 repo)。vendored 程式碼**已成 uv path dependency 隨依賴編進 binary**
-  (Nuitka),部署不需外帶 vendor/;
-  ②真實會議長音檔驗收待 custom/ 三段人工校對;③標點恢復後續另評。
+### BL-08 [✅ 2026-09-03 accepted and promoted to production provider] FireRedASRProvider
+- **Delivered**: `fireredasr_provider.py` — (1) 60s hard cap: ffmpeg silencedetect
+  finds silence and greedily cuts ≤55s segments (cut point at the silence midpoint; hard cut when there is no silence —
+  silero-vad drags torchaudio into a base-resolution and GPU-group switch conflict, so it was dropped); (2) ffmpeg
+  16kHz mono resampling; (3) OpenCC s2twp simplified→traditional (Taiwan usage); (4) AED without punctuation →
+  chunks=None takes the `leaf_splitter` plain-text path. The factory `provider: "fireredasr"`
+  is wired in; a lazy singleton loads the model. The code is vendored from the official repo
+  (`vendor/fireredasr_src/`, Apache-2.0; the PyPI `fireredasr` is a third-party fork).
+- **Acceptance passed (2026-09-03, CV22 zh-TW test, 200 manually verified sentences)**:
+  avg CER **6.11% vs whisper turbo 35.92%** (still ~29% after removing the simplified/traditional inflation, nearly a
+  5x difference), 0% simplified-Chinese rate, 1.8x faster on CPU; baselines at `evals/baselines/asr_*_2026-09-03.json`.
+  Config switched to `rag.asr.provider: "fireredasr"`.
+- **Remaining**: (1) Deployment machines must ship the `assets/fireredasr/FireRedASR-AED-L/` weights (~4.7GB,
+  not committed). The vendored code **is already compiled into the binary as a uv path dependency**
+  (Nuitka), so deployment does not need to ship `vendor/` separately;
+  (2) Real long meeting-audio acceptance pending three manually corrected clips under `custom/`;
+  (3) Punctuation restoration to be evaluated separately later.
 
-### BL-09 [✅ 2026-09-02] ASR 雲端 provider(OpenAI-compatible)
-- 隨 BL-07 一併交付:`OpenAICompatibleAsrProvider`(multipart POST
-  /audio/transcriptions,Bearer 可選;OpenAI / Groq / vLLM whisper 相容)。
+### BL-09 [✅ 2026-09-02] ASR cloud provider (OpenAI-compatible)
+- Delivered alongside BL-07: `OpenAICompatibleAsrProvider` (multipart POST
+  /audio/transcriptions, optional Bearer; compatible with OpenAI / Groq / vLLM whisper).
 
-### BL-22 [P2] 影片格式支援(mp4/avi/mov/mkv/webm)
-- docling 2.124 官網支援影片(經 ASR + 代表關鍵影格,需 ffmpeg)。
-- **2026-09-02 管線實測已通**:default DocumentConverter 直接 convert mp4 →
-  SUCCESS(無需另掛 pipeline,先前估計過重);樣本為純音調無語音,故
-  **內容級驗證待 BL-02 語音樣本**到位後做,通過即收進白名單。
-  .webm 現行「轉 WAV 當音檔」路徑維持不動。
+### BL-22 [P2] Video format support (mp4/avi/mov/mkv/webm)
+- docling 2.124 officially supports video (via ASR + representative keyframes, requires ffmpeg).
+- **2026-09-02 pipeline verified end-to-end**: the default DocumentConverter converts mp4 directly →
+  SUCCESS (no separate pipeline needed; earlier estimates overstated the cost); the sample was pure tone with no speech, so
+  **content-level verification awaits the BL-02 speech samples**, after which it can be admitted to the whitelist.
+  The current ".webm → convert to WAV as audio" path is unchanged.
 
 ## C. Chunking
 
-### BL-10 [P2] Chunk 統計報表(長度分佈/過短率/表格塊佔比;timing audit 延伸)
-### BL-11 [P2] 語義 chunking 實驗(embedding-based split;等 BL-01 網)
+### BL-10 [P2] Chunk statistics report (length distribution / undersize rate / table-block share; extends the timing audit)
+### BL-11 [P2] Semantic chunking experiment (embedding-based split; awaits the BL-01 harness)
 
 ## D. Embedding
 
-### BL-12 [P1] e5-large vs bge-m3 A/B(懸置多時的決策)
-- 現行 `intfloat/multilingual-e5-large` + query/passage prefix;bge-m3 為回退。
-  用 BL-01 網跑兩者 recall/MRR,數據定案。~28 個舊 folder 的全量重索引隨決策執行。
+### BL-12 [P1] e5-large vs bge-m3 A/B (a long-deferred decision)
+- Current: `intfloat/multilingual-e5-large` + query/passage prefix; bge-m3 as the fallback.
+  Run recall/MRR for both on the BL-01 harness and settle it with data. Full re-indexing of the ~28 existing folders follows the decision.
 
-### BL-13 [P2] Chunk 級 embedding cache
-- 現有檔級 content-hash 跳過;檔內小改動仍全檔重 embed。chunk-hash → vector
-  cache 可省大檔重索引的 GPU 時間。規模上來再做。
+### BL-13 [P2] Chunk-level embedding cache
+- The current file-level content-hash skip still re-embeds an entire file on a small in-file change. A chunk-hash → vector
+  cache could save GPU time on re-indexing large files. Defer until scale demands it.
 
-## E. 檢索 / 查詢
+## E. Retrieval / Query
 
-### BL-14 [P1] `hnsw.ef_search` 調優
-- **現狀**:建索引 `m=16, ef_construction=64`(`db_bootstrap:159`,合理);
-  但查詢期 `ef_search` 用 pgvector 預設 **40** — top_k 調大時召回受限。
-- **做法**:BL-01 網就緒後,對 ef_search 40/100/200 掃 recall-延遲曲線,定值後
-  在 session/連線層設定。
-- **依賴**:BL-01。
+### BL-14 [P1] `hnsw.ef_search` tuning
+- **Current state**: Index built with `m=16, ef_construction=64` (`db_bootstrap:159`, reasonable);
+  but query-time `ef_search` uses pgvector's default of **40** — recall is limited when top_k is raised.
+- **Approach**: Once the BL-01 harness is ready, sweep ef_search 40/100/200 for the recall-latency curve, then set the value
+  at the session/connection layer.
+- **Dependencies**: BL-01.
 
-### BL-15 [P2] Query 側增強實驗(rewrite / multi-query;agentic 場景已由 caller LLM 部分彌補,量測後再決定)
+### BL-15 [P2] Query-side enhancement experiment (rewrite / multi-query; the agentic scenario is partly covered by the caller LLM already, decide after measurement)
 
-## F. 性能 / 可觀測
+## F. Performance / Observability
 
 ### BL-16 [P1] Prometheus metrics
-- **現狀**:僅結構化日誌 + per-file timing audit(原始數據在,無出口)。
-- **做法**:`/metrics` endpoint:索引吞吐(檔/chunk/s)、查詢延遲 P50/P95、
-  job 佇列深度、cache 命中率、embedding 批延遲。timing audit 直接餵。
-- **驗收**:Prometheus 抓得到;README 列指標清單。
+- **Current state**: Only structured logs + per-file timing audit (raw data exists, no export).
+- **Approach**: A `/metrics` endpoint: indexing throughput (files/chunks per s), query latency P50/P95,
+  job queue depth, cache hit rate, embedding batch latency. Fed directly from the timing audit.
+- **Acceptance**: Prometheus can scrape it; the README lists the metrics.
 
-### BL-17 [P2] 查詢壓測基線(k6/locust 一次性,並發查詢 P95 與 GPU 佔用)
+### BL-17 [P2] Query load-test baseline (one-off k6/locust; concurrent-query P95 and GPU utilization)
 
-## G. 平台 / 擴展性
+## G. Platform / Scalability
 
-### BL-18 [P1] Pending 批次持久化
-- **現狀**:`_pending_file_batches` 純記憶體 — 重啟即丟排隊上傳(restart cleanup
-  翻 failed,使用者要重傳)。job 狀態有 DB write-through,佇列沒有。
-- **做法**:排隊批次落 IndexJobs(status=queued 已有 row)+ 重啟時從 DB 重建佇列。
-- **驗收**:整合測試:排隊中 kill/重啟 manager → 佇列恢復、job 以同 id 繼續。
+### BL-18 [P1] Persist pending batches
+- **Current state**: `_pending_file_batches` is purely in memory — a restart drops queued uploads (restart cleanup
+  flips them to failed, forcing users to re-upload). Job status has DB write-through; the queue does not.
+- **Approach**: Persist queued batches to IndexJobs (the status=queued row already exists) + rebuild the queue from the DB on restart.
+- **Acceptance**: Integration test: kill/restart the manager while queued → the queue recovers and the job continues under the same id.
 
-### BL-19 [P2] Job 狀態外置(PG advisory lock + SKip LOCKED)→ 多實例索引
-- 現 folder lock / TTLCache 皆單進程記憶體 — 索引服務只能單實例。
-  等橫向擴展需求明確再做;migrate 層的 advisory lock 模式可沿用。**依賴 BL-18。**
+### BL-19 [P2] Externalize job state (PG advisory lock + SKIP LOCKED) → multi-instance indexing
+- The current folder lock / TTLCache are both single-process in-memory — the indexing service can only run single-instance.
+  Defer until the horizontal-scaling need is clear; the advisory-lock pattern from the migrate layer can be reused. **Depends on BL-18.**
 
-### BL-20 [P2] 解析/嵌入服務化評估(docling-serve;GPU 隔離已由 cuda:N + INFER_LOCK 解,擴展時再評)
+### BL-20 [P2] Evaluate service-izing parse/embed (docling-serve; GPU isolation is already solved by cuda:N + INFER_LOCK, revisit at scale)
 
-### BL-21 [P0·進行中] Import 環自動守門
-- 現只有 grep 斷言(domain 不反向);做成 AST 級 import 圖零環單測,
-  「A call B、B 回 call A」永久阻斷於 CI。
+### BL-21 [P0 · in progress] Automated import-cycle guard
+- Currently only a grep assertion (domain does not depend backward); build an AST-level zero-cycle import-graph unit test so that
+  "A calls B, B calls A back" is permanently blocked in CI.
 
 ---
 
-## 管線審查殘項(2026-09-07 全鏈審查;C1/C2/H1-H4/M3/M4 已修)
+## Pipeline Review Backlog (2026-09-07 full-chain review; C1/C2/H1-H4/M3/M4 fixed)
 
-### BL-23 [P1] 上傳成功但 auto-index 啟動失敗 → 檔案無任何記錄(M1)
-- trigger_auto_index 吞例外只回 warning message;File row 有、FileIndex 無,
-  前端顯示 not_indexed 無法與「排隊中」區分,無重試。應寫 failed 記錄或重試。
+### BL-23 [P1] Upload succeeds but auto-index fails to start → the file has no record at all (M1)
+- `trigger_auto_index` swallows the exception and returns only a warning message; the File row exists but FileIndex does not.
+  The frontend shows not_indexed, indistinguishable from "queued", with no retry. It should write a failed record or retry.
 
-### BL-24 [P2] 刪檔順序:實體檔先刪、DB row 後刪(M2)
-- 中間出錯留「有 row 無檔案」;FileIndex.file_id FK 無 ondelete cascade。
+### BL-24 [P2] Delete order: physical file deleted first, DB row second (M2)
+- An error in between leaves a "row without a file"; `FileIndex.file_id` FK has no ondelete cascade.
 
-### BL-25 [P2] delete_document_index 例外時跳過快取失效(M5)
-- chunks 已刪但 FileIndexNotFound 翻 False → query cache 未清,TTL 內回已刪內容。
+### BL-25 [P2] delete_document_index skips cache invalidation on exception (M5)
+- Chunks are already deleted but FileIndexNotFound flips to False → the query cache is not cleared, returning deleted content within the TTL.
 
-### BL-26 [P2] folder 改名 storage rename 與 file_path 更新非原子(M6)
-### BL-27 [P2] reindex cancel 30s 逾時後殘存 thread 可能重建剛 DROP 的表(H5-B)
-- hierarchical_indexer 檔頭已記載此風險;需 job 硬終止或寫入前 folder 世代檢查。
+### BL-26 [P2] Folder rename: storage rename and file_path update are not atomic (M6)
+### BL-27 [P2] After a reindex cancel 30s timeout, a lingering thread may rebuild a just-DROPped table (H5-B)
+- The `hierarchical_indexer` file header already documents this risk; needs a hard job kill or a folder-generation check before writing.
 
-### BL-28 [P3] 同 folder 同名檔無 unique 約束(L1);save_file 後 DB create 失敗留孤兒檔(L2);
-單檔上傳 metadata None 訊息不一致(L3);delete_folder_index results 語義混雜(L4)。
+### BL-28 [P3] No unique constraint on same-name files in the same folder (L1); a failed DB create after save_file leaves an orphan file (L2);
+inconsistent single-file upload metadata=None message (L3); mixed semantics in delete_folder_index results (L4).
 
-## 已完成(可追溯歸檔)
+## Completed (Traceable Archive)
 
-- 2026-08~09:架構審查 35 項(H1-H6 / M1-M15 / Low)、M6/M14 重構、
-  migrate 三重防護、覆蓋率 95%/50% 雙門檻、整合測試基座(見 git log
-  `chore/bump-v1.1.9-rocm` 分支與 ROADMAP「已交付」)。
-- 2026-09-02:docling 2.119 → 2.124(BL 前置)。
-- 2026-09-02(feat/asr-provider):**BL-06** rag.asr config 化(最小 5 欄);
-  **BL-07** AsrProvider 介面 + docling-whisper default(零行為)+ 分流接線;
-  **BL-09** 雲端 openai-compatible provider;**BL-21** import 環自動守門
-  (AST 兩級零環釘死 CI);格式 v3 官網對標(音訊 6 種 + odt/ods/odp/epub/
-  tex/eml/xlsm);死碼掃描(vulture:7 報全誤報/框架契約,零真死碼)。
-- 2026-09-02(feat/asr-provider):**BL-05** chunk 引用溯源(headings/page_no
-  進 node metadata,search/query 回傳頁碼與章節鏈;僅新索引資料)。
+- 2026-08~09: 35 architecture-review items (H1-H6 / M1-M15 / Low), M6/M14 refactors,
+  migrate triple-guard, 95%/50% dual coverage thresholds, integration-test scaffolding (see the git log
+  `chore/bump-v1.1.9-rocm` branch and the ROADMAP "Delivered" section).
+- 2026-09-02: docling 2.119 → 2.124 (BL prerequisite).
+- 2026-09-02 (feat/asr-provider): **BL-06** rag.asr config (minimal 5 fields);
+  **BL-07** AsrProvider interface + docling-whisper default (zero behavior) + routing;
+  **BL-09** cloud openai-compatible provider; **BL-21** automated import-cycle guard
+  (two-level AST zero-cycle pinned in CI); format v3 aligned with the official site (6 audio + odt/ods/odp/epub/
+  tex/eml/xlsm); dead-code scan (vulture: 7 reports, all false positives / framework contracts, zero real dead code).
+- 2026-09-02 (feat/asr-provider): **BL-05** chunk citation provenance (headings/page_no
+  into node metadata, returned by search/query as page number and section chain; new-index data only).

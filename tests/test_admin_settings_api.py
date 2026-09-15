@@ -1,9 +1,11 @@
 
-"""Admin 設定 API 契約(feat/runtime-settings)。
+"""Admin settings API contract (feat/runtime-settings).
 
-service 層邏輯在 test_runtime_settings.py;這裡釘 HTTP 面:
-路由/狀態碼/回應形狀/錯誤轉譯(422)/probe 防呆/admin 頁可取。
-免認證(產品決策 2026-09):端點不掛 auth,測試直接打。
+The service-layer logic is in test_runtime_settings.py; here we pin the HTTP
+face: routing / status codes / response shape / error translation (422) /
+probe guards / admin page reachability.
+No auth (product decision): the endpoints have no auth attached, so tests call
+them directly.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,7 +21,7 @@ _SVC = "src.adapter.runtime_settings_service"
 
 @pytest.fixture()
 def client():
-    # 免認證(產品決策)— 不需任何 override,端點原樣可打
+    # No auth (product decision) -- no override needed, the endpoints are callable as-is
     app = FastAPI()
     app.include_router(router)
     return TestClient(app)
@@ -43,7 +45,7 @@ class TestSettingsApi:
         body = r.json()
         assert body["data"]["applied"] == {"rag.embedding.model": "m"}
         assert body["data"]["warnings"] == ["警告文案"]
-        # 免認證:沒帶 Authorization → 稽核欄記 console
+        # No auth: without an Authorization header -> the audit field records "console"
         assert ap.call_args.kwargs.get("updated_by") == "console"
 
     def test_put_with_bearer_records_masked_token(self, client):
@@ -52,7 +54,7 @@ class TestSettingsApi:
                        json={"settings": {"rag.rerank.enabled": True}},
                        headers={"Authorization": "Bearer secret-token-xyz-12345"})
         ub = str(ap.call_args.kwargs.get("updated_by"))
-        assert "secret-token-xyz-12345" not in ub  # 只進遮罩形
+        assert "secret-token-xyz-12345" not in ub  # only the masked form is stored
 
     def test_put_empty_body_422(self, client):
         assert client.put("/api/admin/settings", json={}).status_code == 422
@@ -104,7 +106,7 @@ class TestProbe:
         with patch("src.api.router.admin_settings.httpx.AsyncClient", return_value=ac):
             r = client.post("/api/admin/probe", json={"base_url": "http://down:1/v1"})
         d = r.json()["data"]
-        # 只回例外類名 — 原始訊息(可能含內部位址)不得回顯
+        # Return only the exception class name -- the original message (which may contain internal addresses) must not be echoed back
         assert d["reachable"] is False and d["error"] == "OSError"
         assert "10.0.0.5" not in str(d)
 
@@ -122,7 +124,7 @@ class TestProbe:
 
 class TestAdminPage:
     def test_root_serves_console(self, client):
-        # 產品門面:根網址即設定頁
+        # Product front door: the root URL is the settings page
         r = client.get("/")
         assert r.status_code == 200 and "Control Center" in r.text
 
@@ -130,16 +132,17 @@ class TestAdminPage:
         r = client.get("/admin")
         assert r.status_code == 200
         assert "Agentic RAG" in r.text and "Control Center" in r.text
-        # 外部資源僅允許 Google Fonts(對齊 MCP_Center 設計語言;離線時
-        # fallback stack 降級,版面不壞)— 其餘一律 inline
+        # External resources are limited to Google Fonts (aligned with the
+        # MCP_Center design language; when offline the fallback stack degrades
+        # gracefully without breaking the layout) -- everything else is inline
         import re
         externals = set(re.findall(r'https?://([^/"]+)', r.text))
-        # www.w3.org 是 inline SVG 的 xmlns 宣告,非網路請求
+        # www.w3.org is the xmlns declaration of an inline SVG, not a network request
         assert externals <= {"fonts.googleapis.com", "fonts.gstatic.com", "www.w3.org"}, externals
 
 
 class TestAdminHtmlLoader:
-    """主控台 HTML 抽成 web/admin_console.html 後的載入器行為。"""
+    """Loader behavior after the console HTML was extracted into web/admin_console.html."""
 
     def test_reads_real_file(self):
         from src.api.router import admin_page_html as m
@@ -148,7 +151,7 @@ class TestAdminHtmlLoader:
 
     def test_fallback_when_missing(self):
         from src.api.router import admin_page_html as m
-        # 所有候選路徑都不存在 → 回明確 fallback 頁,不崩、不回空
+        # None of the candidate paths exist -> return an explicit fallback page, no crash, no empty response
         with patch("src.utils.runtime_paths.resolve_external_dir", return_value=None), \
              patch("pathlib.Path.is_file", return_value=False):
             html = m._load_admin_html()

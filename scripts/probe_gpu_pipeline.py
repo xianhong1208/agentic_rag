@@ -1,13 +1,14 @@
 
-"""GPU pipeline 探針 — 在服務機驗證「索引時到底有沒有用 GPU」。
+"""GPU pipeline probe — verify on the service host whether indexing actually uses the GPU.
 
-檢查三層(每層都可能靜默退 CPU;OCR 已統一 rapidocr torch backend,
-不再有 onnxruntime 套件層要驗):
-  ① torch 看不看得到 GPU(docling 的 use_cuda gate;ROCm 也走這裡)
-  ② 服務同款 converter 建出來的 RapidOCR torch session 實際 device(呼叫層真相)
-  ③ Layout/TableFormer 模型實際落在哪個 device
+Checks three layers (each can silently fall back to CPU; OCR now uses the
+rapidocr torch backend, so there is no onnxruntime layer left to verify):
+  (1) Whether torch sees the GPU (docling's use_cuda gate; ROCm goes here too)
+  (2) The actual device of the RapidOCR torch session built by the same
+      converter the service uses (ground truth at the call layer)
+  (3) Which device the Layout/TableFormer models actually land on
 
-跑法:
+Run:
     PYTHONPATH=. uv run --no-sync python scripts/probe_gpu_pipeline.py
 """
 
@@ -17,15 +18,14 @@ import sys
 def main() -> int:
     problems = []
 
-    # ① torch
     import torch
     cuda_ok = torch.cuda.is_available()
     name = torch.cuda.get_device_name(0) if cuda_ok else "-"
     print(f"① torch.cuda.is_available() = {cuda_ok}  ({torch.__version__}, {name})")
     if not cuda_ok:
-        problems.append("torch 看不到 GPU → docling 全 pipeline 退 CPU(container --gpus?/driver?)")
+        problems.append("torch cannot see the GPU -> docling pipeline falls back to CPU entirely (container --gpus? / driver?)")
 
-    # ② 服務同款 converter → RapidOCR torch session 實際 device
+    # Same converter the service uses -> actual device of the RapidOCR torch session.
     from src.config.config_manager import get_config
     get_config("config/config.yaml")
     from src.domain.rag.docling_loader import get_converter
@@ -36,8 +36,8 @@ def main() -> int:
         pdf_pipeline = converter._get_pipeline(InputFormat.PDF)
         ocr_model = getattr(pdf_pipeline, "ocr_model", None)
         if ocr_model is None:
-            print("② pipeline 內找不到 ocr_model(OCR 未啟用?)")
-            problems.append("OCR stage 不在 pipeline(檢查 ocr_enabled)")
+            print("② ocr_model not found in pipeline (OCR not enabled?)")
+            problems.append("OCR stage not in pipeline (check ocr_enabled)")
         else:
             found = False
             reader = ocr_model.reader
@@ -52,15 +52,14 @@ def main() -> int:
                 print(f"② RapidOCR {part_name}: device={dev}  {'✅GPU' if on_gpu else '❌CPU'}")
                 if not on_gpu:
                     problems.append(
-                        f"OCR {part_name} 落在 CPU(EngineConfig.torch.use_cuda 未生效"
-                        f"或 accelerator device 判定為 cpu)"
+                        f"OCR {part_name} landed on CPU (EngineConfig.torch.use_cuda not effective "
+                        f"or accelerator device resolved to cpu)"
                     )
             if not found:
-                print("② 無法內省 RapidOCR torch sessions(rapidocr 版本結構不同)— 改用 nvidia-smi/rocm-smi 觀察")
+                print("② Cannot introspect RapidOCR torch sessions (rapidocr version structure differs) — use nvidia-smi/rocm-smi instead")
     except Exception as e:
-        print(f"② converter 內省失敗: {type(e).__name__}: {e}")
+        print(f"② converter introspection failed: {type(e).__name__}: {e}")
 
-    # ③ Layout 模型 device
     try:
         layout = getattr(pdf_pipeline, "layout_model", None)
         if layout is not None:
@@ -72,17 +71,17 @@ def main() -> int:
                 dev = getattr(inner, "device", None) or getattr(inner, "_device", None)
             print(f"③ Layout model device = {dev}")
             if dev is not None and "cuda" not in str(dev).lower():
-                problems.append("Layout 模型落在 CPU")
+                problems.append("Layout model landed on CPU")
     except Exception as e:
-        print(f"③ layout 內省失敗: {type(e).__name__}: {e}")
+        print(f"③ layout introspection failed: {type(e).__name__}: {e}")
 
     print()
     if problems:
-        print("❌ 發現問題:")
+        print("❌ Problems found:")
         for p in problems:
             print(f"   - {p}")
         return 1
-    print("✅ 三層全部在 GPU 上")
+    print("✅ All three layers are on the GPU")
     return 0
 
 

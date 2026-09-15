@@ -1,29 +1,29 @@
 
-"""執行期設定覆寫 — 白名單、驗證、就地變更(admin 熱改的核心)。
+"""Runtime settings overrides — whitelist, validation, in-place mutation (the core of admin hot-reconfig).
 
-分層:config.yaml = 出廠預設(唯讀)→ RuntimeSettings 表 = 現場覆寫
-→ 疊加後的 ConfigModel = 全服務讀的唯一真相。
+Layering: config.yaml = factory defaults (read-only) -> the RuntimeSettings table = live overrides
+-> the merged ConfigModel = the single source of truth every service reads.
 
-為什麼是「就地變更(in-place setattr)」而不是換一顆新 ConfigModel:
-消費端(context_generator 持 llm_config、sub-service 持 ctx)拿的是
-**物件參照** — 換新顆舊參照全部失聯,就地改才會全體生效。
+Why in-place setattr rather than swapping in a fresh ConfigModel: consumers (context_generator
+holds llm_config, sub-services hold ctx) hold object references — replacing the model would orphan
+all old references, so mutating in place is what makes changes take effect everywhere.
 
-白名單三級:
-- live:改了即生效(HTTP 端點型服務、request-time 讀的參數)
-- warn:改了生效但附影響警告(embedding 系 — 向量空間不相容,
-  既有 folder 要重建索引)
-- 名單外:一律拒絕(DB/port/auth 等基礎設施,重啟才能改)
+Three whitelist levels:
+- live: takes effect immediately (HTTP-endpoint services, request-time-read parameters)
+- warn: takes effect but with an impact warning (embedding-family — vector space incompatible,
+  existing folders must be reindexed)
+- not listed: always rejected (infrastructure such as DB/port/auth; requires a restart)
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-# 點路徑 → 級別。名單外的路徑一律拒絕。
-# 注意:score_threshold 等雖凍在 Reranker instance,rebind(rag_context)
-# 會重建該 instance — 這裡只管「值的驗證與寫入」,rebind 是另一層。
+# Dotted path -> level. Any path not listed is rejected.
+# Note: values like score_threshold are frozen into the Reranker instance, but rebind (rag_context)
+# rebuilds that instance — here we only handle value validation and writing; rebind is a separate layer.
 EDITABLE: Dict[str, str] = {
-    # 模型服務 — embedding(warn:換模型 = 向量空間不相容,舊 folder 需重建)
+    # Model services — embedding (warn: changing the model = vector space incompatible, old folders need rebuilding)
     "rag.embedding.provider": "warn",
     "rag.embedding.model": "warn",
     "rag.embedding.dimension": "warn",
@@ -31,19 +31,19 @@ EDITABLE: Dict[str, str] = {
     "rag.embedding.api_key": "warn",
     "rag.embedding.query_prefix": "warn",
     "rag.embedding.passage_prefix": "warn",
-    # 模型服務 — LLM(contextual retrieval)
+    # Model services — LLM (contextual retrieval)
     "rag.llm.provider": "live",
     "rag.llm.model": "live",
     "rag.llm.base_url": "live",
     "rag.llm.api_key": "live",
-    # Contextual retrieval 行為
+    # Contextual retrieval behavior
     "rag.contextual_retrieval.enabled": "live",
     "rag.contextual_retrieval.max_context_length": "live",
     "rag.contextual_retrieval.max_concurrent": "live",
     "rag.contextual_retrieval.max_doc_chars": "live",
     "rag.contextual_retrieval.max_tokens": "live",
     "rag.contextual_retrieval.reasoning_effort": "live",
-    # 模型服務 — rerank
+    # Model services — rerank
     "rag.rerank.enabled": "live",
     "rag.rerank.model": "live",
     "rag.rerank.base_url": "live",
@@ -52,13 +52,13 @@ EDITABLE: Dict[str, str] = {
     "rag.rerank.score_threshold": "live",
     "rag.rerank.query_template": "live",
     "rag.rerank.document_template": "live",
-    # 模型服務 — ASR
+    # Model services — ASR
     "rag.asr.enabled": "live",
     "rag.asr.provider": "live",
     "rag.asr.base_url": "live",
     "rag.asr.api_key": "live",
     "rag.asr.model": "live",
-    # 檢索參數(REST/agentic 均 request-time 讀 config;ctx 標量由 rebind 同步)
+    # Retrieval parameters (both REST/agentic read config at request time; ctx scalars synced via rebind)
     "rag.retrieval.default_top_k": "live",
     "rag.retrieval.default_similarity_cutoff": "live",
     "rag.retrieval.default_sparse_top_k": "live",
@@ -70,19 +70,20 @@ EDITABLE: Dict[str, str] = {
     "rag.retrieval.auto_merging.merge_threshold": "live",
 }
 
-# 顯示時要遮罩的欄位(GET 回 "•••" 佔位;PUT 寫入不受影響)
+# Fields to mask on display (GET returns "•••" as a placeholder; PUT writes are unaffected)
 SECRET_PATHS = {p for p in EDITABLE if p.endswith("api_key")}
 
-# path 前綴 → rebind 群組(rag_context.apply_runtime_changes 的 dispatch key)
+# Path prefix -> rebind group (dispatch key for rag_context.apply_runtime_changes)
 REBIND_GROUPS = ("rag.embedding", "rag.llm", "rag.contextual_retrieval",
                  "rag.rerank", "rag.asr", "rag.retrieval")
 
 
 def _resolve(config_model, path: str, create: bool = True):
-    """點路徑 → (父物件, 欄位名)。
+    """Dotted path -> (parent object, field name).
 
-    create=True:中途 None 的 optional 段以預設值補建(寫入路徑用);
-    create=False:讀取路徑 — 不得有副作用,None 段回 (None, field)。
+    create=True: intermediate None optional segments are built up with default values (for the
+    write path); create=False: the read path — must have no side effects, so a None segment returns
+    (None, field).
     """
     parts = path.split(".")
     obj = config_model
@@ -91,7 +92,7 @@ def _resolve(config_model, path: str, create: bool = True):
         if nxt is None:
             if not create:
                 return None, parts[-1]
-            # optional 段(如 rag.asr 未設)→ 以該欄位型別的預設值補建
+            # optional segment (e.g. rag.asr unset) -> build it from the field type's default
             field = type(obj).model_fields[part]
             ann = field.annotation
             # Optional[X] → X
@@ -105,7 +106,7 @@ def _resolve(config_model, path: str, create: bool = True):
 
 
 def get_effective(config_model, mask_secrets: bool = True) -> Dict[str, Any]:
-    """所有白名單路徑的目前生效值(secret 遮罩)。"""
+    """Current effective values for all whitelisted paths (secrets masked)."""
     out: Dict[str, Any] = {}
     for path in EDITABLE:
         try:
@@ -120,21 +121,21 @@ def get_effective(config_model, mask_secrets: bool = True) -> Dict[str, Any]:
 
 
 def validate_and_apply(config_model, patch: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    """驗證 patch 後**就地**寫進 ConfigModel。
+    """Validate the patch, then write it into the ConfigModel in place.
 
-    全有全無:任何一項驗證失敗 → ValueError,一項都不寫。
+    All-or-nothing: any single validation failure -> ValueError, and nothing is written.
 
     Returns:
-        (applied, warnings) — 實際寫入的 {path: value} 與 warn 級路徑的警告。
+        (applied, warnings) — the actually-written {path: value} and warnings for warn-level paths.
 
     Raises:
-        ValueError: 路徑不在白名單 / 型別驗證不過(訊息含明細)。
+        ValueError: Path not whitelisted / type validation failed (message includes details).
     """
     unknown = [p for p in patch if p not in EDITABLE]
     if unknown:
         raise ValueError(f"不可熱改的設定路徑:{unknown}(白名單見 GET /api/admin/settings)")
 
-    # 先全部驗證(pydantic:套進 section copy 驗型別),全過才寫
+    # Validate everything first (pydantic: apply into a section copy to check types); write only if all pass
     staged = []  # [(parent, field, validated_value, path)]
     errors = []
     for path, value in patch.items():
@@ -143,28 +144,28 @@ def validate_and_apply(config_model, patch: Dict[str, Any]) -> Tuple[Dict[str, A
             section_cls = type(parent)
             data = parent.model_dump()
             data[field] = value
-            validated = section_cls.model_validate(data)  # 型別/約束驗證
+            validated = section_cls.model_validate(data)  # type/constraint validation
             staged.append((parent, field, getattr(validated, field), path))
         except ValueError as e:
             errors.append(f"{path}: {e}")
     if errors:
-        raise ValueError("設定驗證失敗:" + "; ".join(errors))
+        raise ValueError("Settings validation failed: " + "; ".join(errors))
 
     applied: Dict[str, Any] = {}
     warnings: List[str] = []
     for parent, field, value, path in staged:
-        setattr(parent, field, value)  # 就地 — 持參照的消費端同步看到
+        setattr(parent, field, value)  # in place — consumers holding references see it immediately
         applied[path] = value
         if EDITABLE[path] == "warn":
             warnings.append(
-                f"{path}:embedding 面變更 — 向量空間/維度不相容,"
-                "既有 folder 需重建索引後才能正常檢索;新索引立即用新設定"
+                f"{path}: embedding change — vector space/dimension incompatible; "
+                "existing folders must be reindexed before retrieval works. New indexes use the new setting immediately."
             )
     return applied, warnings
 
 
 def rebind_groups_for(paths) -> List[str]:
-    """一批已套用的路徑 → 需要觸發的 rebind 群組(去重、依固定順序)。"""
+    """A batch of applied paths -> the rebind groups to trigger (deduplicated, in a fixed order)."""
     hit = set()
     for p in paths:
         for g in REBIND_GROUPS:

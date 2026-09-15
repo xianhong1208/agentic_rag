@@ -1,13 +1,13 @@
-# 缺陷報告索引 (Defect Reports)
+# Defect Reports Index
 
 
-一份缺陷一個檔,命名 `DEF-<YYYY>-<序號>.md`,範本見 [../templates/DEFECT_REPORT_TEMPLATE.md](../templates/DEFECT_REPORT_TEMPLATE.md)。
+One file per defect, named `DEF-<YYYY>-<sequence>.md`; see the template at [../templates/DEFECT_REPORT_TEMPLATE.md](../templates/DEFECT_REPORT_TEMPLATE.md).
 
-| 編號 | 標題 | 嚴重度 | 狀態 |
+| ID | Title | Severity | Status |
 |------|------|--------|------|
-| [DEF-2026-001](DEF-2026-001.md) | `_parse_db_url` 未對帳密做 percent-decoding | Major | Open |
-| [DEF-2026-002](DEF-2026-002.md) | 例外類別以 truthiness 判斷 `folder_id`,`0` 被誤當未提供 | Minor | Open |
-| [DEF-2026-003](DEF-2026-003.md) | `${VAR:-default}` 環境變數展開未實作,與 README 宣稱不符 | Minor | Open |
-| [DEF-2026-004](DEF-2026-004.md) | `_load_config` 吞掉 FileNotFoundError,設定檔路徑錯誤時靜默啟動 | Minor | Open |
+| [DEF-2026-001](DEF-2026-001.md) | `_parse_db_url` does not percent-decode credentials | Major | Open |
+| [DEF-2026-002](DEF-2026-002.md) | Exception classes test `folder_id` by truthiness, so `0` is mistaken for "not provided" | Minor | Open |
+| [DEF-2026-003](DEF-2026-003.md) | `${VAR:-default}` environment-variable expansion is not implemented, contrary to the README | Minor | Open |
+| [DEF-2026-004](DEF-2026-004.md) | `_load_config` swallows FileNotFoundError, starting silently when the config path is wrong | Minor | Open |
 
-**出場準則**(TEST_PLAN 第 4 節):合併 / 發布前,本索引不得有 Open 的 Blocker / Critical。
+**Exit criteria** (TEST_PLAN, Section 4): before merge / release, this index must contain no Open Blocker / Critical defects.

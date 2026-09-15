@@ -1,77 +1,71 @@
-# Evals — RAG 檢索與 ASR 評測(BL-01 / BL-02)
+# Evals — RAG Retrieval and ASR Evaluation
 
 
-**目的**:所有模型/調參決策的驗收網。換 embedding(BL-12)、換 ASR
-(BL-08 FireRedASR)、調 `ef_search`(BL-14)之前後各跑一次,用數據說話。
+**Purpose**: an acceptance net for every model / tuning decision. Run it before and after each change — switching the embedding model, switching ASR (FireRedASR), or tuning `ef_search` — and let the numbers decide.
 
-## 目錄
+## Layout
 
 ```
 evals/
-  metrics.py                  # 指標純函式(CER / 簡體率 / recall@k / MRR;有單測)
+  metrics.py                  # Metric pure functions (CER / simplified-char rate / recall@k / MRR; unit-tested)
   rag/
-    documents/                # ← 放代表性文件集(白名單內任何格式)
-    golden_qa.yaml            # ← QA 集(格式見檔內註釋)
+    documents/                # <- Representative document set (any format in the allowlist)
+    golden_qa.yaml            # <- QA set (format described in the file's comments)
   asr/
-    audio/                    # ← 放 3-5 段代表音檔(會議/簡報/含前導靜音)
-    drafts/                   # 機器草稿(whisper 產;僅供校對起點,絕不拿來算分)
-    golden_transcripts/       # ← 同名 .txt:**人工校對過**的繁中全文才能放
-  baselines/                  # 跑分輸出(JSON;基線提交進 repo)
+    audio/                    # <- 3-5 representative audio clips (meeting / presentation / with leading silence)
+    drafts/                   # Machine drafts (produced by whisper; a proofreading starting point only, never scored)
+    golden_transcripts/       # <- Same-named .txt: only **human-proofread** full Traditional-Chinese text belongs here
+  baselines/                  # Scoring output (JSON; baselines are committed to the repo)
 ```
 
-## 素材來源 A:Common Voice zh-TW(免校對,推薦)
+## Material Source A: Common Voice zh-TW (no proofreading, recommended)
 
-Mozilla Common Voice Scripted Speech(zh-TW,CC0-1.0)自帶**人工驗證**
-逐句文本 — 不需要校對。從 Mozilla Data Collective 登入下載 tar.gz 後:
+Mozilla Common Voice Scripted Speech (zh-TW, CC0-1.0) ships with **human-verified** per-sentence text, so no proofreading is needed. After logging in to the Mozilla Data Collective and downloading the tar.gz:
 
 ```bash
-uv run --no-sync python scripts/import_common_voice.py <tar.gz 路徑> --n 200
+uv run --no-sync python scripts/import_common_voice.py <tar.gz path> --n 200
 uv run --no-sync python scripts/run_asr_eval.py
 ```
 
-抽樣 seed 固定(--seed 42)可重現;重跑自動清舊 cv_* 批。
-限制:CV 是唸稿短句(語音學上乾淨),量得出模型基礎 CER,但不代表
-會議/長音檔real-world 表現 — 自錄長音檔(素材來源 B)仍值得補。
+The sampling seed is fixed (`--seed 42`) for reproducibility; re-running automatically clears the old `cv_*` batch.
+Limitation: CV consists of read-aloud short sentences (phonetically clean). It measures a model's baseline CER but does not represent real-world performance on meetings / long audio, so recording your own long audio (Material Source B) is still worthwhile.
 
-## 素材來源 B:自有音檔 — 草稿→校對工作流
+## Material Source B: Your Own Audio — Draft -> Proofread Workflow
 
-從零逐字打 20 分鐘音檔不現實 — 用機器草稿當起點:
+Transcribing 20 minutes of audio from scratch is impractical, so start from a machine draft:
 
-1. 產草稿(whisper turbo → `drafts/*.txt`):
+1. Generate drafts (whisper turbo -> `drafts/*.txt`):
    `uv run --no-sync python scripts/make_asr_drafts.py`
-2. **人工校對** `drafts/` 內容(聽音檔修錯字;FireRedASR 版草稿就緒時
-   可並排對照,兩邊分歧處優先聽)
-3. 校對完搬進 `golden_transcripts/` 同名檔
+2. **Proofread** the contents of `drafts/` (listen to the audio and fix errors; once a FireRedASR draft is ready you can compare side by side and prioritize listening where the two disagree).
+3. Once proofread, move the files into `golden_transcripts/` under the same names.
 
-⚠️ `golden_transcripts/` 放未校對的機器輸出 = CER 在跟 whisper 自己的
-錯誤比,兩個 ASR 的分數都失真 — 這條線是評測可信度的底線。
+Warning: putting unproofread machine output into `golden_transcripts/` means CER is measured against whisper's own errors, distorting the scores of both ASR engines. This line is the floor of evaluation credibility.
 
-## 跑法
+## Running
 
 ```bash
-# RAG(需 PostgreSQL + embedding 服務可達;自建評測 folder,跑完自動清除)
+# RAG (requires reachable PostgreSQL + embedding service; creates its own eval folder and cleans up afterward)
 uv run --no-sync python scripts/run_rag_eval.py
 uv run --no-sync python scripts/run_rag_eval.py --baseline evals/baselines/rag_<date>.json
 
-# ASR(對 config 的 provider;--provider 可覆蓋)
+# ASR (against the configured provider; --provider overrides)
 uv run --no-sync python scripts/run_asr_eval.py
 uv run --no-sync python scripts/run_asr_eval.py --provider openai-compatible \
     --baseline evals/baselines/asr_docling-whisper_<date>.json
 ```
 
-## 指標
+## Metrics
 
-| 腳本 | 指標 | 說明 |
-|---|---|---|
-| RAG | recall@5 / recall@10 | 期望檔案在 top-k 檢索結果中的命中比例 |
-| RAG | MRR | 第一個命中檔案的排名倒數(排序品質) |
-| ASR | CER | 字元錯誤率(去空白標點;normalize 見 metrics.py) |
-| ASR | 簡體字比率 | 繁中輸出驗收 ≈0(FireRedASR 輸出簡體時此值會抓到) |
-| ASR | 幻覺命中數 | audio_defense pattern 對 provider 原始輸出的命中計數 |
+| Script | Metric | Description |
+|--------|--------|-------------|
+| RAG | recall@5 / recall@10 | Fraction of expected files hit within the top-k retrieval results |
+| RAG | MRR | Reciprocal rank of the first hit file (ranking quality) |
+| ASR | CER | Character error rate (whitespace and punctuation stripped; normalization in metrics.py) |
+| ASR | Simplified-char rate | For Traditional-Chinese output, acceptance is ~0 (catches cases where FireRedASR emits simplified characters) |
+| ASR | Hallucination hit count | Count of audio_defense pattern hits against the provider's raw output |
 
-## 慣例
+## Conventions
 
-- **基線進 repo**:每次有意義的跑分把 `baselines/*.json` 提交,MR 描述附 diff。
-- **素材不進 repo**(documents/audio 可能含內部資料):`.gitignore` 已排除,
-  素材放共享儲存、README 記路徑即可。
-- 檢索面有任何改動(embedding / chunking / 檢索參數 / ASR)→ 跑分後再合併。
+- **Baselines go in the repo**: commit `baselines/*.json` for every meaningful run and attach the diff in the MR description.
+- **Material does not go in the repo** (documents/audio may contain internal data): already excluded by `.gitignore`; keep the material in shared storage and note the path in the README.
+- Any change on the retrieval side (embedding / chunking / retrieval parameters / ASR) -> score before merging.

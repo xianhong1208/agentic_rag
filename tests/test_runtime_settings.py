@@ -1,15 +1,19 @@
 
-"""執行期設定熱改(feat/runtime-settings)。
+"""Runtime settings hot-reload (feat/runtime-settings).
 
-契約:
-- 白名單外一律拒絕;型別驗證全有全無(一項錯 → 一項都不寫)
-- 就地變更:持 section 參照的消費端(context_generator 持 llm_config)
-  改完立刻看得到
-- warn 級(embedding 系)附影響警告
-- optional 段(rag.asr 可為 None)patch 時自動補建
-- service:寫入持久化 + rebind;adapter 未建構時只寫 config(首建吃新值)
-- rebind:reranker 可 off→on(修 boot-disabled 永遠 None)、QE cache 必清
-- VSM.update_embed_dim:同維度 no-op、換維度清 store cache
+Contract:
+- Anything outside the whitelist is rejected; type validation is all-or-nothing
+  (one item invalid → none written).
+- In-place mutation: a consumer holding a section reference (context_generator
+  holds llm_config) sees the change immediately.
+- warn-level items (the embedding family) carry an impact warning.
+- An optional section (rag.asr may be None) is auto-created when patched.
+- service: persists the write + rebinds; when the adapter is not yet built, only
+  the config is written (first build picks up the new value).
+- rebind: the reranker can go off→on (fixing boot-disabled being forever None),
+  and the QE cache must be cleared.
+- VSM.update_embed_dim: same dimension is a no-op, a changed dimension clears the
+  store cache.
 """
 
 from unittest.mock import MagicMock, patch
@@ -46,8 +50,6 @@ def _mk_config() -> ConfigModel:
     })
 
 
-# ---- runtime_overrides:驗證與就地變更 ---------------------------------------
-
 class TestValidateAndApply:
     def test_whitelist_rejects_unknown_path(self):
         cfg = _mk_config()
@@ -59,13 +61,13 @@ class TestValidateAndApply:
         before = cfg.rag.retrieval.default_top_k
         with pytest.raises(ValueError, match="驗證失敗"):
             ro.validate_and_apply(cfg, {
-                "rag.retrieval.default_top_k": 99,          # 合法
-                "rag.rerank.score_threshold": "not-a-num",  # 非法
+                "rag.retrieval.default_top_k": 99,          # valid
+                "rag.rerank.score_threshold": "not-a-num",  # invalid
             })
-        assert cfg.rag.retrieval.default_top_k == before  # 合法項也沒寫
+        assert cfg.rag.retrieval.default_top_k == before  # the valid item was not written either
 
     def test_in_place_mutation_visible_via_held_reference(self):
-        # 消費端(如 context_generator)持 section 參照 — 就地改要立刻可見
+        # A consumer (e.g. context_generator) holds a section reference — an in-place change must be immediately visible
         cfg = _mk_config()
         llm_ref = cfg.rag.llm
         ro.validate_and_apply(cfg, {"rag.llm.model": "new-model"})
@@ -84,7 +86,7 @@ class TestValidateAndApply:
         assert warnings == []
 
     def test_optional_section_auto_created(self):
-        # rag.asr 未設(None)→ patch 自動補建預設段再寫
+        # rag.asr unset (None) → patch auto-creates the default section before writing
         cfg = _mk_config()
         cfg.rag.asr = None
         ro.validate_and_apply(cfg, {"rag.asr.provider": "fireredasr"})
@@ -92,7 +94,7 @@ class TestValidateAndApply:
         assert cfg.rag.asr.provider == "fireredasr"
 
     def test_coercion_follows_pydantic(self):
-        # "12"(字串數字)→ pydantic 寬鬆轉型,與 yaml 行為一致
+        # "12" (a numeric string) → pydantic's lenient coercion, consistent with yaml behavior
         cfg = _mk_config()
         applied, _ = ro.validate_and_apply(cfg, {"rag.retrieval.default_top_k": "12"})
         assert applied["rag.retrieval.default_top_k"] == 12
@@ -107,7 +109,7 @@ class TestEffectiveView:
         assert eff["rag.rerank.score_threshold"] == cfg.rag.rerank.score_threshold
 
     def test_all_whitelist_paths_resolvable(self):
-        # 白名單路徑必須全部指得到 ConfigModel 欄位 — schema 改名時這裡紅
+        # Every whitelist path must resolve to a ConfigModel field — this turns red when the schema is renamed
         cfg = _mk_config()
         eff = ro.get_effective(cfg, mask_secrets=False)
         assert set(eff.keys()) == set(ro.EDITABLE.keys())
@@ -117,8 +119,6 @@ class TestEffectiveView:
             "rag.rerank.enabled", "rag.rerank.model", "rag.embedding.model"])
         assert gs == ["rag.embedding", "rag.rerank"]
 
-
-# ---- service 編排(mock DB)--------------------------------------------------
 
 _SVC = "src.adapter.runtime_settings_service"
 
@@ -169,8 +169,8 @@ class TestService:
              patch(f"{_SVC}.RuntimeSettingsDB") as db:
             db.load_all.return_value = {
                 "rag.retrieval.default_top_k": 15,
-                "no.such.path": 1,                      # 白名單改版遺留 → 略過
-                "rag.rerank.score_threshold": "junk",   # 壞資料 → 略過
+                "no.such.path": 1,                      # leftover from a whitelist revision → skipped
+                "rag.rerank.score_threshold": "junk",   # bad data → skipped
             }
             applied = svc.load_overrides_on_startup()
         assert applied == 1
@@ -182,8 +182,6 @@ class TestService:
             db.delete.return_value = False
             assert svc.reset_setting("rag.rerank.score_threshold") is False
 
-
-# ---- RAGContext rebind ------------------------------------------------------
 
 class TestCtxRebind:
     def _ctx(self):
@@ -199,7 +197,7 @@ class TestCtxRebind:
         )
 
     def test_rerank_off_to_on_and_cache_cleared(self):
-        # boot 時 disabled → reranker None;熱改開啟必須能長出來(修舊缺陷)
+        # Disabled at boot → reranker None; a hot-reload enable must be able to bring it into being (fixes an old defect)
         ctx = self._ctx()
         cfg = _mk_config()
         cfg.rag.rerank.enabled = True
@@ -209,7 +207,7 @@ class TestCtxRebind:
             R.from_config.return_value = fake
             ctx.apply_runtime_changes(["rag.rerank"])
         assert ctx.reranker is fake
-        assert ctx.query_engines == {}  # cache 凍著舊 reranker → 必清
+        assert ctx.query_engines == {}  # the cache froze the old reranker → must be cleared
 
     def test_rerank_disable_sets_none(self):
         ctx = self._ctx()
@@ -258,8 +256,6 @@ class TestCtxRebind:
         assert ctx.query_engines == {}
 
 
-# ---- VSM.update_embed_dim ---------------------------------------------------
-
 class TestVsmDimUpdate:
     def _vsm(self):
         from src.domain.rag.vector_store_manager import VectorStoreManager
@@ -300,7 +296,7 @@ class TestServiceViewAndReset:
 
     def test_reset_restores_yaml_value_and_rebinds(self, tmp_path):
         cfg = _mk_config()
-        cfg.rag.rerank.score_threshold = 0.9  # 現場覆寫中
+        cfg.rag.rerank.score_threshold = 0.9  # currently overridden at runtime
         yaml_file = tmp_path / "c.yaml"
         yaml_file.write_text(
             "rag:\n  rerank:\n    score_threshold: 0.25\n", encoding="utf-8")
@@ -312,7 +308,7 @@ class TestServiceViewAndReset:
              patch.object(Config, "_config_path", str(yaml_file)):
             db.delete.return_value = True
             assert svc.reset_setting("rag.rerank.score_threshold") is True
-        assert cfg.rag.rerank.score_threshold == 0.25  # 還原 yaml 出廠值
+        assert cfg.rag.rerank.score_threshold == 0.25  # restored to the yaml factory value
         rb.assert_called_once_with(["rag.rerank.score_threshold"])
 
     def test_reset_unknown_path_rejected(self):
@@ -321,7 +317,7 @@ class TestServiceViewAndReset:
             svc.reset_setting("database.url")
 
     def test_yaml_value_falls_back_to_field_default(self):
-        # yaml 裡沒寫該欄位(或檔案讀不到)→ pydantic 欄位宣告預設
+        # The field is absent from yaml (or the file is unreadable) → the pydantic field-declared default
         cfg = _mk_config()
         from src.adapter import runtime_settings_service as svc
         from src.config.config_manager import Config

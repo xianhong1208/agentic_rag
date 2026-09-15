@@ -1,8 +1,7 @@
 
-"""Dynamic Tool Manager — 為每個 token 可存取的 folder 註冊單一工具
+"""Dynamic Tool Manager — registers a single tool per folder accessible to a token.
 
-跟前一版 flat RAG 的 dynamic_tool_manager 對齊(closure pattern),Python 3.13 + Nuitka 已驗證可跑。
-唯一差異:此版本工具帶 mode 參數(search/list/read)+ expand_context,功能更豐富。
+The tool carries a mode parameter (search/list/read) plus expand_context.
 """
 
 from typing import Any, Callable, Dict, Literal, Optional
@@ -17,7 +16,7 @@ logger = get_mcptools_logger()
 
 
 class DynamicToolManager:
-    """Singleton 管理 per-folder MCP 工具註冊"""
+    """Singleton that manages per-folder MCP tool registration."""
 
     _instance: Optional["DynamicToolManager"] = None
     _mcp: Optional[FastMCP] = None
@@ -73,17 +72,19 @@ class DynamicToolManager:
         folder_description: Optional[str] = None,
         user_token: Optional[str] = None,
     ) -> bool:
-        """註冊 per-token + per-folder 的工具
+        """Register a per-token, per-folder tool.
 
         Args:
-            folder_name: 資料夾名稱
-            query_function: async 函數,簽名 (folder_name, mode, query, file_id, top_k,
-                                              expand_context, similarity_cutoff)
-            folder_description: 描述,寫進 tool description 引導 agent
-            user_token: token(必須)— 用於 ACL 過濾(only 此 token 看得到)
+            folder_name: Folder name.
+            query_function: Async function with signature (folder_name, mode, query,
+                file_id, top_k, expand_context, similarity_cutoff).
+            folder_description: Description written into the tool description to
+                guide the agent.
+            user_token: Token (required) — used for ACL filtering (only this token
+                can see the tool).
 
         Returns:
-            True if registered (or already exists for this token)
+            True if registered (or already exists for this token).
         """
         if self._mcp is None:
             raise RuntimeError("FastMCP instance not set")
@@ -91,7 +92,7 @@ class DynamicToolManager:
             logger.error("user_token is required")
             return False
 
-        # ACL 預檢:確認 token 真的有權存取此 folder
+        # ACL pre-check: confirm the token actually has access to this folder
         user_folders = FolderDB.get(user_token=user_token)
         if not any(f.name == folder_name for f in user_folders):
             logger.warning(
@@ -107,12 +108,12 @@ class DynamicToolManager:
         if token_folder_key in self._token_folder_to_tool:
             return True  # already registered
 
-        # Tool name: 從 config 拿 prefix(預設 Agentic_)
+        # Tool name: take the prefix from config (default Agentic_)
         config = Config.get_config_model()
         prefix = getattr(getattr(config, "app", None), "tool_prefix", "Agentic")
         tool_name = f"{prefix}_{folder_name}"
 
-        # 此 tool name 已被其他 token 註冊?共享同一個 tool function
+        # Tool name already registered by another token? Share the same tool function
         if tool_name in self._registered_tools:
             self._token_folder_to_tool[token_folder_key] = tool_name
             logger.info(
@@ -120,7 +121,7 @@ class DynamicToolManager:
             )
             return True
 
-        # ---------- 構建工具描述(這是 agent 看到的核心介面文件)----------
+        # Build the tool description (the interface doc the agent sees)
         config = Config.get_config_model()
         retrieval = config.rag.retrieval
         default_top_k = retrieval.default_top_k
@@ -182,7 +183,7 @@ class DynamicToolManager:
         ])
         description = "\n".join(desc_parts)
 
-        # ---------- 構建工具函數(對齊前一版 flat RAG 同 closure pattern)----------
+        # Build the tool function
         def create_tool_func(top_k, similarity_cutoff, expand_context):
             async def agentic_tool(
                 query: str = "",
@@ -205,7 +206,6 @@ class DynamicToolManager:
 
         agentic_tool = create_tool_func(default_top_k, default_cutoff, default_expand)
 
-        # 設置函數元數據(前一版 flat RAG 同樣作法)
         agentic_tool.__name__ = tool_name
         agentic_tool.__doc__ = f"Agentic RAG tool for folder '{folder_name}' (search / list / read modes)"
         tool_func = agentic_tool
@@ -226,13 +226,13 @@ class DynamicToolManager:
         return True
 
     def unregister_folder_tool(self, folder_name: str, user_token: str):
-        """移除 user_token 對某 folder 工具的訪問權。
+        """Remove a user_token's access to a folder's tool.
 
-        若該 token 是最後一個使用者,連 tool 本身一起 unregister。
+        If that token is the last user, unregister the tool itself as well.
 
         Args:
-            folder_name: folder 名(對應已註冊工具)。
-            user_token: 要移除的 token。
+            folder_name: Folder name (corresponding to a registered tool).
+            user_token: The token to remove.
         """
         if self._mcp is None:
             raise RuntimeError("FastMCP instance not set")
@@ -248,19 +248,19 @@ class DynamicToolManager:
         self._token_folder_descriptions.pop(token_folder_key, None)
         DynamicToolManager._registry_version += 1  # bust external caches
 
-        # 還有其他 token 在用嗎?
+        # Any other tokens still using it?
         still_in_use = any(
             t == tool_name for t in self._token_folder_to_tool.values()
         )
         if not still_in_use:
             try:
-                # FastMCP v3:mcp.remove_tool() 已 deprecated,改走 local_provider
+                # FastMCP v3: mcp.remove_tool() is deprecated; use local_provider instead
                 if hasattr(self._mcp, "local_provider") and hasattr(
                     self._mcp.local_provider, "remove_tool"
                 ):
                     self._mcp.local_provider.remove_tool(tool_name)
                 else:
-                    # 備援:舊版 FastMCP 還是用頂層 API
+                    # Fallback: older FastMCP still uses the top-level API
                     self._mcp.remove_tool(tool_name)
             except Exception as e:
                 logger.warning(f"Failed to remove tool {tool_name} from MCP: {e}")

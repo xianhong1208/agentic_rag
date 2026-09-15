@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
-"""Test ffmpeg silenceremove + Whisper detect/transcribe A-B comparison.
+"""Compare leading-silence trimming against Whisper language detection/transcription.
 
-用途:在動 hierarchical_indexer 之前,先拿真實會議檔驗證 --threshold / --duration
-參數是否能正確 trim 掉前置靜音,並讓 Whisper 從「主持人開始說話」處 detect 語言。
+Trims a recording's leading silence with ffmpeg, then reports duration cut,
+detected language, and a short transcript before vs. after trimming, so
+--threshold / --duration can be tuned before wiring trimming into indexing.
 
 Usage:
-    uv run python scripts/test_trim_audio.py path/to/meeting.mp3
     uv run python scripts/test_trim_audio.py path/to/meeting.mp3 \\
         --threshold -35 --duration 2.0 --keep-trimmed
-
-Output:
-    - trim 前後時長 + 砍掉幾秒
-    - detect_language A/B + top-5 機率分佈
-    - 前 60s 轉錄文字 A/B(看是否從亂碼變正常中文)
 """
 
 from __future__ import annotations

@@ -1,13 +1,17 @@
 
-"""執行期設定編排 — admin API 背後的一站式流程。
+"""Runtime settings orchestration — the end-to-end flow behind the admin API.
 
-apply:驗證 → 就地改 ConfigModel → 持久化 DB(重啟不丟)→ rebind 活物件
-reset:刪 DB 覆寫 → 從 config.yaml 原值還原該欄位 → rebind
-startup:main.py 啟動時把 DB 覆寫疊上剛載入的 ConfigModel(此時 adapter
-        尚未建構,rebind 自然無對象 — 首次建構直接吃疊加後的值)。
+apply:   validate -> mutate ConfigModel in place -> persist to DB (survives
+         restart) -> rebind live objects.
+reset:   delete the DB override -> restore the field from its config.yaml
+         value -> rebind.
+startup: at main.py startup, overlay the DB overrides onto the freshly loaded
+         ConfigModel. The adapter is not built yet, so there is nothing to
+         rebind — the first construction picks up the overlaid values.
 
-併發:單把鎖序列化 admin 寫入(設定面板不是高頻路徑);讀不加鎖 —
-就地 setattr 是原子的屬性替換,讀端頂多晚一拍看到。
+Concurrency: a single lock serializes admin writes (the settings panel is not a
+high-frequency path); reads take no lock — an in-place setattr is an atomic
+attribute swap, so a reader at worst sees the previous value for one beat.
 """
 
 from __future__ import annotations
@@ -26,10 +30,11 @@ _apply_lock = threading.Lock()
 
 
 def load_overrides_on_startup() -> int:
-    """啟動時把 DB 覆寫疊上 ConfigModel(main.py 於 DB ready 後呼叫)。
+    """Overlay the DB overrides onto the ConfigModel at startup (called by main.py once the DB is ready).
 
-    無效的覆寫(白名單改過 / 型別對不上)逐條略過並 log — 一條壞資料
-    不能擋服務啟動。回傳成功套用數。
+    Invalid overrides (a changed whitelist or a type mismatch) are skipped one
+    by one and logged — a single bad row must not block service startup.
+    Returns the number successfully applied.
     """
     overrides = RuntimeSettingsDB.load_all()
     if not overrides:
@@ -41,13 +46,13 @@ def load_overrides_on_startup() -> int:
             ro.validate_and_apply(config_model, {path: value})
             applied += 1
         except ValueError as e:
-            logger.warning(f"[RUNTIME] 略過無效覆寫 {path}={value!r}: {e}")
-    logger.info(f"[RUNTIME] 啟動套用 {applied}/{len(overrides)} 條執行期覆寫")
+            logger.warning(f"[RUNTIME] Skipping invalid override {path}={value!r}: {e}")
+    logger.info(f"[RUNTIME] Applied {applied}/{len(overrides)} runtime override(s) on startup")
     return applied
 
 
 def get_settings_view() -> Dict[str, Any]:
-    """設定面板的完整視圖:每條白名單路徑的生效值 / 級別 / 是否有覆寫。"""
+    """Full view for the settings panel: effective value / level / whether overridden, for each whitelisted path."""
     config_model = Config.get_config_model()
     effective = ro.get_effective(config_model)
     overridden = set(RuntimeSettingsDB.load_all().keys())
@@ -67,12 +72,14 @@ def get_settings_view() -> Dict[str, Any]:
 
 def apply_settings(patch: Dict[str, Any], updated_by: Optional[str] = None
                    ) -> Tuple[Dict[str, Any], List[str]]:
-    """驗證 → 就地改 config → 持久化 → rebind。全有全無(驗證期);
-    持久化與 rebind 為 best-effort 順序執行,失敗原樣 raise 讓 API 回 500。
+    """Validate -> mutate config in place -> persist -> rebind.
+
+    Validation is all-or-nothing. Persistence and rebind then run in order as
+    best-effort; a failure is re-raised as-is so the API returns 500.
     """
     with _apply_lock:
         config_model = Config.get_config_model()
-        before = ro.get_effective(config_model, mask_secrets=True)  # 舊值(secret 遮罩)
+        before = ro.get_effective(config_model, mask_secrets=True)  # previous values (secrets masked)
         applied, warnings = ro.validate_and_apply(config_model, patch)
         for path, value in applied.items():
             RuntimeSettingsDB.upsert(path, value, updated_by=updated_by)
@@ -84,21 +91,21 @@ def apply_settings(patch: Dict[str, Any], updated_by: Optional[str] = None
 
 
 def reset_setting(path: str) -> bool:
-    """移除單條覆寫,還原 config.yaml 原值並 rebind。回傳是否有覆寫可刪。"""
+    """Remove a single override, restore the config.yaml value, and rebind. Returns whether an override existed to delete."""
     if path not in ro.EDITABLE:
-        raise ValueError(f"不可操作的設定路徑:{path}")
+        raise ValueError(f"Setting path is not editable: {path}")
     with _apply_lock:
         removed = RuntimeSettingsDB.delete(path)
         if not removed:
             return False
-        # 從磁碟 config.yaml 重讀該欄位原值(不動其他 runtime 狀態)
+        # Re-read the field's original value from config.yaml on disk (leaving other runtime state untouched)
         yaml_value = _yaml_value(path)
         config_model = Config.get_config_model()
         ro.validate_and_apply(config_model, {path: yaml_value})
         _rebind([path])
         _audit(path, "reset", None,
                "•••" if path in ro.SECRET_PATHS else yaml_value, None)
-        logger.info(f"[RUNTIME] reset {path} → yaml 預設 {yaml_value!r}")
+        logger.info(f"[RUNTIME] reset {path} -> yaml default {yaml_value!r}")
         return True
 
 
@@ -113,7 +120,7 @@ def audit_log(limit: int = 100):
 
 
 def _yaml_value(path: str) -> Any:
-    """讀 config.yaml(磁碟原檔)裡該點路徑的值;沒有 → 該欄位 pydantic 預設。"""
+    """Read the value at the dotted path from config.yaml (the on-disk file); if absent, fall back to the field's pydantic default."""
     import yaml
     raw_path = Config._config_path
     try:
@@ -126,7 +133,7 @@ def _yaml_value(path: str) -> Any:
             return node
     except Exception:
         pass
-    # fallback:欄位宣告預設
+    # Fallback: the field's declared default
     parent_path, _, field = path.rpartition(".")
     obj = Config.get_config_model()
     for part in parent_path.split("."):
@@ -136,14 +143,14 @@ def _yaml_value(path: str) -> Any:
 
 
 def _rebind(paths: List[str]) -> List[str]:
-    """adapter 已建才 rebind(未建 = 尚無活物件,首次建構吃新 config)。"""
+    """Rebind only if the adapter is already built (if not, there is no live object yet — the first construction picks up the new config)."""
     groups = ro.rebind_groups_for(paths)
     if not groups:
         return []
     from src.adapter.rag import peek_rag_adapter
     adapter = peek_rag_adapter()
     if adapter is None:
-        logger.info(f"[RUNTIME] adapter 未建構,{groups} 待首次建構生效")
+        logger.info(f"[RUNTIME] adapter not built yet; {groups} will take effect at first construction")
         return []
     adapter._ctx.apply_runtime_changes(groups)
     return groups

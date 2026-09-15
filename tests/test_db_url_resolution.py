@@ -1,9 +1,10 @@
 
-"""database.port 欄位注入(2026-09-07 用戶部署 DB 在非預設 port 5444)。
+"""Injection of the database.port field.
 
-坑:create_engine/create_async_engine 只吃 url,忽略 config 分開的 port
-欄位 → url 沒寫 port 時預設 5432,連錯實例 → password failed。
-_resolve_db_url 在 url 未帶 port 時補上欄位 port。
+create_engine/create_async_engine only read the URL and ignore a separately
+configured port field; when the URL omits the port it defaults to 5432,
+connecting to the wrong instance. _resolve_db_url fills in the field port when
+the URL carries none.
 """
 
 from types import SimpleNamespace
@@ -28,6 +29,6 @@ def test_no_port_anywhere_left_untouched():
     assert "localhost/db" in r and ":54" not in r
 
 def test_password_preserved():
-    # render_as_string(hide_password=False) — 連線用,不能遮
+    # render_as_string(hide_password=False) — used for connecting, must not be masked
     r = _resolve_db_url(_cfg("postgresql://postgres:secret@localhost/db", 5444))
     assert "secret" in r

@@ -1,8 +1,9 @@
 
-"""評測指標純函式(BL-01 檢索 / BL-02 ASR 共用)。
+"""Pure evaluation-metric functions (shared by retrieval and ASR evaluation).
 
-零外部依賴、零 I/O — 由 tests/test_eval_metrics.py 鎖行為,
-跑分腳本(scripts/run_rag_eval.py / run_asr_eval.py)呼叫。
+No external dependencies, no I/O — behavior is pinned by
+tests/test_eval_metrics.py and these are called by the scoring scripts
+(scripts/run_rag_eval.py / run_asr_eval.py).
 """
 
 from __future__ import annotations
@@ -10,35 +11,33 @@ from __future__ import annotations
 import re
 from typing import List, Sequence
 
-# ---------------------------------------------------------------------------
-# CER — 字元錯誤率(ASR)
-# ---------------------------------------------------------------------------
-
 _NORMALIZE_STRIP = re.compile(r"[\s,,。.、;;::!!??\"'「」『』()()\-—·…]+")
 
 
 def _normalize(text: str) -> str:
-    """去空白與常見標點 — ASR 輸出常無標點,不因標點差異罰分。"""
+    """Strip whitespace and common punctuation — ASR output often lacks
+    punctuation, so we avoid penalizing punctuation differences."""
     return _NORMALIZE_STRIP.sub("", text)
 
 
 def cer(reference: str, hypothesis: str, normalize: bool = True) -> float:
-    """字元錯誤率 = levenshtein(ref, hyp) / len(ref)。
+    """Character Error Rate = levenshtein(ref, hyp) / len(ref).
 
     Args:
-        reference: 人工校對的 golden transcript。
-        hypothesis: ASR 輸出。
-        normalize: 去空白/標點後再比(預設開)。
+        reference: Human-proofread golden transcript.
+        hypothesis: ASR output.
+        normalize: Compare after stripping whitespace/punctuation (default on).
 
     Returns:
-        0.0(完全一致)~ 上不封頂(插入過多時可 >1);ref 空而 hyp 非空回 1.0。
+        0.0 (exact match) up to unbounded (can exceed 1 with many insertions);
+        returns 1.0 when ref is empty but hyp is not.
     """
     if normalize:
         reference, hypothesis = _normalize(reference), _normalize(hypothesis)
     if not reference:
         return 0.0 if not hypothesis else 1.0
 
-    # 標準 DP levenshtein(字元級,兩列滾動)
+    # Standard DP Levenshtein (character-level, two-row rolling)
     prev = list(range(len(hypothesis) + 1))
     for i, rc in enumerate(reference, 1):
         curr = [i]
@@ -52,12 +51,11 @@ def cer(reference: str, hypothesis: str, normalize: bool = True) -> float:
     return prev[-1] / len(reference)
 
 
-# ---------------------------------------------------------------------------
-# 簡體字比率(啟發式)— 驗「輸出是否繁中」(FireRedASR 輸出簡體的驗收指標)
-# ---------------------------------------------------------------------------
-
-# 「簡繁不同形」的高頻簡體字樣本(啟發式;非窮舉 — 夠判斷輸出語系傾向。
-# ⚠️ 只放簡體獨有字形 — 簡繁同形字(系/中/近/余 等)絕不能進來,否則繁中誤判)
+# High-frequency sample of Simplified characters that differ in form from their
+# Traditional counterparts (heuristic, not exhaustive — enough to judge the
+# language leaning of the output).
+# WARNING: include only Simplified-exclusive glyphs — characters identical in
+# both scripts must never be added, or Traditional Chinese would be misjudged.
 _SIMPLIFIED_CHARS = set(
     "会议记录检统计设进军对开关买卖东车书长门问间闻风飞马鸟龙点级红绿"
     "语说读写听讲话让认识谁请谢边这远运动过还货质银钱铁钟错难题华万"
@@ -66,9 +64,11 @@ _SIMPLIFIED_CHARS = set(
 
 
 def simplified_char_ratio(text: str) -> float:
-    """CJK 字元中屬於「簡體獨有形」樣本集的比率。
+    """Ratio of CJK characters that belong to the Simplified-exclusive sample set.
 
-    啟發式:>0 即混入簡體;繁中輸出驗收要求 ≈0。無 CJK 字元回 0.0。
+    Heuristic: any value >0 means Simplified characters are mixed in; Traditional
+    Chinese output is expected to be approximately 0. Returns 0.0 when there are
+    no CJK characters.
     """
     cjk = [c for c in text if "一" <= c <= "鿿"]
     if not cjk:
@@ -76,12 +76,9 @@ def simplified_char_ratio(text: str) -> float:
     return sum(1 for c in cjk if c in _SIMPLIFIED_CHARS) / len(cjk)
 
 
-# ---------------------------------------------------------------------------
-# 檢索指標(RAG)
-# ---------------------------------------------------------------------------
-
 def recall_at_k(retrieved: Sequence[str], expected: List[str], k: int) -> float:
-    """top-k 內命中的期望項比例(期望多項時為部分分)。"""
+    """Fraction of expected items hit within the top-k (partial credit when
+    multiple items are expected)."""
     if not expected:
         return 1.0
     top = set(retrieved[:k])
@@ -89,7 +86,8 @@ def recall_at_k(retrieved: Sequence[str], expected: List[str], k: int) -> float:
 
 
 def mrr(retrieved: Sequence[str], expected: List[str]) -> float:
-    """Mean Reciprocal Rank(單查詢版):第一個命中位置的倒數;無命中 0。"""
+    """Mean Reciprocal Rank (single-query version): reciprocal of the first hit's
+    position; 0 if there is no hit."""
     exp = set(expected)
     for i, r in enumerate(retrieved, 1):
         if r in exp:

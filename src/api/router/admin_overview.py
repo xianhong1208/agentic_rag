@@ -1,13 +1,13 @@
 
-"""Control Center 資料面 API(唯讀彙總;掛進 admin 模組 router)。
+"""Control Center data-plane API (read-only aggregates; mounted on the admin module router).
 
-- GET /api/admin/overview            — 總覽 KPI(folder/file/index/job)
-- GET /api/admin/folders             — 全 folder + 索引彙總
-- GET /api/admin/folders/{id}/files  — 單 folder 檔案級索引狀態
-- GET /api/admin/jobs                — 近期 index job
+- GET /api/admin/overview            — overview KPIs (folder/file/index/job)
+- GET /api/admin/folders             — all folders + index aggregates
+- GET /api/admin/folders/{id}/files  — per-file index status for one folder
+- GET /api/admin/jobs                — recent index jobs
 
-auth 語義與設定 API 相同(免認證,產品決策 — 見 admin_settings.py)。
-全部唯讀,不觸發任何索引/刪除動作。
+Auth semantics match the settings API (unauthenticated by product decision — see admin_settings.py).
+Everything is read-only and triggers no indexing/deletion actions.
 """
 
 from __future__ import annotations
@@ -20,13 +20,13 @@ logger = get_api_logger()
 
 router = APIRouter(tags=["Admin: Overview"])
 
-# 檢索評測(harness)背景執行狀態 — 單一 in-memory 執行槽(評測非高頻)。
+# Retrieval evaluation (harness) background run state — a single in-memory slot (evaluation is infrequent).
 _EVAL: dict = {"running": False, "folder": None, "done": 0, "total": 0,
                "result": None, "error": None, "started_at": None}
 
 
 def _load_eval_mod():
-    """載入 scripts/rag_eval.py(非套件,用 importlib 直載)。"""
+    """Load scripts/rag_eval.py (not a package; loaded directly via importlib)."""
     import importlib.util
     import os
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -38,18 +38,18 @@ def _load_eval_mod():
     return mod
 
 
-_EVAL_TASK = None  # 保留 task 參考,避免被 GC(Task 物件不放進 _EVAL,否則 status 無法 JSON 序列化)
+_EVAL_TASK = None  # Keep a task reference so it isn't garbage-collected (the Task object stays out of _EVAL, which must remain JSON-serializable for status)
 
 
 async def _run_eval_bg(folder_ref: str, n: int, k: int, regenerate: bool) -> None:
-    """評測本體:**跑在主 event loop**(與快取的 PGVectorStore async engine 同 loop,
-    避免 asyncpg『attached to a different loop』)。結果/錯誤寫回 _EVAL。"""
+    """Evaluation body: runs on the main event loop (same loop as the cached PGVectorStore
+    async engine, avoiding asyncpg's "attached to a different loop"). Results/errors are written back to _EVAL."""
     try:
         mod = _load_eval_mod()
         _EVAL["result"] = await mod.run_eval_async(
             folder_ref, n=n, k=k, regenerate=regenerate,
             progress=lambda d, t: _EVAL.update(done=d, total=t))
-    except Exception as e:  # noqa: BLE001 — 背景執行,錯誤存起來給 status 回報
+    except Exception as e:  # noqa: BLE001 — background run; store the error for status to report
         _EVAL["error"] = str(e)
         logger.warning(f"[EVAL] run failed: {e}")
     finally:
@@ -58,9 +58,10 @@ async def _run_eval_bg(folder_ref: str, n: int, k: int, regenerate: bool) -> Non
 
 @router.post("/api/admin/eval/run")
 async def eval_run(body: dict = Body(default={}, example={"folder_id": 1, "n": 15})):
-    """啟動一次檢索評測(主 loop 背景 task;生成合成問題 → 三路檢索 → nDCG/Recall/MRR)。
+    """Start one retrieval evaluation (background task on the main loop; generate synthetic
+    questions -> three-way retrieval -> nDCG/Recall/MRR).
 
-    reindex 後請帶 regenerate=true(node_id 變,舊標註集失效)。"""
+    After a reindex, pass regenerate=true (node_ids change, invalidating the old labeled set)."""
     import asyncio
     import time
     global _EVAL_TASK
@@ -73,20 +74,20 @@ async def eval_run(body: dict = Body(default={}, example={"folder_id": 1, "n": 1
     regen = bool(body.get("regenerate", False))
     _EVAL.update(running=True, folder=folder_ref, done=0, total=n,
                  result=None, error=None, started_at=time.time())
-    # 主 loop 上跑(不開新執行緒/新 loop)—— 共用同一個 asyncpg 連線池不會跨 loop
+    # Run on the main loop (no new thread/loop) so the shared asyncpg connection pool stays on one loop
     _EVAL_TASK = asyncio.create_task(_run_eval_bg(folder_ref, n, k, regen))
     return {"data": {"started": True}, "message": "evaluation started"}
 
 
 @router.get("/api/admin/eval/status")
 async def eval_status():
-    """評測進度 / 結果(前端輪詢)。"""
+    """Evaluation progress / results (polled by the frontend)."""
     return {"data": dict(_EVAL), "message": "ok"}
 
 
 @router.get("/api/admin/eval/report")
 async def eval_report(folder_id: int = Query(...)):
-    """讀該 folder 最近一次評測報告(reports/rag_eval_<name>.json);無則回 null。"""
+    """Read the folder's most recent evaluation report (reports/rag_eval_<name>.json); returns null if none."""
     import json
     import os
     from db.cached_folderdb import CachedFolderDB
@@ -103,7 +104,7 @@ async def eval_report(folder_id: int = Query(...)):
 
 @router.get("/api/admin/overview")
 async def get_overview():
-    """總覽 KPI + 進行中 job + 目前模型配置摘要。"""
+    """Overview KPIs + in-progress jobs + a summary of the current model configuration."""
     from db import admin_stats
     from src.config import runtime_overrides as ro
     from src.config.config_manager import Config
@@ -113,7 +114,7 @@ async def get_overview():
         data["trend"] = admin_stats.indexing_trend(7)
     except Exception:
         data["trend"] = []
-    # 模型配置摘要(給總覽頁的服務卡;沿用設定白名單的遮罩語義)
+    # Model configuration summary (for the overview page's service cards; reuses the settings whitelist's masking semantics)
     cfg = Config.get_config_model()
     eff = ro.get_effective(cfg) if cfg else {}
     try:
@@ -137,8 +138,8 @@ async def get_overview():
 
 
 def _asr_available(cfg) -> bool:
-    """ASR provider 就緒與否(fireredasr = 權重在;docling-whisper = .pt 在;
-    雲端 = 設定齊)。檔案存在性檢查,便宜、不載模型。"""
+    """Whether the ASR provider is ready (fireredasr = weights present; docling-whisper = .pt present;
+    cloud = configuration complete). A cheap file-existence check that does not load any model."""
     try:
         from src.domain.rag.asr_provider import create_asr_provider
         asr_cfg = getattr(getattr(cfg, "rag", None), "asr", None)
@@ -149,14 +150,14 @@ def _asr_available(cfg) -> bool:
 
 @router.get("/api/admin/folders")
 async def list_folders():
-    """全部 folder + 各自索引彙總(檔案數/已索引/失敗/chunks/向量表)。"""
+    """All folders + per-folder index aggregates (file count / indexed / failed / chunks / vector table)."""
     from db import admin_stats
     return {"data": {"folders": admin_stats.folders_with_index_stats()}, "message": "ok"}
 
 
 @router.get("/api/admin/folders/{folder_id}/files")
 async def list_folder_files(folder_id: int):
-    """單一 folder 的檔案級索引狀態(含失敗原因截斷)。"""
+    """Per-file index status for a single folder (with truncated failure reasons)."""
     from db import admin_stats
     files = admin_stats.files_with_index_status(folder_id)
     return {"data": {"folder_id": folder_id, "files": files}, "message": "ok"}
@@ -164,8 +165,8 @@ async def list_folder_files(folder_id: int):
 
 @router.get("/api/admin/active-stages")
 async def active_stages():
-    """目前正在索引的檔案在哪個階段({file_id: {stage,done,total,eta}})—
-    檔案清單即時顯示「解析/生成上下文/向量化/寫入」用。"""
+    """Which stage each currently-indexing file is at ({file_id: {stage,done,total,eta}}) —
+    used by the file list to show "parse / generate context / vectorize / write" in real time."""
     from src.domain.rag.index_job_manager import IndexingJobManager
     return {"data": {"stages": IndexingJobManager.get_instance().active_file_stages()},
             "message": "ok"}
@@ -174,28 +175,28 @@ async def active_stages():
 @router.get("/api/admin/folders/{folder_id}/files/{file_id}/chunks")
 async def list_file_chunks(folder_id: int, file_id: str,
                            limit: int = Query(500, ge=1, le=2000)):
-    """某檔切好的 leaf chunks(客戶檢視索引長相)。"""
+    """The leaf chunks a file was split into (lets the customer inspect what the index looks like)."""
     from db import admin_stats
     return {"data": admin_stats.chunks_for_file(folder_id, file_id, limit), "message": "ok"}
 
 
 @router.get("/api/admin/audit")
 async def settings_audit(limit: int = Query(100, ge=1, le=500)):
-    """設定變更稽核記錄(誰在何時把什麼改成什麼)。"""
+    """Settings-change audit log (who changed what to what, and when)."""
     from src.adapter import runtime_settings_service as svc
     return {"data": {"entries": svc.audit_log(limit)}, "message": "ok"}
 
 
 @router.get("/api/admin/resources")
 async def system_resources_endpoint():
-    """系統資源:DB 大小 / 向量表大小 / 磁碟。"""
+    """System resources: DB size / vector table size / disk."""
     from db import admin_stats
     return {"data": admin_stats.system_resources(), "message": "ok"}
 
 
 @router.get("/api/admin/jobs")
 async def list_jobs(limit: int = Query(20, ge=1, le=100)):
-    """近期 index job(依最後更新排序)。"""
+    """Recent index jobs (ordered by last update)."""
     from db import admin_stats
     return {"data": {"jobs": admin_stats.recent_jobs(limit)}, "message": "ok"}
 
@@ -205,19 +206,20 @@ async def query_analytics(
     folder_id: int | None = Query(None),
     days: int = Query(30, ge=1, le=365),
 ):
-    """查詢分析:查詢量 / 平均延遲 / 零結果率 / 熱門查詢 / 每日趨勢。
+    """Query analytics: query volume / average latency / zero-result rate / top queries / daily trend.
 
-    folder_id 省略 = 全部資料夾;days = 統計視窗。資料源為 QueryLog
-    (每次 /query 檢索 best-effort 記一筆)。"""
+    Omitting folder_id = all folders; days = the statistics window. The data source is QueryLog
+    (best-effort one record per /query retrieval)."""
     from db.query_log_db import QueryLogDB
     return {"data": QueryLogDB.analytics(folder_id=folder_id, days=days), "message": "ok"}
 
 
 async def _probe_endpoint_health(base_url: str, api_key: str | None):
-    """探測一個 OpenAI 相容端點(GET {base_url}/models),回 (status, detail, latency_ms)。
+    """Probe an OpenAI-compatible endpoint (GET {base_url}/models); returns (status, detail, latency_ms).
 
-    SSRF 語義同 admin_settings.probe_endpoint:設計目的即探測內網模型服務,
-    不做網段過濾;固定 GET /models、不跟隨 redirect、錯誤只回例外類名。
+    SSRF semantics match admin_settings.probe_endpoint: the intent is to probe internal model
+    services, so no subnet filtering is applied; always GET /models, no redirect following, and
+    errors report only the exception class name.
     """
     import time
 
@@ -234,12 +236,12 @@ async def _probe_endpoint_health(base_url: str, api_key: str | None):
         if resp.status_code < 500:
             return "ok", f"HTTP {resp.status_code}", ms
         return "down", f"HTTP {resp.status_code}", ms
-    except Exception as e:  # noqa: BLE001 — 只回類名,不回顯內部細節
+    except Exception as e:  # noqa: BLE001 — return only the class name, never internal details
         return "down", type(e).__name__, int((time.perf_counter() - t0) * 1000)
 
 
 def _probe_db_health():
-    """同步探測 DB(SELECT 1),回 (status, detail, latency_ms)。由 to_thread 呼叫。"""
+    """Synchronously probe the DB (SELECT 1); returns (status, detail, latency_ms). Called via to_thread."""
     import time
     from sqlalchemy import text
     from db.db import get_engine
@@ -254,28 +256,29 @@ def _probe_db_health():
 
 @router.get("/api/admin/health")
 async def health_check():
-    """外部依賴即時健康度:DB / Embedding / LLM / Reranker / Speech-to-Text。
+    """Live health of external dependencies: DB / Embedding / LLM / Reranker / Speech-to-Text.
 
-    運維一眼看穿連線/端點問題(取代事後翻 log)。每項回 status(ok/down/
-    disabled/unset)、detail、latency_ms、endpoint。"""
+    Lets operators spot connection/endpoint problems at a glance (instead of digging through logs
+    after the fact). Each entry returns status (ok/down/disabled/unset), detail, latency_ms, endpoint."""
     import asyncio
 
     from src.config import runtime_overrides as ro
     from src.config.config_manager import Config
 
     cfg = Config.get_config_model()
-    # 需要未遮罩 api_key 才能真的帶 Authorization 探測(遮罩值 ••• 非 latin-1
-    # 會讓 httpx header 編碼炸 UnicodeEncodeError);金鑰只用於送出,不回傳。
+    # An unmasked api_key is needed to actually probe with Authorization (the masked value •••
+    # is non-latin-1 and would blow up httpx header encoding with UnicodeEncodeError); the key is
+    # only used to send the request, never returned.
     eff = ro.get_effective(cfg, mask_secrets=False) if cfg else {}
     checks = []
 
-    # DB(同步 engine,丟 threadpool 不佔 loop)
+    # DB (sync engine; offloaded to a threadpool so it doesn't occupy the loop)
     db_status, db_detail, db_ms = await asyncio.to_thread(_probe_db_health)
     checks.append({"name": "Database", "kind": "db", "status": db_status,
                    "detail": db_detail, "latency_ms": db_ms,
                    "endpoint": (getattr(getattr(cfg, "database", None), "url", "") or "").split("@")[-1]})
 
-    # 端點類(embedding / llm / rerank)— 並行探測
+    # Endpoint checks (embedding / llm / rerank) — probed in parallel
     endpoint_specs = [
         ("Embedding", "layers", eff.get("rag.embedding.base_url"), eff.get("rag.embedding.api_key"), True),
         ("LLM", "spark", eff.get("rag.llm.base_url"), eff.get("rag.llm.api_key"), True),
@@ -297,7 +300,7 @@ async def health_check():
         checks.append({"name": name, "kind": icon, "status": status,
                        "detail": detail, "latency_ms": ms, "endpoint": url or ""})
 
-    # ASR(本地權重或雲端設定就緒與否;非 HTTP 探測)
+    # ASR (whether local weights or cloud configuration are ready; not an HTTP probe)
     asr_enabled = bool(eff.get("rag.asr.enabled"))
     asr_provider = eff.get("rag.asr.provider") or "—"
     if not asr_enabled:

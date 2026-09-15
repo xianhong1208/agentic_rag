@@ -6,7 +6,7 @@ from uuid import UUID
 
 
 class FileConfigData(BaseModel):
-    """文件配置信息模型"""
+    """File configuration information model."""
     id: UUID
     folder_id: int
     file_name: str
@@ -19,7 +19,7 @@ class FileConfigData(BaseModel):
     updated_time: datetime
 
 class FileDownloadData(BaseModel):
-    """文件下載專用模型，包含文件內容"""
+    """File-download model, including the file content."""
     id: UUID
     folder_id: int
     file_name: str
@@ -34,7 +34,7 @@ class FileDownloadData(BaseModel):
 
 
 class FolderConfigData(BaseModel):
-    """資料夾信息模型"""
+    """Folder information model."""
     id: int
     name: str
     description: Optional[str] = None
@@ -45,12 +45,13 @@ class FolderConfigData(BaseModel):
     updated_at: datetime
 
 
-# H5: 定義下沉到 domain(src/domain/rag/dto.py);此處 re-export 維持既有 import 路徑。
+# The definitions live in the domain layer (src/domain/rag/dto.py); re-exported
+# here to preserve the existing import path.
 from src.domain.rag.dto import RAGChunkMetadata, RAGSearchResult  # noqa: E402,F401
 
 
 class RAGQueryResult(BaseModel):
-    """RAG 查詢響應模型"""
+    """RAG query response model."""
     query: str
     results: List[RAGSearchResult]
     total_results: int
@@ -58,7 +59,7 @@ class RAGQueryResult(BaseModel):
 
 
 class FileIndexData(BaseModel):
-    """文件索引信息模型"""
+    """File index information model."""
     file_id: UUID
     file_name: str
     folder_id: int

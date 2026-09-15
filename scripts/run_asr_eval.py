@@ -1,19 +1,22 @@
 
-"""BL-02 — ASR 評測跑分:對任一 AsrProvider 跑 golden transcripts,產出 CER 表。
+"""Score ASR evaluation: run golden transcripts through any AsrProvider and produce a CER table.
 
-用法:
-    uv run --no-sync python scripts/run_asr_eval.py                 # config 的 provider
+Usage:
+    uv run --no-sync python scripts/run_asr_eval.py                 # provider from config
     uv run --no-sync python scripts/run_asr_eval.py --provider openai-compatible
     uv run --no-sync python scripts/run_asr_eval.py --baseline evals/baselines/asr_xxx.json
 
-素材(見 evals/README.md):
+Material (see evals/README.md):
     evals/asr/audio/<name>.{wav,mp3,m4a,aac,ogg,flac}
-    evals/asr/golden_transcripts/<name>.txt     # 人工校對繁中全文
+    evals/asr/golden_transcripts/<name>.txt     # human-proofread Traditional-Chinese transcript
 
-指標:CER(字元錯誤率,去標點空白)、簡體字比率(繁中驗收 ≈0)、
-幻覺 pattern 命中數(audio_defense)、耗時。
-評測對象 = provider 原始輸出(不含前導靜音裁切/幻覺過濾 — 那是生產防禦層,
-幻覺數在此以「過濾器命中計數」呈現,供模型間比較)。
+Metrics: CER (character error rate, punctuation/whitespace stripped), simplified
+-character ratio (~0 for valid Traditional Chinese), hallucination-pattern match
+count (audio_defense), and elapsed time.
+Evaluated on the provider's raw output (no leading-silence trimming or
+hallucination filtering — those are the production defense layer; here the
+hallucination count is reported as the filter's match count for cross-model
+comparison).
 """
 
 from __future__ import annotations
@@ -36,8 +39,8 @@ _AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"}
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--provider", help="覆蓋 config 的 rag.asr.provider")
-    ap.add_argument("--baseline", help="與既有基線 JSON 比較")
+    ap.add_argument("--provider", help="override rag.asr.provider from config")
+    ap.add_argument("--baseline", help="compare against an existing baseline JSON")
     ap.add_argument("--config", default="config/config.yaml")
     args = ap.parse_args()
 
@@ -48,11 +51,11 @@ def main() -> int:
             if g.is_file():
                 pairs.append((f, g))
             else:
-                print(f"⚠️  {f.name} 無對應 golden_transcripts/{f.stem}.txt — 跳過")
+                print(f"WARNING: {f.name} has no matching golden_transcripts/{f.stem}.txt — skipping")
     if not pairs:
-        print("❌ 無評測素材。請放置:")
+        print("No eval material. Please provide:")
         print(f"   {AUDIO_DIR.relative_to(REPO)}/<name>.wav|mp3|m4a|aac|ogg|flac")
-        print(f"   {GOLDEN_DIR.relative_to(REPO)}/<name>.txt(人工校對繁中全文)")
+        print(f"   {GOLDEN_DIR.relative_to(REPO)}/<name>.txt (human-proofread Traditional-Chinese transcript)")
         return 2
 
     from src.config.config_manager import Config
@@ -70,7 +73,7 @@ def main() -> int:
     provider = create_asr_provider(asr_cfg)
     provider_name = asr_cfg.provider if asr_cfg else "docling-whisper"
     if not provider.available():
-        print(f"❌ provider '{provider_name}' 不可服務(模型/端點未就緒)")
+        print(f"provider '{provider_name}' not available (model/endpoint not ready)")
         return 2
 
     rows = []
@@ -88,13 +91,15 @@ def main() -> int:
             "elapsed_s": round(elapsed, 1),
             "ref_chars": len(ref),
             "hyp_chars": len(result.text),
-            # 全文入基線:事後可做誤差歸因(如「假設後掛 s2twp 重算 CER」
-            # 隔離簡繁字形 vs 真字錯)而不用重跑轉錄
+            # Store full text in the baseline so error attribution can be done
+            # later (e.g. recompute CER with s2twp appended, to separate
+            # simplified/traditional glyph differences from real character
+            # errors) without rerunning transcription
             "ref": ref.strip(),
             "hyp": result.text.strip(),
         })
-        print(f"  {audio.name}: CER={rows[-1]['cer']:.2%} 簡體率={rows[-1]['simplified_ratio']:.2%} "
-              f"幻覺={n_halluc} {elapsed:.1f}s")
+        print(f"  {audio.name}: CER={rows[-1]['cer']:.2%} simplified={rows[-1]['simplified_ratio']:.2%} "
+              f"hallucinations={n_halluc} {elapsed:.1f}s")
 
     summary = {
         "provider": provider_name,
@@ -107,14 +112,14 @@ def main() -> int:
     out = BASELINE_DIR / f"asr_{provider_name}_{date.today().isoformat()}.json"
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n== {provider_name} ==  avg CER {summary['avg_cer']:.2%} | "
-          f"簡體率 {summary['avg_simplified_ratio']:.2%} | 幻覺 {summary['total_hallucinations']}")
-    print(f"基線寫入:{out.relative_to(REPO)}")
+          f"simplified {summary['avg_simplified_ratio']:.2%} | hallucinations {summary['total_hallucinations']}")
+    print(f"baseline written: {out.relative_to(REPO)}")
 
     if args.baseline:
         base = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
         d = summary["avg_cer"] - base["avg_cer"]
-        print(f"vs {base['provider']}({base['date']}):CER {base['avg_cer']:.2%} → "
-              f"{summary['avg_cer']:.2%}({'+' if d >= 0 else ''}{d:.2%})")
+        print(f"vs {base['provider']} ({base['date']}): CER {base['avg_cer']:.2%} → "
+              f"{summary['avg_cer']:.2%} ({'+' if d >= 0 else ''}{d:.2%})")
     return 0
 
 

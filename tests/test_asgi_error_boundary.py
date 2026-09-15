@@ -1,16 +1,12 @@
 
-"""M15 後半 — 最外層 ASGI 錯誤邊界。
+"""Outermost ASGI error boundary.
 
-背景:error handlers 註冊在內層 FastAPI,但 SelectiveAuthMiddleware /
-RequestIdMiddleware 是包在 FastAPI **外面**的純 ASGI wrapper —— middleware
-自身的未預期例外會冒過 FastAPI 直達 ASGI server,client 拿到裸 500/斷線,
-無統一 JSON、無日誌關聯。ASGIErrorBoundary 補上最外層的 catch-all。
-
-契約:
-1. 正常請求透傳,不動 response
-2. 回應開始前炸 → 500 + 統一 JSON(格式對齊 error_handler.generic_exception_handler)
-3. 回應已開始才炸 → re-raise(headers 已送出,無法補救;讓 server 斷連是正確行為)
-4. 非 http scope(lifespan/websocket)不包 — 原樣透傳
+Middleware runs outside FastAPI, so an exception there bubbles past FastAPI's
+handlers to the ASGI server as a bare 500. ASGIErrorBoundary is the outermost
+catch-all. Contract: normal requests pass through untouched; an exception
+before the response starts becomes a 500 with unified JSON; an exception after
+the response started re-raises (headers already sent); non-http scopes
+(lifespan/websocket) pass through unwrapped.
 """
 
 import pytest
@@ -53,7 +49,7 @@ def test_unified_json_500_when_exception_before_response_start():
     r = client.get("/api/some/path")
     assert r.status_code == 500
     body = r.json()
-    # 格式對齊 error_handler.generic_exception_handler
+    # Format aligned with error_handler.generic_exception_handler
     assert body["error"] == "INTERNAL_SERVER_ERROR"
     assert "message" in body and "timestamp" in body
     assert body["path"] == "/api/some/path"
@@ -61,14 +57,14 @@ def test_unified_json_500_when_exception_before_response_start():
 
 
 def test_reraise_when_response_already_started():
-    """headers 已送出無法補救 — 必須 re-raise,不得嘗試二次回應。"""
+    """Headers already sent, unrecoverable -- must re-raise, must not attempt a second response."""
     client = TestClient(ASGIErrorBoundary(_boom_after_start()))
     with pytest.raises(RuntimeError, match="boom mid-stream"):
         client.get("/x")
 
 
 async def test_non_http_scope_not_wrapped():
-    """lifespan 等非 http scope 原樣透傳(異常照冒,不被包成 http 回應)。"""
+    """Non-http scopes like lifespan pass through as-is (exceptions still bubble, not wrapped into an http response)."""
     captured = {}
 
     async def inner(scope, receive, send):
@@ -82,7 +78,7 @@ async def test_non_http_scope_not_wrapped():
 
 
 async def test_non_http_scope_passthrough_on_success():
-    """非 http scope 正常完成:原樣透傳、不加工。"""
+    """Non-http scope completes normally: passed through as-is, no processing."""
     seen = {}
 
     async def inner(scope, receive, send):

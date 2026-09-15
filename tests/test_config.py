@@ -1,8 +1,7 @@
-"""Unit tests for src/config (model.py + config_manager.py)
+"""Unit tests for src/config (model.py + config_manager.py).
 
-不依賴 DB / vLLM / 任何外部服務 — 純邏輯測試。
-YAML 一律寫進 pytest tmp_path;路徑驗證靠 monkeypatch.chdir 控制基準目錄。
-跑法:cd agentic_rag && uv run pytest tests/test_config.py -v
+Pure logic; YAML is written to tmp_path and monkeypatch.chdir sets the path
+validation base directory.
 """
 
 import pytest
@@ -27,13 +26,11 @@ from src.config.model import (
 from src.config.config_manager import Config, get_config
 
 
-# ---------------------------------------------------------------------------
-# 共用 fixture / helpers
-# ---------------------------------------------------------------------------
+# Shared fixtures / helpers
 
 @pytest.fixture(autouse=True)
 def _reset_config_state():
-    """每個 test 前後重置 Config 類別層級狀態,避免測試間互相污染"""
+    """Reset Config class-level state before and after each test, to avoid cross-test pollution"""
     Config._config = {}
     Config._config_model = None
     Config._module_configs = {}
@@ -71,18 +68,16 @@ modules:
 
 
 def _write_config(tmp_path, monkeypatch, text, name="config.yaml"):
-    """把 YAML 寫進 tmp_path 並 chdir 過去(讓路徑白名單以 tmp_path 為基準)"""
+    """Write the YAML into tmp_path and chdir there (so the path allowlist is based on tmp_path)"""
     monkeypatch.chdir(tmp_path)
     (tmp_path / name).write_text(text, encoding="utf-8")
     return name
 
 
-# ---------------------------------------------------------------------------
-# config/model.py — 代表性 Pydantic models
-# ---------------------------------------------------------------------------
+# config/model.py -- representative Pydantic models
 
 def test_server_config_required_and_coercion():
-    """ServerConfig 必填齊全可建立,port 字串自動轉 int (TC-config-01)"""
+    """ServerConfig builds with all required fields; a string port is auto-coerced to int (TC-config-01)"""
     cfg = ServerConfig(host="0.0.0.0", port="8080", transport="sse")
     assert cfg.host == "0.0.0.0"
     assert cfg.port == 8080
@@ -90,7 +85,7 @@ def test_server_config_required_and_coercion():
 
 
 def test_server_config_missing_required():
-    """ServerConfig 缺 host/port/transport 任一必填 → ValidationError (TC-config-02)"""
+    """ServerConfig missing any of the required host/port/transport -> ValidationError (TC-config-02)"""
     with pytest.raises(ValidationError) as exc_info:
         ServerConfig(host="0.0.0.0")
     missing = {e["loc"][0] for e in exc_info.value.errors()}
@@ -98,7 +93,7 @@ def test_server_config_missing_required():
 
 
 def test_database_config_optional_defaults():
-    """DatabaseConfig 的 host/port/database/user/password 預設 None (TC-config-03)"""
+    """DatabaseConfig host/port/database/user/password default to None (TC-config-03)"""
     cfg = DatabaseConfig(
         url="sqlite://", echo=False, pool_size=5,
         max_overflow=10, pool_timeout=30, pool_recycle=3600,
@@ -111,7 +106,7 @@ def test_database_config_optional_defaults():
 
 
 def test_auth_config_defaults():
-    """AuthConfig 只給 enabled,其餘連線設定用預設值 (TC-config-04)"""
+    """AuthConfig with only enabled given; the rest of the connection settings use defaults (TC-config-04)"""
     cfg = AuthConfig(enabled=True)
     assert cfg.token_server_url is None
     assert cfg.cache_ttl == 60
@@ -121,22 +116,23 @@ def test_auth_config_defaults():
 
 
 def test_auth_config_missing_enabled():
-    """AuthConfig 缺必填 enabled → ValidationError (TC-config-05)"""
+    """AuthConfig missing required enabled -> ValidationError (TC-config-05)"""
     with pytest.raises(ValidationError):
         AuthConfig()
 
 
 def test_dynamic_tools_config_default_disabled():
-    """DynamicToolsConfig.enabled 預設 False (TC-config-06)"""
+    """DynamicToolsConfig.enabled defaults to False (TC-config-06)"""
     assert DynamicToolsConfig().enabled is False
 
 
 def test_app_config_all_defaults():
-    """AppConfig 無參數建立時使用全部預設值 (TC-config-07)"""
+    """AppConfig built with no arguments uses all defaults (TC-config-07)"""
     cfg = AppConfig()
     assert cfg.name == "Agentic RAG"
-    # version 欄位已自 AppConfig 移除 — 版本唯一來源是 pyproject.toml
-    # (src/version.py get_version()),config 不再攜帶版本避免雙源漂移
+    # The version field was removed from AppConfig -- the single source of the
+    # version is pyproject.toml (src/version.py get_version()); config no longer
+    # carries the version, to avoid dual-source drift
     assert not hasattr(cfg, "version")
     assert cfg.title == "Agentic RAG MCP Server"
     assert cfg.lifespan is None
@@ -144,7 +140,7 @@ def test_app_config_all_defaults():
 
 
 def test_rag_chunking_config_defaults():
-    """RAGChunkingConfig 平面欄位預設 None,max_chunk_size=2000、chunk_overlap=50 (TC-config-08)"""
+    """RAGChunkingConfig flat fields default to None; max_chunk_size=2000, chunk_overlap=50 (TC-config-08)"""
     cfg = RAGChunkingConfig()
     assert cfg.default_chunk_size is None
     assert cfg.default_overlap is None
@@ -154,20 +150,20 @@ def test_rag_chunking_config_defaults():
 
 
 def test_auto_merging_config_defaults():
-    """AutoMergingConfig 預設 enabled=True、merge_threshold=0.5 (TC-config-09)"""
+    """AutoMergingConfig defaults enabled=True, merge_threshold=0.5 (TC-config-09)"""
     cfg = AutoMergingConfig()
     assert cfg.enabled is True
     assert cfg.merge_threshold == 0.5
 
 
 def test_rag_retrieval_config_required_and_defaults():
-    """RAGRetrievalConfig 必填三欄 + 其餘預設(sparse 12 / alpha 0.75 / jiebacfg 等) (TC-config-10)"""
+    """RAGRetrievalConfig three required fields + the rest defaulted (sparse 12 / alpha 0.75 / simple, etc.) (TC-config-10)"""
     cfg = RAGRetrievalConfig(
         default_top_k=10, default_similarity_cutoff=0.25, hybrid_search=True,
     )
     assert cfg.default_sparse_top_k == 12
     assert cfg.default_hybrid_alpha == 0.75
-    assert cfg.text_search_config == "jiebacfg"
+    assert cfg.text_search_config == "simple"
     assert cfg.return_resource_files is False
     assert cfg.auto_merging is None
     assert cfg.expand_context_default is True
@@ -175,7 +171,7 @@ def test_rag_retrieval_config_required_and_defaults():
 
 
 def test_contextual_retrieval_config_defaults():
-    """ContextualRetrievalConfig 預設 enabled=False、apply_to='all' (TC-config-11)"""
+    """ContextualRetrievalConfig defaults enabled=False, apply_to='all' (TC-config-11)"""
     cfg = ContextualRetrievalConfig()
     assert cfg.enabled is False
     assert cfg.max_context_length == 150
@@ -184,7 +180,7 @@ def test_contextual_retrieval_config_defaults():
 
 
 def test_rerank_config_defaults():
-    """RerankConfig 預設 disabled、bge-reranker 模型、threshold 0.0 (TC-config-12)"""
+    """RerankConfig defaults disabled, bge-reranker model, threshold 0.0 (TC-config-12)"""
     cfg = RerankConfig()
     assert cfg.enabled is False
     assert cfg.model == "BAAI/bge-reranker-v2-m3"
@@ -194,10 +190,11 @@ def test_rerank_config_defaults():
 
 
 def test_indexing_config_defaults():
-    """IndexingConfig 預設 100 併發 / 10 天單檔 / 10 天 job 上限 (TC-config-13)
+    """IndexingConfig defaults: high concurrency / 10-day per-file / 10-day job cap (TC-config-13)
 
-    timeout 預設 2026-08 從 1800s/21600s 放寬到 10 天(慢機台大檔 OCR;
-    watchdog 誤判由 keepalive 60s 心跳兜底)。
+    The timeout defaults were relaxed to 10 days (for OCR of large files on slow
+    machines; watchdog false positives are backstopped by a 60s keepalive
+    heartbeat).
     """
     cfg = IndexingConfig()
     assert cfg.max_concurrent_jobs == 4
@@ -206,7 +203,7 @@ def test_indexing_config_defaults():
 
 
 def test_rag_config_nested_assembly():
-    """RAGConfig 用巢狀 dict 組裝子 models,optional 子項預設 None (TC-config-14)"""
+    """RAGConfig assembles sub-models from nested dicts; optional sub-items default to None (TC-config-14)"""
     cfg = RAGConfig(
         embedding={"provider": "vllm", "model": "bge-m3", "dimension": 1024},
         chunking={"hierarchy_sizes": [1024, 256]},
@@ -230,7 +227,7 @@ def test_rag_config_nested_assembly():
 
 
 def test_config_model_full_tree():
-    """ConfigModel 主樹從巢狀 dict 組裝成功,rag 預設 None (TC-config-15)"""
+    """ConfigModel main tree assembles from nested dicts; rag defaults to None (TC-config-15)"""
     cfg = ConfigModel(
         server={"host": "h", "port": 1, "transport": "sse"},
         database={
@@ -251,7 +248,7 @@ def test_config_model_full_tree():
 
 
 def test_config_model_missing_section():
-    """ConfigModel 缺 server 區塊 → ValidationError (TC-config-16)"""
+    """ConfigModel missing the server section -> ValidationError (TC-config-16)"""
     with pytest.raises(ValidationError) as exc_info:
         ConfigModel(
             database={
@@ -270,71 +267,68 @@ def test_config_model_missing_section():
 
 
 def test_modules_config_extra_allowed():
-    """ModulesConfig extra='allow':額外模組區塊被保留不報錯 (TC-config-17)"""
+    """ModulesConfig extra='allow': extra module sections are preserved without error (TC-config-17)"""
     cfg = ModulesConfig(enabled=["demo"], demo={"description": "x"})
     assert cfg.enabled == ["demo"]
     assert cfg.model_dump()["demo"] == {"description": "x"}
 
 
-# ---------------------------------------------------------------------------
-# config/config_manager.py — _validate_config_path
-# ---------------------------------------------------------------------------
+# config/config_manager.py -- _validate_config_path
 
 def test_validate_config_path_allows_relative_paths(tmp_path, monkeypatch):
-    """cwd 下的相對路徑(根層 / config/ / 子目錄)都通過驗證 (TC-config-18)"""
+    """Relative paths under cwd (root level / config/ / subdirectory) all pass validation (TC-config-18)"""
     monkeypatch.chdir(tmp_path)
     assert Config._validate_config_path("config.yaml").name == "config.yaml"
     assert Config._validate_config_path("config/app.yaml").name == "app.yaml"
-    # ALLOWED_CONFIG_DIRS 含 "." → cwd 下任意子路徑都允許
+    # ALLOWED_CONFIG_DIRS includes "." -> any subpath under cwd is allowed
     assert Config._validate_config_path("sub/dir/x.yml").suffix == ".yml"
 
 
 def test_validate_config_path_rejects_traversal(tmp_path, monkeypatch):
-    """../ 路徑穿越到 cwd 之外 → ValueError (TC-config-19)"""
+    """../ path traversal outside cwd -> ValueError (TC-config-19)"""
     monkeypatch.chdir(tmp_path)
     with pytest.raises(ValueError, match="outside the allowed base directory"):
         Config._validate_config_path("../evil.yaml")
 
 
 def test_validate_config_path_rejects_absolute_outside(tmp_path, monkeypatch):
-    """cwd 之外的絕對路徑 → ValueError (TC-config-20)"""
+    """An absolute path outside cwd -> ValueError (TC-config-20)"""
     monkeypatch.chdir(tmp_path)
     with pytest.raises(ValueError, match="outside the allowed base directory"):
         Config._validate_config_path("/etc/passwd.yaml")
 
 
 def test_validate_config_path_rejects_bad_extension(tmp_path, monkeypatch):
-    """非 .yaml/.yml 副檔名 → ValueError (TC-config-21)"""
+    """A non-.yaml/.yml extension -> ValueError (TC-config-21)"""
     monkeypatch.chdir(tmp_path)
     with pytest.raises(ValueError, match="extension"):
         Config._validate_config_path("config.txt")
 
 
-# ---------------------------------------------------------------------------
-# config/config_manager.py — get_config / set_config 生命週期
-# ---------------------------------------------------------------------------
+# config/config_manager.py -- get_config / set_config lifecycle
 
 def test_get_config_valid_yaml(tmp_path, monkeypatch):
-    """合法 YAML → 回傳 ConfigModel,getters 可取得各區塊 (TC-config-22)"""
+    """Valid YAML -> returns a ConfigModel, getters can access each section (TC-config-22)"""
     name = _write_config(tmp_path, monkeypatch, VALID_YAML)
     model = get_config(name)
     assert isinstance(model, ConfigModel)
     assert model.server.port == 8080
     assert model.app.name == "TestApp"
-    # class-level getters 與便利函數一致
+    # class-level getters agree with the convenience functions
     assert Config.get_server_config().host == "127.0.0.1"
     assert Config.get_auth_config().enabled is False
-    assert Config.get_auth_config().cache_ttl == 60  # AuthConfig 預設值補齊
+    assert Config.get_auth_config().cache_ttl == 60  # AuthConfig default filled in
     assert Config.get_logging_config().level == "INFO"
     assert Config.get_modules_config().enabled == []
     assert Config.get_config()["server"]["port"] == 8080
 
 
 def test_get_config_env_var_placeholder_not_expanded(tmp_path, monkeypatch):
-    """`${VAR:-default}` 佔位符不做環境變數展開,保留字面值 (TC-config-23)
+    """The `${VAR:-default}` placeholder is not env-var-expanded; the literal value is kept (TC-config-23)
 
-    原始碼只用 yaml.safe_load,沒有任何 expandvars/envsubst 邏輯;
-    即使環境變數有設定,載入結果仍是原字串。此測試固定住現行行為。
+    The source only uses yaml.safe_load, with no expandvars/envsubst logic; even
+    if the env var is set, the loaded result is still the original string. This
+    test pins down the current behavior.
     """
     monkeypatch.setenv("TEST_DB_URL", "postgresql://real/db")
     yaml_text = VALID_YAML.replace(
@@ -347,25 +341,26 @@ def test_get_config_env_var_placeholder_not_expanded(tmp_path, monkeypatch):
 
 
 def test_get_config_invalid_schema_returns_none(tmp_path, monkeypatch):
-    """YAML 缺必填 section(Pydantic 驗證失敗)→ get_config 回 None (TC-config-24)"""
+    """YAML missing a required section (Pydantic validation fails) -> get_config returns None (TC-config-24)"""
     name = _write_config(tmp_path, monkeypatch, "server:\n  host: only-host\n")
     assert get_config(name) is None
     assert Config.get_config_model() is None
 
 
 def test_get_config_malformed_yaml_returns_none(tmp_path, monkeypatch):
-    """YAML 語法錯誤 → 內部吞掉、_config 清空、回 None (TC-config-25)"""
+    """YAML syntax error -> swallowed internally, _config cleared, returns None (TC-config-25)"""
     name = _write_config(tmp_path, monkeypatch, "server: [unclosed\n  :::")
     assert get_config(name) is None
     assert Config.get_config() == {}
 
 
 def test_get_config_missing_file_returns_none(tmp_path, monkeypatch):
-    """檔案不存在 → 回 None(FileNotFoundError 被 _load_config 的 catch-all 吞掉) (TC-config-26)
+    """File does not exist -> returns None (the FileNotFoundError is swallowed by _load_config's catch-all) (TC-config-26)
 
-    註:_load_config docstring 宣稱會 raise FileNotFoundError,但實作中
-    raise 在 try 區塊內、被 `except Exception` 捕捉,實際不會外拋。
-    本測試固定住現行(實際)行為。
+    Note: the _load_config docstring claims it raises FileNotFoundError, but in
+    the implementation the raise is inside a try block and caught by
+    `except Exception`, so it never actually propagates. This test pins down the
+    current (actual) behavior.
     """
     monkeypatch.chdir(tmp_path)
     assert get_config("no_such_file.yaml") is None
@@ -373,7 +368,7 @@ def test_get_config_missing_file_returns_none(tmp_path, monkeypatch):
 
 
 def test_set_config_loads_enabled_module_configs(tmp_path, monkeypatch):
-    """enabled 模組的詳細配置進安全字典,get_module_model 可取;未啟用回 None (TC-config-27)"""
+    """An enabled module's detailed config goes into the safe dict, retrievable via get_module_model; a disabled one returns None (TC-config-27)"""
     yaml_text = VALID_YAML.replace(
         "modules:\n  enabled: []\n",
         "modules:\n"
@@ -397,7 +392,7 @@ def test_set_config_loads_enabled_module_configs(tmp_path, monkeypatch):
 
 
 def test_set_config_skips_invalid_module_config(tmp_path, monkeypatch):
-    """單一模組配置缺必填欄位 → 該模組被跳過,主 config 仍載入成功 (TC-config-28)"""
+    """A single module config missing required fields -> that module is skipped, the main config still loads successfully (TC-config-28)"""
     yaml_text = VALID_YAML.replace(
         "modules:\n  enabled: []\n",
         "modules:\n"
@@ -407,12 +402,12 @@ def test_set_config_skips_invalid_module_config(tmp_path, monkeypatch):
     )
     name = _write_config(tmp_path, monkeypatch, yaml_text)
     Config.set_config(name)
-    assert Config.get_config_model() is not None  # 主 config 成功
-    assert Config.get_module_model("broken") is None  # 壞模組被跳過
+    assert Config.get_config_model() is not None  # main config succeeded
+    assert Config.get_module_model("broken") is None  # the broken module was skipped
 
 
 def test_getters_return_none_before_load():
-    """尚未載入 config(model 為 None)時所有 getters 回 None (TC-config-29)"""
+    """Before config is loaded (model is None), all getters return None (TC-config-29)"""
     assert Config.get_config_model() is None
     assert Config.get_server_config() is None
     assert Config.get_database_config() is None
@@ -424,7 +419,7 @@ def test_getters_return_none_before_load():
 
 
 def test_config_path_outside_allowed_dirs_rejected(tmp_path):
-    """config 路徑安全檢查:允許目錄之外的路徑一律 ValueError(路徑穿越防禦)。"""
+    """Config path safety check: any path outside the allowed dirs raises ValueError (path-traversal defense)."""
     evil = tmp_path / "evil.yaml"
     evil.write_text("server: {}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Security Error"):
@@ -432,16 +427,17 @@ def test_config_path_outside_allowed_dirs_rejected(tmp_path):
 
 
 def test_asr_config_defaults():
-    """AsrConfig 最小欄位集:enabled + provider + 雲端三欄,別的沒有 (TC-config-16)
+    """AsrConfig minimal field set: enabled + provider + the three cloud fields, nothing else (TC-config-16)
 
-    刻意瘦身:每個 config 欄位都是永久維護面;裁切/過濾程式內恆開,
-    FireRedASR 專用欄位等 BL-08 實作再加。"""
+    Deliberately lean: every config field is a permanent maintenance surface;
+    trimming/filtering is always on in code, and FireRedASR-specific fields are
+    added only when BL-08 is implemented."""
     from src.config.model import AsrConfig
     cfg = AsrConfig()
     assert cfg.enabled is True
     assert cfg.provider == "docling-whisper"
     assert cfg.base_url is None and cfg.api_key is None and cfg.model is None
-    # 守住瘦身:不得偷偷長回被砍掉的欄位
+    # Guard the lean set: the removed fields must not quietly grow back
     assert set(AsrConfig.model_fields) == {"enabled", "provider", "base_url", "api_key", "model"}
 
 
@@ -454,7 +450,7 @@ _RAG_REQUIRED = dict(
 
 
 def test_rag_config_asr_nested_assembly():
-    """RAGConfig 巢狀組裝 asr 段;未給時預設 None(向下相容)(TC-config-17)"""
+    """RAGConfig nested assembly of the asr section; defaults to None when omitted (backward compat) (TC-config-17)"""
     from src.config.model import AsrConfig
     cfg = RAGConfig(
         **_RAG_REQUIRED,

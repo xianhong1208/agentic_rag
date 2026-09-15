@@ -1,18 +1,22 @@
 
-"""自定義 FastMCP 類,實現基於 token 的工具權限過濾
+"""Custom FastMCP subclass implementing per-token tool permission filtering.
 
-FastMCP v3.x 的 list_tools 機制:
+FastMCP v3.x list_tools mechanism:
   - public method: `async def list_tools(*, run_middleware: bool = True)`
-  - 當 run_middleware=True(預設,client 真實呼叫時):
-        會把控制權交給 middleware chain,最後 call_next 又叫
-        `self.list_tools(run_middleware=False)` 拿底層真正工具列表
-  - 當 run_middleware=False:跳過 middleware,實際從 provider 拿 tools
+  - run_middleware=True (default, on a real client call): control passes to the
+        middleware chain, and call_next eventually invokes
+        `self.list_tools(run_middleware=False)` to fetch the real underlying
+        tool list.
+  - run_middleware=False: skips middleware and actually fetches tools from the
+        provider.
 
-我們要過濾在 run_middleware=False 階段做 — 那是最內層、middleware 看不到的地方,
-也是 FastMCP 真正把 list 包進 response 前最後一道。
+Filtering happens in the run_middleware=False stage — the innermost point that
+middleware cannot see, and the last step before FastMCP wraps the list into the
+response.
 
-舊版實作走的 `_list_tools` 是 FastMCP v2 的 API,在 v3 不存在,所以
-override 沒生效,每個 token 都看到全部工具 — 這正是你遇到的問題。
+Note: FastMCP v2's `_list_tools` API does not exist in v3, so overriding it has
+no effect and every token sees all tools; overriding the public method here is
+the correct v3 approach.
 """
 
 from collections.abc import Sequence
@@ -27,6 +31,7 @@ from fastmcp.server.dependencies import get_http_request
 from db.folderdb import FolderDB
 from src.log import get_api_logger, mask_token
 from src.auth.dependencies import get_remote_verifier_instance
+from src.auth.owner_key import owner_key_from_bearer
 from src.fastmcp_tools.dynamic_tool_manager import DynamicToolManager
 
 if TYPE_CHECKING:
@@ -44,66 +49,71 @@ _filter_cache: "TTLCache[str, list]" = TTLCache(maxsize=_FILTER_CACHE_MAX, ttl=_
 
 
 class AuthFilteredFastMCP(FastMCP):
-    """擴展 FastMCP 以支援基於 token 的工具過濾
+    """Extend FastMCP to support per-token tool filtering.
 
-    每個 token 只能看到自己有權限的 folder 對應的 MCP tools。
+    Each token only sees the MCP tools for folders it is authorized to access.
     """
 
     def _is_dynamic_folder_tool(self, tool_name: str) -> bool:
-        """判斷工具是否為動態註冊的 per-folder 工具。
+        """Determine whether a tool is a dynamically registered per-folder tool.
 
-        正規:查 DynamicToolManager.registered_tools;備援:看名稱前綴(Agentic_)。
+        Primary: check DynamicToolManager.registered_tools. Fallback: check the
+        name prefix (Agentic_).
 
         Args:
-            tool_name: 工具名稱。
+            tool_name: Tool name.
 
         Returns:
-            True = 動態工具(應走 ACL filter);False = 全域工具。
+            True = dynamic tool (should go through the ACL filter); False = global tool.
         """
         try:
             manager = DynamicToolManager.get_instance()
             if tool_name in manager.get_registered_tools():
                 return True
-            # 備援:某些 agentic_rag 部署環境 prefix 可能不一致
+            # Fallback: the prefix may be inconsistent in some agentic_rag deployments
             return tool_name.startswith("Agentic_")
         except Exception:
             return tool_name.startswith("Agentic_")
 
-    # ============================================================================
-    # FastMCP v3.x 的正確 override 位置 — public method `list_tools`
-    # ============================================================================
+    # Correct override point for FastMCP v3.x is the public method `list_tools`
     async def list_tools(self, *, run_middleware: bool = True) -> "Sequence[Tool]":
-        """list_tools override ─ 在 middleware 內層套 per-token ACL(避免雙層過濾)。
+        """list_tools override — apply the per-token ACL at the inner middleware
+        layer (to avoid double filtering).
 
-        FastMCP 兩層呼叫:run_middleware=True 是 client 入口,遞迴會再 call 一次 False;
-        我們只在 False 那層套 ACL,確保 middleware 看到已過濾結果,且不重複跑 filter。
+        FastMCP calls in two layers: run_middleware=True is the client entry
+        point, which recurses into a run_middleware=False call. The ACL is
+        applied only in the False layer so middleware sees the already-filtered
+        result and the filter does not run twice.
 
         Args:
-            run_middleware: True = 入口層(走 middleware chain);False = 實際 fetch。
+            run_middleware: True = entry layer (runs the middleware chain);
+                False = the actual fetch.
 
         Returns:
-            過濾後的工具 list(該 token 看得到的)。
+            The filtered tool list (what the token can see).
         """
-        # 先讓 FastMCP 跑完它的 middleware / transforms / visibility 邏輯
+        # Let FastMCP finish its middleware / transforms / visibility logic first
         tools = await super().list_tools(run_middleware=run_middleware)
 
-        # 只在最內層 fetch 階段套 ACL,避免兩次過濾
+        # Apply the ACL only in the innermost fetch stage to avoid filtering twice
         if not run_middleware:
             tools = await self._apply_token_filter(list(tools))
 
         return tools
 
     async def _apply_token_filter(self, all_tools: list) -> list:
-        """依當前 request 的 token 過濾工具列表(帶 TTL cache)。
+        """Filter the tool list by the current request's token (with a TTL cache).
 
-        沒 token → 只回靜態工具。有效 token → 對每動態工具檢查 ACL + 注入 folder description。
-        cache 走 _filter_cache (60s TTL,DynamicToolManager 註冊變更 bump version 自動 invalidate)。
+        No token -> return only static tools. Valid token -> check the ACL for
+        each dynamic tool and inject the folder description. The cache is
+        _filter_cache (60s TTL; a DynamicToolManager registration change bumps
+        the version and auto-invalidates it).
 
         Args:
-            all_tools: 全部已註冊工具的 list。
+            all_tools: The list of all registered tools.
 
         Returns:
-            過濾後 + description 已注入的工具 list。
+            The filtered tool list with descriptions injected.
         """
         _remote_verifier = get_remote_verifier_instance()
 
@@ -137,15 +147,20 @@ class AuthFilteredFastMCP(FastMCP):
                 api_logger.warning(f"list_tools invalid token: {mask_token(token)}")
                 return [t for t in all_tools if not self._is_dynamic_folder_tool(t.name)]
 
-            # 找出該 token 可看到的 per-folder 工具
+            # Ownership is keyed on the token's owner key (jti), not the raw token —
+            # folders and the tool mapping are stored under that key (see acl.py /
+            # register_folder_tool), so the lookups below must use it too.
+            owner_key = owner_key_from_bearer(token)
+
+            # Determine the per-folder tools this token can see
             try:
                 manager = DynamicToolManager.get_instance()
-                user_folders = FolderDB.get(user_token=token)
+                user_folders = FolderDB.get(user_token=owner_key)
                 allowed: set = set()
                 if user_folders:
                     for folder in user_folders:
                         tool_name = manager._token_folder_to_tool.get(
-                            f"{token}:{folder.name}"
+                            f"{owner_key}:{folder.name}"
                         )
                         if tool_name:
                             allowed.add(tool_name)
@@ -153,7 +168,7 @@ class AuthFilteredFastMCP(FastMCP):
                 api_logger.error(f"Error getting allowed tools for token: {e}")
                 allowed = set()
 
-            # 過濾 + 注入 per-token folder description
+            # Filter and inject the per-token folder description
             filtered: list = []
             for tool in all_tools:
                 if not self._is_dynamic_folder_tool(tool.name):
@@ -162,10 +177,10 @@ class AuthFilteredFastMCP(FastMCP):
                 if tool.name not in allowed:
                     continue
 
-                # 動態注入該 token 的 folder description
+                # Dynamically inject this token's folder description
                 folder_name = manager.get_folder_name_from_tool(tool.name)
                 if folder_name:
-                    folder_desc = manager.get_folder_description_for_token(folder_name, token)
+                    folder_desc = manager.get_folder_description_for_token(folder_name, owner_key)
                     if folder_desc:
                         new_desc = f"{tool.description}\n\n資料夾說明:{folder_desc}"
                         tool = tool.model_copy(update={"description": new_desc})
@@ -181,5 +196,5 @@ class AuthFilteredFastMCP(FastMCP):
         except Exception as e:
             api_logger.error(f"Error in list_tools filtering: {e}")
             traceback.print_exc()
-            # 安全保底:任何例外都隱藏所有動態工具
+            # Fail-safe: on any exception, hide all dynamic tools
             return [t for t in all_tools if not self._is_dynamic_folder_tool(t.name)]

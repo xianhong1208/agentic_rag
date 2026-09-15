@@ -1,19 +1,15 @@
+"""Outermost ASGI error boundary.
 
-"""最外層 ASGI 錯誤邊界(M15 後半)。
+The FastAPI exception handlers are registered on the inner app, but the auth /
+request-id middleware wrap outside FastAPI, so an unexpected exception from the
+middleware itself bubbles past FastAPI to the ASGI server, leaving the client
+with a bare 500 and no consistent JSON format. This wrapper sits at the very
+outermost layer as the final catch-all:
 
-問題:error handlers(error_handler.register_error_handlers)註冊在內層
-FastAPI,但 SelectiveAuthMiddleware / RequestIdMiddleware 包在 FastAPI
-**外面** —— middleware 自身的未預期例外會冒過 FastAPI 直達 ASGI server,
-client 拿到裸 500 / 斷線,無統一 JSON 格式。
-
-此 wrapper 放在整個 ASGI stack 的最外層,是最後一道 catch-all:
-- 回應尚未開始:log 完整 traceback,回統一 JSON 500(格式對齊
-  error_handler.generic_exception_handler,不外洩內部細節)
-- 回應已開始(headers 已送):無法補救,re-raise 讓 server 斷連 — 標準行為
-- 非 http scope(lifespan / websocket):不包,原樣透傳
-
-正常請求零開銷(只多一層 send 包裝);FastAPI 內部的例外仍由內層
-exception handlers 處理,不會落到這裡。
+- Response not yet started: log the traceback and return a consistent JSON 500
+  (aligned with error_handler.generic_exception_handler; no internal details).
+- Response already started: unrecoverable, re-raise so the server drops the connection.
+- Non-http scope (lifespan / websocket): passed through untouched.
 """
 
 from __future__ import annotations
@@ -28,14 +24,14 @@ logger = get_api_logger()
 
 
 class ASGIErrorBoundary:
-    """整個 ASGI stack 的最外層 catch-all(組裝見 app.py)。"""
+    """Outermost catch-all for the entire ASGI stack (assembled in app.py)."""
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
-            # lifespan / websocket:不介入(lifespan 例外要讓 server 看到原樣)
+            # lifespan / websocket exceptions must reach the server as-is
             await self.app(scope, receive, send)
             return
 
@@ -57,7 +53,7 @@ class ASGIErrorBoundary:
                 f"Traceback:\n{traceback.format_exc()}"
             )
             if response_started:
-                # headers 已送出,無法再發合法回應 — re-raise 讓 server 斷連
+                # Headers already sent: re-raise to let the server drop the connection
                 raise
             body = json.dumps({
                 "error": "INTERNAL_SERVER_ERROR",

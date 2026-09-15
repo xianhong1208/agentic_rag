@@ -1,14 +1,10 @@
 
-"""BL-07 — AsrProvider 介面 / 工廠 / 兩個實作(docling 本地 + openai-compatible 雲端)。
+"""BL-07 -- AsrProvider factory and implementations (docling local + openai-compatible cloud).
 
-契約:
-- 工廠按 config.provider 路由;openai-compatible 缺 base_url 要立刻報錯
-  (不是轉錄時才炸);未知 provider 明確 ValueError;fireredasr 路由到
-  FireRedAsrProvider(BL-08,細節測試在 test_fireredasr_provider.py)
-- DoclingWhisperAsrProvider = 封裝 docling_convert_once,參數原樣透傳
-  (零行為變化的 default)
-- OpenAICompatibleAsrProvider = POST {base_url}/audio/transcriptions
-  (multipart file + model + Bearer),回 json text;HTTP 錯誤原樣 raise
+Covers: factory routing by config.provider (openai-compatible without base_url
+errors immediately; unknown provider raises ValueError; fireredasr routes to
+FireRedAsrProvider); DoclingWhisperAsrProvider wrapping docling_convert_once;
+and OpenAICompatibleAsrProvider POSTing multipart to {base_url}/audio/transcriptions.
 """
 
 from unittest.mock import MagicMock, patch
@@ -26,15 +22,13 @@ from src.domain.rag.asr_provider import (
 _AP = "src.domain.rag.asr_provider"
 
 
-# ---- 工廠路由 -----------------------------------------------------------------
-
 class TestFactory:
     def test_default_docling_whisper(self):
         p = create_asr_provider(AsrConfig())
         assert isinstance(p, DoclingWhisperAsrProvider)
 
     def test_none_config_gives_default(self):
-        """rag.asr 未設(None)→ default provider(向下相容)。"""
+        """rag.asr unset (None) -> default provider (backward compat)."""
         assert isinstance(create_asr_provider(None), DoclingWhisperAsrProvider)
 
     def test_openai_compatible_requires_base_url(self):
@@ -59,13 +53,11 @@ class TestFactory:
             create_asr_provider(AsrConfig(provider="bogus"))
 
 
-# ---- DoclingWhisperAsrProvider(零行為 default)--------------------------------
-
 class TestDoclingProvider:
     def test_delegates_to_docling_convert_once(self):
         cb = object()
-        # BL-05 後 convert_once 回 chunk 記錄 dict;音檔無 heading/頁,
-        # provider 必須壓平成純文字(也相容裸字串舊形)
+        # convert_once now returns chunk-record dicts; audio has no heading/page,
+        # so the provider must flatten to plain text (also compatible with the old bare-string form)
         records = [
             {"text": "c1", "headings": None, "page_no": None},
             "c2",
@@ -87,16 +79,15 @@ class TestDoclingProvider:
         )
 
     def test_default_max_tokens_not_none(self):
-        # 不帶 max_tokens 呼叫(evals 草稿腳本的形)— None 不能直傳
-        # convert_once(會蓋掉預設 512 → refine 內 None//2 TypeError)
+        # Called without max_tokens (the shape of the evals draft script) -- None
+        # must not be passed straight into convert_once (it would override the
+        # default 512 -> None//2 TypeError inside refine)
         with patch(f"{_AP}.docling_convert_once",
                    return_value=("t", [])) as m:
             DoclingWhisperAsrProvider().transcribe(
                 audio_path="/tmp/a.mp3", file_name="a.mp3")
         assert m.call_args.kwargs["max_tokens"] == 512
 
-
-# ---- OpenAICompatibleAsrProvider(雲端)---------------------------------------
 
 def _mock_httpx_post(json_body=None, status=200):
     resp = MagicMock()
@@ -127,7 +118,7 @@ class TestOpenAICompatibleProvider:
             r = self._provider().transcribe(audio_path=str(wav), file_name="m.wav")
 
         assert r.text == "雲端轉錄結果"
-        assert r.chunks is None  # 雲端無預切 chunk,交回 leaf_splitter
+        assert r.chunks is None  # cloud has no pre-split chunks, handed back to leaf_splitter
         url = client.post.call_args.args[0]
         kw = client.post.call_args.kwargs
         assert url == "http://stt:8000/v1/audio/transcriptions"
@@ -144,7 +135,7 @@ class TestOpenAICompatibleProvider:
         assert headers.get("Authorization") == "Bearer sk-test"
 
     def test_no_api_key_no_auth_header(self, tmp_path):
-        """自架服務常無 key:不得送出空 Bearer。"""
+        """Self-hosted services often have no key: must not send an empty Bearer."""
         wav = tmp_path / "m.wav"; wav.write_bytes(b"x")
         client = _mock_httpx_post()
         p = OpenAICompatibleAsrProvider(base_url="http://stt:8000/v1")
@@ -153,7 +144,7 @@ class TestOpenAICompatibleProvider:
         assert "Authorization" not in (mk.call_args.kwargs.get("headers") or {})
 
     def test_http_error_raises(self, tmp_path):
-        """雲端 4xx/5xx 原樣 raise — 上層 index_document 走既有失敗路徑寫 failed tag。"""
+        """Cloud 4xx/5xx raise as-is -- the upstream index_document takes the existing failure path and writes a failed tag."""
         import httpx
         wav = tmp_path / "m.wav"; wav.write_bytes(b"x")
         client = _mock_httpx_post(status=500)
@@ -169,8 +160,6 @@ class TestOpenAICompatibleProvider:
             p.transcribe(audio_path=str(wav), file_name="m.wav")
         assert client.post.call_args.args[0] == "http://stt:8000/v1/audio/transcriptions"
 
-
-# ---- DocumentLoader 音檔分流(BL-07 接線)--------------------------------------
 
 _DL = "src.domain.rag.document_loader"
 
@@ -214,11 +203,11 @@ class TestDocumentLoaderAudioRouting:
         assert doc.text == "會議內容"
         assert doc.metadata["_docling_chunks"] == ["c1", "c2"]
         assert p.calls and p.calls[0]["file_name"] == "m.mp3"
-        assert p.calls[0]["max_tokens"] == 256  # min(leaf, 450) 無 context-gen
+        assert p.calls[0]["max_tokens"] == 256  # min(leaf, 450), no context-gen
 
     def test_cloud_provider_no_chunks_no_docling_chunks_key(self, tmp_path):
         doc = self._load(_loader(_FakeAsr(chunks=None)), tmp_path)
-        assert "_docling_chunks" not in doc.metadata  # 交 leaf_splitter 純文字路徑
+        assert "_docling_chunks" not in doc.metadata  # takes the leaf_splitter plain-text path
 
     def test_hallucination_filter_applied_after_provider(self, tmp_path):
         p = _FakeAsr(text="開始。打赏支持本栏目。結束")
@@ -238,15 +227,16 @@ class TestDocumentLoaderAudioRouting:
         fb.assert_called_once()
 
     def test_unavailable_provider_raises_clear_error(self, tmp_path):
-        # config 選定的 provider 就是唯一語音來源:不可用 → 明確報錯讓檔案
-        # 標 failed(帶可行動訊息),絕不靜默 fallback 成不轉錄(用戶決策)
+        # The config-selected provider is the sole speech source: if unavailable
+        # -> error explicitly so the file is marked failed (with an actionable
+        # message), never silently fall back to no transcription (user decision)
         p = _FakeAsr(avail=False)
         loader = _loader(p)
         with patch(f"{_DL}.FileStorage.resolve_path", return_value=tmp_path / "m.mp3"):
             (tmp_path / "m.mp3").write_bytes(b"x")
             with pytest.raises(RuntimeError, match="不可用"):
                 loader.load(file_path="s/m.mp3", file_id="f1", file_name="m.mp3")
-        assert p.calls == []  # 未嘗試轉錄
+        assert p.calls == []  # transcription was not attempted
 
     def test_provider_error_propagates(self, tmp_path):
         p = _FakeAsr(err=RuntimeError("stt down"))

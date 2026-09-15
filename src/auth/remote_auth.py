@@ -1,7 +1,7 @@
 
-"""遠端 Token 驗證客戶端
+"""Remote token verification client.
 
-提供給 MCP Server 使用，透過 HTTP 呼叫 Token Server 進行認證。
+Used by the MCP Server to authenticate via HTTP calls to the Token Server.
 """
 
 import time
@@ -20,7 +20,7 @@ logger = get_auth_logger()
 
 @dataclass
 class TokenVerifyResult:
-    """Token 驗證結果"""
+    """Token verification result."""
     valid: bool
     user_name: Optional[str] = None
     scopes: Optional[list] = None
@@ -29,11 +29,11 @@ class TokenVerifyResult:
 
 
 class RemoteTokenVerifier:
-    """遠端 Token 驗證器
+    """Remote token verifier.
 
-    透過 HTTP 呼叫 Token Server 的 /auth/verify API 進行驗證。
+    Verifies via HTTP calls to the Token Server's /auth/verify API.
 
-    使用方式:
+    Usage:
         verifier = RemoteTokenVerifier("http://localhost:8000")
         result = await verifier.verify("token_string")
         if result.valid:
@@ -49,15 +49,15 @@ class RemoteTokenVerifier:
         service_host: Optional[str] = None,
         service_port: Optional[int] = None
     ):
-        """初始化遠端驗證器
+        """Initialize the remote verifier.
 
         Args:
-            token_server_url: Token Server 的基礎 URL (如 http://localhost:8000)
-            timeout: HTTP 請求超時時間（秒）
-            retry_count: 失敗重試次數
-            cache_ttl: 驗證結果快取時間（秒）
-            service_host: 本服務在 Token Server 中註冊的 host
-            service_port: 本服務在 Token Server 中註冊的 port
+            token_server_url: Base URL of the Token Server (e.g. http://localhost:8000)
+            timeout: HTTP request timeout (seconds)
+            retry_count: Number of retries on failure
+            cache_ttl: Verification-result cache lifetime (seconds)
+            service_host: The host this service is registered under in the Token Server
+            service_port: The port this service is registered under in the Token Server
         """
         self.token_server_url = token_server_url.rstrip('/')
         self.verify_url = f"{self.token_server_url}/auth/verify"
@@ -66,98 +66,91 @@ class RemoteTokenVerifier:
         self.service_host = service_host
         self.service_port = service_port
 
-        # 簡單的記憶體快取（減少對 Token Server 的請求）
+        # Simple in-memory cache (reduces requests to the Token Server)
         self._cache: Dict[str, tuple[TokenVerifyResult, float]] = {}
         self._cache_ttl = cache_ttl
         self._cache_lock = threading.Lock()
 
-        # 持久化的 HTTP 客戶端（避免 Nuitka + anyio cancel scope 問題）
-        # 注意：只使用同步客戶端，async 方法透過 asyncio.to_thread 呼叫
+        # Persistent HTTP client (avoids Nuitka + anyio cancel-scope issues).
+        # Note: only the sync client is used; async methods call it via asyncio.to_thread.
         self._sync_client: Optional[httpx.Client] = None
 
         logger.info(f"RemoteTokenVerifier initialized: {self.verify_url} (cache_ttl: {cache_ttl}s)")
 
     def _get_cache_key(self, token: str) -> str:
-        """產生快取 key（使用 SHA-256 避免原始 token 留在記憶體）"""
+        """Generate a cache key (uses SHA-256 so the raw token doesn't stay in memory)."""
         return hashlib.sha256(token.encode()).hexdigest()
 
     def _get_sync_client(self) -> httpx.Client:
-        """取得或建立持久化的 sync HTTP 客戶端"""
         if self._sync_client is None:
             self._sync_client = httpx.Client(timeout=self.timeout)
         return self._sync_client
 
     async def verify(self, token: str) -> TokenVerifyResult:
-        """驗證 Token
+        """Verify a token.
 
         Args:
-            token: 要驗證的 Token 字串
+            token: The token string to verify.
 
         Returns:
-            TokenVerifyResult: 驗證結果
+            TokenVerifyResult: the verification result.
         """
         cache_key = self._get_cache_key(token)
 
-        # 檢查快取
         cached = self._get_from_cache(cache_key)
         if cached:
             logger.debug(f"Token verification cache hit: {token[:8]}...")
             return cached
 
-        # 呼叫 Token Server
         result = await self._call_verify_api(token)
 
-        # 存入快取（只快取有效的結果）
         if result.valid:
             self._set_cache(cache_key, result)
 
         return result
 
     def verify_sync(self, token: str) -> TokenVerifyResult:
-        """同步版本的 Token 驗證（用於非 async 環境）"""
+        """Synchronous version of token verification (for non-async contexts)."""
         cache_key = self._get_cache_key(token)
 
-        # 檢查快取
         cached = self._get_from_cache(cache_key)
         if cached:
             logger.debug(f"Token verification cache hit: {token[:8]}...")
             return cached
 
-        # 呼叫 Token Server
         result = self._call_verify_api_sync(token)
 
-        # 存入快取
         if result.valid:
             self._set_cache(cache_key, result)
 
         return result
 
     async def _call_verify_api(self, token: str) -> TokenVerifyResult:
-        """非同步呼叫 Token Server API(透過 asyncio.to_thread 包同步 httpx)。
+        """Asynchronously call the Token Server API (wraps sync httpx via asyncio.to_thread).
 
-        Nuitka 編譯後 anyio 的 cancel scope(happy eyeballs)會出問題,所以走 sync client。
+        After Nuitka compilation, anyio's cancel scope (happy eyeballs) misbehaves, so a sync client is used.
 
         Args:
-            token: 要驗證的 token。
+            token: The token to verify.
 
         Returns:
-            TokenVerifyResult(valid + user_name + scopes 或 error)。
+            TokenVerifyResult (valid + user_name + scopes, or error).
         """
-        # 使用同步版本在執行緒中執行，完全避開 anyio
+        # Run the sync version in a thread, avoiding anyio entirely
         return await asyncio.to_thread(self._call_verify_api_sync, token)
 
     def _call_verify_api_sync(self, token: str) -> TokenVerifyResult:
-        """同步呼叫 Token Server API(用持久化 httpx.Client + 重試)。
+        """Synchronously call the Token Server API (persistent httpx.Client + retries).
 
         Args:
-            token: 要驗證的 token。
+            token: The token to verify.
 
         Returns:
-            TokenVerifyResult;重試耗盡或非 retryable error 時 valid=False + error 帶細節。
+            TokenVerifyResult; on exhausted retries or a non-retryable error, valid=False with error details.
         """
         last_error = None
 
-        # 建構請求 payload（帶上 service_host + service_port 供 Token Server 驗證歸屬）
+        # Build the request payload (include service_host + service_port so the Token Server can verify ownership)
         payload = {"token": token}
         if self.service_host and self.service_port:
             payload["service_host"] = self.service_host
@@ -203,28 +196,24 @@ class RemoteTokenVerifier:
                 last_error = str(e)
                 logger.error(f"Error calling Token Server: {e}")
 
-        # 所有重試都失敗
         logger.error(f"Token verification failed after {self.retry_count + 1} attempts")
         return TokenVerifyResult(valid=False, error=last_error)
 
     def _get_from_cache(self, cache_key: str) -> Optional[TokenVerifyResult]:
-        """從快取取得驗證結果（thread-safe）"""
         with self._cache_lock:
             if cache_key in self._cache:
                 result, cached_time = self._cache[cache_key]
                 if time.time() - cached_time < self._cache_ttl:
                     return result
                 else:
-                    # 快取過期，移除
                     del self._cache[cache_key]
             return None
 
     def _set_cache(self, cache_key: str, result: TokenVerifyResult):
-        """存入快取（thread-safe）"""
         with self._cache_lock:
             self._cache[cache_key] = (result, time.time())
 
-            # 清理過期的快取項目（簡單的 LRU）
+            # Clean up expired cache entries (simple LRU)
             if len(self._cache) > 1000:
                 current_time = time.time()
                 expired_keys = [
@@ -235,13 +224,12 @@ class RemoteTokenVerifier:
                     del self._cache[k]
 
     def clear_cache(self):
-        """清除所有快取（thread-safe）"""
+        """Clear the entire cache (thread-safe)."""
         with self._cache_lock:
             self._cache.clear()
         logger.info("Remote token verifier cache cleared")
 
     def _health_check_sync(self) -> bool:
-        """同步版本的健康檢查"""
         try:
             client = self._get_sync_client()
             response = client.get(f"{self.token_server_url}/health")
@@ -251,21 +239,20 @@ class RemoteTokenVerifier:
             return False
 
     async def health_check(self) -> bool:
-        """檢查 Token Server 是否可用
+        """Check whether the Token Server is available.
 
-        使用 asyncio.to_thread 避免 Nuitka + anyio 相容性問題。
+        Uses asyncio.to_thread to avoid Nuitka + anyio compatibility issues.
         """
         return await asyncio.to_thread(self._health_check_sync)
 
     def close(self):
-        """關閉 HTTP 客戶端連線"""
+        """Close the HTTP client connection."""
         if self._sync_client is not None:
             self._sync_client.close()
             self._sync_client = None
         logger.debug("RemoteTokenVerifier HTTP client closed")
 
 
-# 全域實例（可選）
 _verifier_instance: Optional[RemoteTokenVerifier] = None
 
 
@@ -277,18 +264,18 @@ def get_remote_verifier(
     service_host: Optional[str] = None,
     service_port: Optional[int] = None
 ) -> RemoteTokenVerifier:
-    """取得或建立遠端驗證器實例
+    """Get or create the remote verifier instance.
 
     Args:
-        token_server_url: Token Server URL（首次呼叫時必須提供）
-        timeout: HTTP 請求超時時間（秒）
-        retry_count: 失敗重試次數
-        cache_ttl: 驗證結果快取時間（秒）
-        service_host: 本服務在 Token Server 中註冊的 host
-        service_port: 本服務在 Token Server 中註冊的 port
+        token_server_url: Token Server URL (required on the first call)
+        timeout: HTTP request timeout (seconds)
+        retry_count: Number of retries on failure
+        cache_ttl: Verification-result cache lifetime (seconds)
+        service_host: The host this service is registered under in the Token Server
+        service_port: The port this service is registered under in the Token Server
 
     Returns:
-        RemoteTokenVerifier 實例
+        The RemoteTokenVerifier instance.
     """
     global _verifier_instance
 
@@ -308,7 +295,7 @@ def get_remote_verifier(
 
 
 def reset_remote_verifier():
-    """重置遠端驗證器實例（會關閉 HTTP 客戶端連線）"""
+    """Reset the remote verifier instance (closes the HTTP client connection)."""
     global _verifier_instance
     if _verifier_instance is not None:
         _verifier_instance.close()

@@ -1,207 +1,207 @@
-# TC-hierarchy:Hierarchical Chunking 測試案例
+# TC-hierarchy: Hierarchical Chunking Test Cases
 
 
-| 項目 | 內容 |
-|------|------|
-| 對應規格 | [SPEC-hierarchy](../specs/SPEC-hierarchy.md) |
-| 測試層級 | 單元 |
-| 測試腳本 | `tests/test_hierarchy.py` |
+| Item | Content |
+|------|---------|
+| Related spec | [SPEC-hierarchy](../specs/SPEC-hierarchy.md) |
+| Test level | Unit |
+| Test script | `tests/test_hierarchy.py` |
 
-> TC-hierarchy-01 ~ 09 為既有測試補登記;TC-hierarchy-10 ~ 16 為本次缺口補測。
-> 全部案例純邏輯、無 mock。跑法:`cd agentic_rag && uv run pytest tests/test_hierarchy.py -v`
+> TC-hierarchy-01 to 09 register existing tests; TC-hierarchy-10 to 16 fill remaining coverage gaps.
+> All cases are pure logic with no mocks. Run with: `cd agentic_rag && uv run pytest tests/test_hierarchy.py -v`
 
 ---
 
-## TC-hierarchy-01:estimate_tokens — 中文 1.5 token/char
+## TC-hierarchy-01: estimate_tokens — Chinese at 1.5 token/char
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-01 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `"公司財報"`(4 個中文字) |
-| **測試步驟** | 1. 呼叫 `estimate_tokens()` |
-| **預期結果** | 回 `int(4 * 1.5)` |
-| **實作** | `tests/test_hierarchy.py::test_estimate_tokens_chinese` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-01 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `"公司財報"` (4 Chinese characters) |
+| **Test steps** | 1. Call `estimate_tokens()` |
+| **Expected result** | Returns `int(4 * 1.5)` |
+| **Implementation** | `tests/test_hierarchy.py::test_estimate_tokens_chinese` |
 
-## TC-hierarchy-02:estimate_tokens — 英文 0.3 token/char
+## TC-hierarchy-02: estimate_tokens — English at 0.3 token/char
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-02 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `"hello"` |
-| **測試步驟** | 1. 呼叫 `estimate_tokens()` |
-| **預期結果** | 回 `int(5 * 0.3)` |
-| **實作** | `tests/test_hierarchy.py::test_estimate_tokens_english` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-02 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `"hello"` |
+| **Test steps** | 1. Call `estimate_tokens()` |
+| **Expected result** | Returns `int(5 * 0.3)` |
+| **Implementation** | `tests/test_hierarchy.py::test_estimate_tokens_english` |
 
-## TC-hierarchy-03:estimate_tokens — 空字串
+## TC-hierarchy-03: estimate_tokens — empty string
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-03 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `""` |
-| **測試步驟** | 1. 呼叫 `estimate_tokens()` |
-| **預期結果** | 回 `0` |
-| **實作** | `tests/test_hierarchy.py::test_estimate_tokens_empty` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-03 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `""` |
+| **Test steps** | 1. Call `estimate_tokens()` |
+| **Expected result** | Returns `0` |
+| **Implementation** | `tests/test_hierarchy.py::test_estimate_tokens_empty` |
 
-## TC-hierarchy-04:build_hierarchy — 單一小 leaf 的完整 metadata schema
+## TC-hierarchy-04: build_hierarchy — full metadata schema for a single small leaf
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-06 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 1 個小 Document,`parent_target_tokens=1024`,base_metadata 含 file_id / file_name |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()`<br>2. 檢查 leaf 與 parent 的 metadata |
-| **預期結果** | 1 leaf + 1 parent;leaf:node_role="leaf"、parent_node_id==parent.id_、chunk_index==0、total_chunks==1;parent:node_role="parent"、children_node_ids==[leaf.id_]、chunk_count==1、children_index_range==[0,0] |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_single_small_doc` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-06 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | 1 small Document, `parent_target_tokens=1024`, base_metadata with file_id / file_name |
+| **Test steps** | 1. Call `build_hierarchy()`<br>2. Check the leaf and parent metadata |
+| **Expected result** | 1 leaf + 1 parent; leaf: node_role="leaf", parent_node_id==parent.id_, chunk_index==0, total_chunks==1; parent: node_role="parent", children_node_ids==[leaf.id_], chunk_count==1, children_index_range==[0,0] |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_single_small_doc` |
 
-## TC-hierarchy-05:build_hierarchy — 多 leaf 在預算內歸一 parent
+## TC-hierarchy-05: build_hierarchy — multiple leaves grouped into one parent within budget
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-07 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 3 個短 Document,`parent_target_tokens=1024` |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()`<br>2. 檢查 parent 數與 leaf 指向 |
-| **預期結果** | 3 leaves、1 parent;chunk_count==3、children_index_range==[0,2];所有 leaf 的 parent_node_id 相同 |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_multiple_leaves_in_one_parent` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-07 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | 3 short Documents, `parent_target_tokens=1024` |
+| **Test steps** | 1. Call `build_hierarchy()`<br>2. Check the parent count and the leaves' pointers |
+| **Expected result** | 3 leaves, 1 parent; chunk_count==3, children_index_range==[0,2]; all leaves have the same parent_node_id |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_multiple_leaves_in_one_parent` |
 
-## TC-hierarchy-06:build_hierarchy — 超過 token 預算拆多 parent
+## TC-hierarchy-06: build_hierarchy — split into multiple parents when the token budget is exceeded
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-07、REQ-hierarchy-10 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 4 個約 67 token 的中文 Document,`parent_target_tokens=100` |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()`<br>2. 排序各 parent 的 children_index_range 檢查重疊 |
-| **預期結果** | 4 leaves、≥2 parents;ranges 排序後互不重疊(前段尾 < 後段頭) |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_splits_when_token_budget_exceeded` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-07, REQ-hierarchy-10 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | 4 Chinese Documents of about 67 tokens each, `parent_target_tokens=100` |
+| **Test steps** | 1. Call `build_hierarchy()`<br>2. Sort each parent's children_index_range and check for overlap |
+| **Expected result** | 4 leaves, >=2 parents; sorted ranges do not overlap (the end of an earlier range < the start of the next) |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_splits_when_token_budget_exceeded` |
 
-## TC-hierarchy-07:build_hierarchy — parent.text 順序拼接
+## TC-hierarchy-07: build_hierarchy — parent.text concatenated in order
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-08 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 3 個 Document(第一段 / 第二段 / 第三段) |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()`<br>2. 檢查 parent.text 內容與出現順序 |
-| **預期結果** | 三段皆在 parent.text 且 index 依原順序遞增 |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_parent_text_concatenation` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-08 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | 3 Documents (第一段 / 第二段 / 第三段) |
+| **Test steps** | 1. Call `build_hierarchy()`<br>2. Check the content and order of parent.text |
+| **Expected result** | All three segments are in parent.text, with index increasing in the original order |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_parent_text_concatenation` |
 
-## TC-hierarchy-08:build_hierarchy — base_metadata 傳播與 leaf 自身 metadata 保留
+## TC-hierarchy-08: build_hierarchy — base_metadata propagation and leaf's own metadata preserved
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-09 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | leaf 帶 `{"existing_key": "preserve_me"}`;base 含 file_id / file_name / folder_name |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()`<br>2. 逐鍵比對 leaf 與 parent metadata |
-| **預期結果** | base 三鍵同時出現在 leaf 與 parent;leaf 的 existing_key 保留 |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_metadata_propagation` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-09 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | leaf carries `{"existing_key": "preserve_me"}`; base has file_id / file_name / folder_name |
+| **Test steps** | 1. Call `build_hierarchy()`<br>2. Compare leaf and parent metadata key by key |
+| **Expected result** | All three base keys appear in both leaf and parent; the leaf's existing_key is preserved |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_metadata_propagation` |
 
-## TC-hierarchy-09:build_hierarchy — 空輸入
+## TC-hierarchy-09: build_hierarchy — empty input
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-05 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `leaf_documents=[]` |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()` |
-| **預期結果** | 回 `([], [])` |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_empty_input` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-05 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `leaf_documents=[]` |
+| **Test steps** | 1. Call `build_hierarchy()` |
+| **Expected result** | Returns `([], [])` |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_empty_input` |
 
-## TC-hierarchy-10:estimate_tokens — 中英混合加總
+## TC-hierarchy-10: estimate_tokens — mixed Chinese-English sum
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-04 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `"公司ABC"`(2 中文 + 3 英文) |
-| **測試步驟** | 1. 呼叫 `estimate_tokens()` |
-| **預期結果** | 回 `int(2*1.5 + 3*0.3)` |
-| **實作** | `tests/test_hierarchy.py::test_estimate_tokens_mixed_chinese_english` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-04 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `"公司ABC"` (2 Chinese + 3 English) |
+| **Test steps** | 1. Call `estimate_tokens()` |
+| **Expected result** | Returns `int(2*1.5 + 3*0.3)` |
+| **Implementation** | `tests/test_hierarchy.py::test_estimate_tokens_mixed_chinese_english` |
 
-## TC-hierarchy-11:estimate_tokens — 數字與假名不算中文區段
+## TC-hierarchy-11: estimate_tokens — digits and kana do not count as Chinese ranges
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-02 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | `"12345"` 與平假名 `"あいう"` |
-| **測試步驟** | 1. 分別呼叫 `estimate_tokens()` |
-| **預期結果** | `"12345"` → `int(5*0.3)`;`"あいう"` → `0`(假名 < U+4E00,按 0.3/char 計) |
-| **實作** | `tests/test_hierarchy.py::test_estimate_tokens_non_cjk_range_counts_as_other` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-02 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | `"12345"` and hiragana `"あいう"` |
+| **Test steps** | 1. Call `estimate_tokens()` on each |
+| **Expected result** | `"12345"` -> `int(5*0.3)`; `"あいう"` -> `0` (kana < U+4E00, counted at 0.3/char) |
+| **Implementation** | `tests/test_hierarchy.py::test_estimate_tokens_non_cjk_range_counts_as_other` |
 
-## TC-hierarchy-12:build_hierarchy — 單 leaf 超預算自成一 parent
+## TC-hierarchy-12: build_hierarchy — an oversized single leaf becomes its own parent
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-07 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 3 個各自遠超預算的 Document,`parent_target_tokens=10` |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()`<br>2. 檢查 parent 數與各自 chunk_count |
-| **預期結果** | 3 leaves、3 parents,每個 parent 的 chunk_count==1(不丟棄) |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_oversized_leaf_gets_own_parent` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-07 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | 3 Documents each far exceeding the budget, `parent_target_tokens=10` |
+| **Test steps** | 1. Call `build_hierarchy()`<br>2. Check the parent count and each chunk_count |
+| **Expected result** | 3 leaves, 3 parents, each parent's chunk_count==1 (nothing dropped) |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_oversized_leaf_gets_own_parent` |
 
-## TC-hierarchy-13:build_hierarchy — leaf metadata 中 None 值濾除
+## TC-hierarchy-13: build_hierarchy — None values in leaf metadata are filtered out
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-09 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | leaf metadata=`{"keep_me": "v", "drop_me": None}` |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()`<br>2. 檢查 leaf node metadata |
-| **預期結果** | `keep_me == "v"` 保留;`drop_me` 不存在於 leaf metadata |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_filters_none_metadata_values` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-09 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | leaf metadata=`{"keep_me": "v", "drop_me": None}` |
+| **Test steps** | 1. Call `build_hierarchy()`<br>2. Check the leaf node metadata |
+| **Expected result** | `keep_me == "v"` is preserved; `drop_me` is absent from the leaf metadata |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_filters_none_metadata_values` |
 
-## TC-hierarchy-14:build_hierarchy — 跨 parent 的 chunk_index 連續與 total_chunks
+## TC-hierarchy-14: build_hierarchy — contiguous chunk_index across parents and total_chunks
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-10 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 4 個中文 Document(拆組情境),`parent_target_tokens=100` |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()`<br>2. 確認確實拆為 ≥2 parents<br>3. 收集所有 leaf 的 chunk_index / total_chunks |
-| **預期結果** | chunk_index 序列 == `[0, 1, 2, 3]`(全域連續);所有 leaf 的 total_chunks == 4 |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_chunk_index_and_total_chunks_across_parents` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-10 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | 4 Chinese Documents (split scenario), `parent_target_tokens=100` |
+| **Test steps** | 1. Call `build_hierarchy()`<br>2. Confirm it actually splits into >=2 parents<br>3. Collect chunk_index / total_chunks of all leaves |
+| **Expected result** | The chunk_index sequence == `[0, 1, 2, 3]` (globally contiguous); total_chunks == 4 for all leaves |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_chunk_index_and_total_chunks_across_parents` |
 
-## TC-hierarchy-15:build_hierarchy — 不傳 base_metadata
+## TC-hierarchy-15: build_hierarchy — without passing base_metadata
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-09 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | 1 個 Document,省略 base_metadata 參數 |
-| **測試步驟** | 1. 呼叫 `build_hierarchy(leaf_documents=[...], parent_target_tokens=1024)` |
-| **預期結果** | 正常建出 1 leaf + 1 parent,leaf node_role=="leaf",不拋例外 |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_default_base_metadata` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-09 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | 1 Document, omitting the base_metadata parameter |
+| **Test steps** | 1. Call `build_hierarchy(leaf_documents=[...], parent_target_tokens=1024)` |
+| **Expected result** | Builds 1 leaf + 1 parent normally, leaf node_role=="leaf", no exception raised |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_default_base_metadata` |
 
-## TC-hierarchy-16:build_hierarchy — leaf metadata 覆蓋 base_metadata
+## TC-hierarchy-16: build_hierarchy — leaf metadata overrides base_metadata
 
-| 欄位 | 內容 |
-|------|------|
-| **對應需求** | REQ-hierarchy-09 |
-| **層級** | 單元 |
-| **前置條件** | 無 |
-| **測試輸入** | base=`{"file_name": "base-level.txt"}`;leaf metadata=`{"file_name": "leaf-level.txt"}` |
-| **測試步驟** | 1. 呼叫 `build_hierarchy()`<br>2. 分別檢查 leaf 與 parent 的 file_name |
-| **預期結果** | leaf 的 file_name == `"leaf-level.txt"`(leaf 優先);parent 的 file_name == `"base-level.txt"`(用 base) |
-| **實作** | `tests/test_hierarchy.py::test_build_hierarchy_leaf_metadata_overrides_base` |
+| Field | Content |
+|-------|---------|
+| **Requirement** | REQ-hierarchy-09 |
+| **Level** | Unit |
+| **Preconditions** | None |
+| **Test input** | base=`{"file_name": "base-level.txt"}`; leaf metadata=`{"file_name": "leaf-level.txt"}` |
+| **Test steps** | 1. Call `build_hierarchy()`<br>2. Check the file_name of the leaf and the parent separately |
+| **Expected result** | The leaf's file_name == `"leaf-level.txt"` (leaf takes precedence); the parent's file_name == `"base-level.txt"` (uses base) |
+| **Implementation** | `tests/test_hierarchy.py::test_build_hierarchy_leaf_metadata_overrides_base` |
 
-> 撰寫原則:一個案例只驗證一件事;正常路徑與例外路徑分開;預期結果必須是**可觀察、可判定**的。
+> Authoring principles: each case verifies exactly one thing; keep the happy path and the exception path separate; expected results must be **observable and determinable**.

@@ -1,5 +1,5 @@
 
-"""SettingsAudit 持久化 — 設定變更歷史(append-only,合規稽核)。"""
+"""SettingsAudit persistence — settings change history (append-only, for compliance auditing)."""
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -31,7 +31,7 @@ class SettingsAuditDB(BaseDB):
     @classmethod
     def record(cls, key: str, action: str, old_value: Any, new_value: Any,
                changed_by: Optional[str]) -> None:
-        """寫一筆變更(best-effort — 稽核失敗不擋設定變更本身)。"""
+        """Write one change record (best-effort — audit failure does not block the setting change itself)."""
         try:
             with Session() as s:
                 s.add(SettingsAudit(

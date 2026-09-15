@@ -1,8 +1,10 @@
 
-"""QueryLog 持久化 + 分析彙總 — Control Center 查詢分析視圖的資料源。
+"""QueryLog persistence and analytics aggregation — data source for the
+Control Center's query-analytics view.
 
-record 為 best-effort(失敗只記 log,絕不擋查詢);analytics 一次算好
-KPI(查詢量 / 平均延遲 / 零結果率)、熱門查詢、零結果查詢、每日趨勢。
+record is best-effort (failures are logged only, never blocking a query);
+analytics computes, in one pass, the KPIs (query volume / average latency /
+zero-result rate), top queries, zero-result queries, and the daily trend.
 """
 from __future__ import annotations
 
@@ -38,7 +40,7 @@ class QueryLogDB(BaseDB):
     @classmethod
     def record(cls, query: str, folder_id: Optional[int], result_count: int,
                latency_ms: Optional[int], token_prefix: Optional[str]) -> None:
-        """記一筆查詢(best-effort — 遙測失敗不影響查詢本身)。"""
+        """Record one query (best-effort — telemetry failure does not affect the query itself)."""
         try:
             q = (query or "").strip()[:2000]
             if not q:
@@ -54,10 +56,12 @@ class QueryLogDB(BaseDB):
     @classmethod
     def analytics(cls, folder_id: Optional[int] = None, days: int = 30,
                   top: int = 10) -> Dict[str, Any]:
-        """查詢分析彙總。folder_id=None → 全部;days 為統計視窗天數。
+        """Query-analytics aggregation. folder_id=None means all folders; days
+        is the statistics window in days.
 
-        回 {total, zero_result, zero_rate, avg_latency_ms, top_queries[],
-        zero_queries[], by_day[]}。DB 掛 / 表不存在 → 全零結構(不拋)。
+        Returns {total, zero_result, zero_rate, avg_latency_ms, top_queries[],
+        zero_queries[], by_day[]}. If the DB is down or the table is missing,
+        returns an all-zero structure (does not raise).
         """
         empty = {"total": 0, "zero_result": 0, "zero_rate": 0.0,
                  "avg_latency_ms": None, "top_queries": [], "zero_queries": [],
